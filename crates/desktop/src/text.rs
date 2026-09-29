@@ -1,58 +1,22 @@
-//! Fonts, text layout and the glyph atlas.
+//! Text layout and the glyph atlas.
 //!
 //! Layout happens in physical pixels so glyphs rasterise and land on the
-//! pixel grid exactly; the public API speaks logical pixels.
-//!
-//! ponytail: no shaping, bidi or font fallback. Latin/Cyrillic/Greek render
-//! correctly (Inter covers them); emoji and CJK show as missing-glyph boxes.
-//! Upgrade path: swap this module's internals for `swash`/`rustybuzz`.
+//! pixel grid exactly; the public API speaks logical pixels. A layout is a
+//! string plus optional styled runs (font, size, colour slot, decorations,
+//! link), each character resolved through the font fallback chain in
+//! `font.rs`. Emoji sequences collapse into single ligature glyphs, and lines
+//! may break between CJK characters, which have no spaces.
 
 use std::collections::HashMap;
+use std::ops::Range;
+use std::rc::Rc;
 
-use fontdue::{Font, FontSettings};
+pub use crate::font::{FontId, Fonts};
+use crate::font::{Layer, is_cjk, is_emoji_joiner, is_invisible};
 
 /// Side length of the square R8 glyph atlas texture. 2048 is the largest
 /// size every backend (including GLES) guarantees.
 pub const ATLAS_SIZE: u32 = 2048;
-
-/// Font faces bundled with the app.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FontId {
-    /// Inter Regular: body text.
-    Regular,
-    /// Inter SemiBold: titles, labels and emphasis.
-    SemiBold,
-}
-
-/// The loaded font faces.
-pub struct Fonts {
-    regular: Font,
-    semibold: Font,
-}
-
-impl Fonts {
-    /// Parses the embedded fonts.
-    ///
-    /// # Panics
-    /// Only if the embedded font files are corrupt, which is a build defect.
-    #[must_use]
-    pub fn load() -> Self {
-        let load = |bytes: &'static [u8]| {
-            Font::from_bytes(bytes, FontSettings::default()).expect("embedded font is a valid TrueType file")
-        };
-        Self {
-            regular: load(include_bytes!("../assets/Inter-Regular.ttf")),
-            semibold: load(include_bytes!("../assets/Inter-SemiBold.ttf")),
-        }
-    }
-
-    fn get(&self, id: FontId) -> &Font {
-        match id {
-            FontId::Regular => &self.regular,
-            FontId::SemiBold => &self.semibold,
-        }
-    }
-}
 
 /// How a piece of text should look.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -69,13 +33,49 @@ impl Style {
     /// Regular text of `size` with a comfortable reading line height.
     #[must_use]
     pub const fn regular(size: f32) -> Self {
-        Self { font: FontId::Regular, size, line_height: 1.55 }
+        Self { font: FontId::REGULAR, size, line_height: 1.55 }
     }
 
     /// Semibold text of `size` with a tight line height.
     #[must_use]
     pub const fn semibold(size: f32) -> Self {
-        Self { font: FontId::SemiBold, size, line_height: 1.3 }
+        Self { font: FontId::SEMIBOLD, size, line_height: 1.3 }
+    }
+
+    /// Monospaced text of `size`, for code.
+    #[must_use]
+    pub const fn mono(size: f32) -> Self {
+        Self { font: FontId::MONO, size, line_height: 1.6 }
+    }
+}
+
+/// Decoration flag: a rounded background behind the run (inline code).
+pub const BACKGROUND: u8 = 1;
+/// Decoration flag: underline (links).
+pub const UNDERLINE: u8 = 2;
+/// Decoration flag: strike-through.
+pub const STRIKE: u8 = 4;
+
+/// Styling of one run inside a rich layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Run {
+    /// Preferred face.
+    pub font: FontId,
+    /// Size relative to the layout's base size.
+    pub size: f32,
+    /// Colour slot, resolved against a palette when drawing.
+    pub ink: u8,
+    /// [`BACKGROUND`], [`UNDERLINE`] and [`STRIKE`] flags.
+    pub decoration: u8,
+    /// Link number plus one; zero when the run is not a link.
+    pub link: u16,
+}
+
+impl Run {
+    /// A plain run in `font`.
+    #[must_use]
+    pub const fn plain(font: FontId) -> Self {
+        Self { font, size: 1.0, ink: 0, decoration: 0, link: 0 }
     }
 }
 
@@ -83,10 +83,15 @@ impl Style {
 #[derive(Clone, Copy, Debug)]
 struct Glyph {
     index: u16,
+    font: FontId,
+    /// Index into [`TextLayout::runs`].
+    run: u16,
     /// Pen position (left edge of the advance box).
     x: f32,
     advance: f32,
-    /// Byte offset of the source character.
+    /// Pixels per em this glyph renders at.
+    px: f32,
+    /// Byte offset of the source character (cluster start).
     byte: u32,
     /// Whitespace: has an advance but no ink.
     space: bool,
@@ -110,9 +115,7 @@ struct Line {
 pub struct TextLayout {
     glyphs: Vec<Glyph>,
     lines: Vec<Line>,
-    font: FontId,
-    /// Physical pixel size the glyphs were measured at.
-    px: f32,
+    runs: Vec<Run>,
     scale: f32,
     /// Baseline offset from the top of a line, physical pixels.
     baseline: f32,
@@ -129,75 +132,179 @@ pub enum Align {
     Center,
 }
 
+/// A decorated stretch of one line, in logical pixels relative to the layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Decoration {
+    /// Left edge.
+    pub x: f32,
+    /// Line top.
+    pub y: f32,
+    /// Width.
+    pub w: f32,
+    /// Line height.
+    pub h: f32,
+    /// Baseline offset from the line top.
+    pub baseline: f32,
+    /// The run's styling.
+    pub run: Run,
+}
+
+fn is_regional_indicator(c: char) -> bool {
+    matches!(c as u32, 0x1F1E6..=0x1F1FF)
+}
+
+/// Mutable state of a layout pass.
+struct Builder<'a> {
+    fonts: &'a Fonts,
+    glyphs: Vec<Glyph>,
+    lines: Vec<Line>,
+    max_width: f32,
+    line_start: usize,
+    byte_start: usize,
+    x: f32,
+    /// First glyph of the next line if the current one wraps now.
+    wrap_at: Option<usize>,
+    /// Previous glyph, for kerning: (font, glyph, px).
+    prev: Option<(FontId, u16, f32)>,
+}
+
+impl Builder<'_> {
+    fn newline(&mut self, byte: usize) {
+        self.lines.push(finish_line(&self.glyphs, self.line_start, self.glyphs.len(), self.byte_start, byte));
+        self.line_start = self.glyphs.len();
+        self.byte_start = byte + 1;
+        self.x = 0.0;
+        self.wrap_at = None;
+        self.prev = None;
+    }
+
+    fn push(&mut self, font: FontId, index: u16, run: u16, px: f32, byte: usize, ch: char) {
+        let face = self.fonts.face(font);
+        let em = px / face.units_per_em();
+        let space = ch.is_whitespace();
+        let mut advance = face.advance(index) * em;
+        if ch == '\t' {
+            advance *= 4.0;
+        }
+        if let Some((pf, pg, ppx)) = self.prev
+            && pf == font
+            && (ppx - px).abs() < f32::EPSILON
+        {
+            self.x += face.kerning(pg, index) * em;
+        }
+        // CJK text has no spaces: a line may break before any ideograph.
+        if is_cjk(ch) && self.glyphs.len() > self.line_start {
+            self.wrap_at = Some(self.glyphs.len());
+        }
+        if self.x + advance > self.max_width && !space && self.glyphs.len() > self.line_start {
+            let split = self.wrap_at.filter(|&w| w > self.line_start).unwrap_or(self.glyphs.len());
+            let split_byte = self.glyphs.get(split).map_or(byte, |g| g.byte as usize);
+            self.lines.push(finish_line(&self.glyphs, self.line_start, split, self.byte_start, split_byte));
+            let shift = self.glyphs.get(split).map_or(self.x, |g| g.x);
+            for glyph in &mut self.glyphs[split..] {
+                glyph.x -= shift;
+            }
+            self.x -= shift;
+            self.line_start = split;
+            self.byte_start = split_byte;
+            self.wrap_at = None;
+        }
+        self.glyphs.push(Glyph { index, font, run, x: self.x, advance, px, byte: byte as u32, space });
+        self.x += advance;
+        self.prev = Some((font, index, px));
+        if space || is_cjk(ch) {
+            self.wrap_at = Some(self.glyphs.len());
+        }
+    }
+}
+
 impl TextLayout {
-    /// Lays out `text`, wrapping at word boundaries to `max_width` logical
-    /// pixels when given. Words wider than the line are broken anywhere.
+    /// Lays out `text` in one style, wrapping at word boundaries to
+    /// `max_width` logical pixels when given. Words wider than the line are
+    /// broken anywhere.
     #[must_use]
     pub fn new(fonts: &Fonts, text: &str, style: Style, max_width: Option<f32>, scale: f32) -> Self {
-        let font = fonts.get(style.font);
-        let px = style.size * scale;
-        let metrics = font.horizontal_line_metrics(px).unwrap_or(fontdue::LineMetrics {
-            ascent: px * 0.8,
-            descent: -px * 0.2,
-            line_gap: 0.0,
-            new_line_size: px,
-        });
-        let line_height = (style.size * style.line_height * scale).round();
-        let baseline = ((line_height - (metrics.ascent - metrics.descent)) * 0.5 + metrics.ascent).round();
-        let max_width = max_width.map_or(f32::INFINITY, |w| (w * scale).floor());
+        Self::rich(fonts, text, &[], style, max_width, scale)
+    }
 
-        let mut glyphs: Vec<Glyph> = Vec::with_capacity(text.len());
-        let mut lines = Vec::new();
-        let mut line_start = 0usize;
-        let mut byte_start = 0usize;
-        let mut x = 0.0f32;
-        // First glyph after the latest whitespace: where a wrap would split.
-        let mut wrap_at: Option<usize> = None;
-        let mut prev: Option<u16> = None;
+    /// Lays out `text` with styled `spans` (sorted, non-overlapping byte
+    /// ranges); text outside every span uses `base` with ink 0. Line metrics
+    /// always come from `base`.
+    #[must_use]
+    pub fn rich(fonts: &Fonts, text: &str, spans: &[(Range<usize>, Run)], base: Style, max_width: Option<f32>, scale: f32) -> Self {
+        let primary = fonts.face(base.font);
+        let px = base.size * scale;
+        let (ascent, descent) = primary.vertical_metrics();
+        let (ascent, descent) = (ascent / primary.units_per_em() * px, descent / primary.units_per_em() * px);
+        let line_height = (base.size * base.line_height * scale).round();
+        let baseline = ((line_height - (ascent - descent)) * 0.5 + ascent).round();
 
-        for (byte, ch) in text.char_indices() {
+        let mut runs = Vec::with_capacity(spans.len() + 1);
+        runs.push(Run::plain(base.font));
+        runs.extend(spans.iter().map(|(_, run)| *run));
+
+        let mut b = Builder {
+            fonts,
+            glyphs: Vec::with_capacity(text.len()),
+            lines: Vec::new(),
+            max_width: max_width.map_or(f32::INFINITY, |w| (w * scale).floor()),
+            line_start: 0,
+            byte_start: 0,
+            x: 0.0,
+            wrap_at: None,
+            prev: None,
+        };
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut span = 0;
+        let mut i = 0;
+        while i < chars.len() {
+            let (byte, ch) = chars[i];
+            while span < spans.len() && spans[span].0.end <= byte {
+                span += 1;
+            }
+            let run_index = if spans.get(span).is_some_and(|(r, _)| r.start <= byte) { span + 1 } else { 0 };
+            let run = runs[run_index];
+            let run_index = run_index as u16;
+            i += 1;
             if ch == '\n' {
-                lines.push(finish_line(&glyphs, line_start, glyphs.len(), byte_start, byte));
-                line_start = glyphs.len();
-                byte_start = byte + 1;
-                x = 0.0;
-                wrap_at = None;
-                prev = None;
+                b.newline(byte);
                 continue;
             }
-            let index = font.lookup_glyph_index(if ch == '\t' { ' ' } else { ch });
-            let mut advance = font.metrics_indexed(index, px).advance_width;
-            if ch == '\t' {
-                advance *= 4.0;
+            if is_invisible(ch) {
+                continue;
             }
-            if let Some(prev) = prev {
-                x += font.horizontal_kern_indexed(prev, index, px).unwrap_or(0.0);
+            let glyph_px = px * run.size;
+            let next = chars.get(i).map(|&(_, c)| c);
+            let (font, index) = fonts.resolve(run.font, if ch == '\t' { ' ' } else { ch }, next);
+            if font != FontId::EMOJI {
+                b.push(font, index, run_index, glyph_px, byte, ch);
+                continue;
             }
 
-            if x + advance > max_width && !ch.is_whitespace() && glyphs.len() > line_start {
-                let split = wrap_at.filter(|&w| w > line_start).unwrap_or(glyphs.len());
-                let split_byte = glyphs.get(split).map_or(byte, |g| g.byte as usize);
-                lines.push(finish_line(&glyphs, line_start, split, byte_start, split_byte));
-                let shift = glyphs.get(split).map_or(x, |g| g.x);
-                for glyph in &mut glyphs[split..] {
-                    glyph.x -= shift;
+            // An emoji cluster: joiners, whatever follows a ZWJ, and the
+            // second half of a flag all belong to the first character.
+            let face = fonts.face(font);
+            let mut sequence = vec![index];
+            while let Some(&(_, c)) = chars.get(i) {
+                let prev = chars[i - 1].1;
+                let flag_pair = is_regional_indicator(ch) && is_regional_indicator(c) && sequence.len() == 1;
+                if !(is_emoji_joiner(c) || prev == '\u{200D}' || flag_pair) {
+                    break;
                 }
-                x -= shift;
-                line_start = split;
-                byte_start = split_byte;
-                wrap_at = None;
+                sequence.extend(face.glyph(c));
+                i += 1;
             }
-
-            glyphs.push(Glyph { index, x, advance, byte: byte as u32, space: ch.is_whitespace() });
-            x += advance;
-            prev = Some(index);
-            if ch.is_whitespace() {
-                wrap_at = Some(glyphs.len());
+            let mut k = 0;
+            while k < sequence.len() {
+                let (glyph, used) = face.ligature(&sequence[k..]).unwrap_or((sequence[k], 1));
+                b.push(font, glyph, run_index, glyph_px, byte, ch);
+                k += used;
             }
         }
-        lines.push(finish_line(&glyphs, line_start, glyphs.len(), byte_start, text.len()));
+        let end = text.len();
+        b.lines.push(finish_line(&b.glyphs, b.line_start, b.glyphs.len(), b.byte_start, end));
 
-        Self { glyphs, lines, font: style.font, px, scale, baseline, line_height }
+        Self { glyphs: b.glyphs, lines: b.lines, runs, scale, baseline, line_height }
     }
 
     /// Widest line in logical pixels.
@@ -218,6 +325,12 @@ impl TextLayout {
         self.line_height / self.scale
     }
 
+    /// Distance from a line's top to its baseline, logical pixels.
+    #[must_use]
+    pub fn baseline(&self) -> f32 {
+        self.baseline / self.scale
+    }
+
     /// Number of visual lines (at least one).
     #[must_use]
     pub fn line_count(&self) -> usize {
@@ -231,15 +344,16 @@ impl TextLayout {
         if self.lines.len() != 1 || self.lines[0].width <= max {
             return;
         }
-        let line = &mut self.lines[0];
-        let font = fonts.get(self.font);
-        let index = font.lookup_glyph_index('…');
-        let advance = font.metrics_indexed(index, self.px).advance_width;
+        let Some(last) = self.glyphs.last().copied() else { return };
+        let (font, index) = fonts.resolve(self.runs[usize::from(last.run)].font, '…', None);
+        let face = fonts.face(font);
+        let advance = face.advance(index) * last.px / face.units_per_em();
         while self.glyphs.last().is_some_and(|g| g.x + g.advance + advance > max || g.space) {
             self.glyphs.pop();
         }
+        let line = &mut self.lines[0];
         let x = self.glyphs.last().map_or(0.0, |g| g.x + g.advance);
-        self.glyphs.push(Glyph { index, x, advance, byte: line.byte_end, space: false });
+        self.glyphs.push(Glyph { index, font, x, advance, byte: line.byte_end, space: false, ..last });
         line.end = self.glyphs.len() as u32;
         line.width = x + advance;
     }
@@ -271,6 +385,19 @@ impl TextLayout {
             .map_or(line.byte_end, |g| g.byte) as usize
     }
 
+    /// The link number (as given in [`Run::link`], minus one) of the glyph
+    /// under the logical point `(x, y)`, if any.
+    #[must_use]
+    pub fn link_at(&self, x: f32, y: f32) -> Option<u16> {
+        if y < 0.0 || x < 0.0 {
+            return None;
+        }
+        let line = self.lines.get((y / self.line_height()) as usize)?;
+        let x = x * self.scale;
+        let glyph = self.glyphs[line.start as usize..line.end as usize].iter().find(|g| x >= g.x && x < g.x + g.advance)?;
+        self.runs[usize::from(glyph.run)].link.checked_sub(1)
+    }
+
     /// The source byte range of each visual line, with its top `y` in
     /// logical pixels. Used to draw selections.
     pub fn line_spans(&self) -> impl Iterator<Item = (usize, usize, f32)> + '_ {
@@ -279,11 +406,42 @@ impl TextLayout {
             .enumerate()
             .map(|(row, l)| (l.byte_start as usize, l.byte_end as usize, row as f32 * self.line_height()))
     }
+
+    /// Stretches of decorated runs, one per line and run.
+    #[must_use]
+    pub fn decorations(&self) -> Vec<Decoration> {
+        let mut out = Vec::new();
+        let s = self.scale;
+        for (row, line) in self.lines.iter().enumerate() {
+            let glyphs = &self.glyphs[line.start as usize..line.end as usize];
+            let mut i = 0;
+            while i < glyphs.len() {
+                let run = self.runs[usize::from(glyphs[i].run)];
+                let mut j = i + 1;
+                while j < glyphs.len() && glyphs[j].run == glyphs[i].run {
+                    j += 1;
+                }
+                if run.decoration != 0 {
+                    let (x0, x1) = (glyphs[i].x, glyphs[j - 1].x + glyphs[j - 1].advance);
+                    out.push(Decoration {
+                        x: x0 / s,
+                        y: row as f32 * self.line_height() ,
+                        w: (x1 - x0) / s,
+                        h: self.line_height(),
+                        baseline: self.baseline(),
+                        run,
+                    });
+                }
+                i = j;
+            }
+        }
+        out
+    }
 }
 
 fn finish_line(glyphs: &[Glyph], start: usize, end: usize, byte_start: usize, byte_end: usize) -> Line {
-    // Trailing whitespace glyphs have zero-width bitmaps but real advances;
-    // exclude them so right-aligned and centred text looks balanced.
+    // Trailing whitespace has advances but no ink; exclude it so centred and
+    // right-aligned text looks balanced.
     let width = glyphs[start..end]
         .iter()
         .rev()
@@ -324,13 +482,15 @@ pub struct Upload {
     pub data: Vec<u8>,
 }
 
-/// CPU side of the glyph atlas: a shelf packer plus a lookup table.
+/// CPU side of the glyph atlas: a shelf packer plus lookup tables.
 ///
 /// ponytail: when the atlas fills up it is wiped and the frame redrawn;
 /// fine for UI text volumes, add an LRU if many sizes/scripts appear.
 #[derive(Default)]
 pub struct GlyphAtlas {
     entries: HashMap<(FontId, u16, u32), AtlasEntry>,
+    /// Colour layers per glyph (`None`: not a colour glyph).
+    layers: HashMap<(FontId, u16), Option<Rc<[Layer]>>>,
     cursor_x: u32,
     cursor_y: u32,
     row_height: u32,
@@ -345,6 +505,10 @@ impl GlyphAtlas {
         *self = Self::default();
     }
 
+    fn layers(&mut self, fonts: &Fonts, font: FontId, index: u16) -> Option<Rc<[Layer]>> {
+        self.layers.entry((font, index)).or_insert_with(|| fonts.face(font).layers(index).map(Rc::from)).clone()
+    }
+
     /// Returns the atlas entry for a glyph, rasterising it on first use.
     /// `None` means the atlas is full.
     fn get(&mut self, fonts: &Fonts, font: FontId, index: u16, px: f32) -> Option<AtlasEntry> {
@@ -352,10 +516,9 @@ impl GlyphAtlas {
         if let Some(entry) = self.entries.get(&key) {
             return Some(*entry);
         }
-        let (metrics, data) = fonts.get(font).rasterize_indexed(index, px);
-        let (w, h) = (metrics.width as u32, metrics.height as u32);
-        let mut entry = AtlasEntry { x: 0, y: 0, w: w as u16, h: h as u16, xmin: metrics.xmin as i16, ymin: metrics.ymin as i16 };
-        if w > 0 && h > 0 {
+        let mut entry = AtlasEntry { x: 0, y: 0, w: 0, h: 0, xmin: 0, ymin: 0 };
+        if let Some(bitmap) = fonts.face(font).rasterize(index, px) {
+            let (w, h) = (bitmap.w, bitmap.h);
             // One texel of padding keeps linear filtering from bleeding.
             if self.cursor_x + w + 1 > ATLAS_SIZE {
                 self.cursor_x = 0;
@@ -365,9 +528,15 @@ impl GlyphAtlas {
             if self.cursor_y + h + 1 > ATLAS_SIZE || w + 1 > ATLAS_SIZE {
                 return None;
             }
-            entry.x = self.cursor_x as u16;
-            entry.y = self.cursor_y as u16;
-            self.uploads.push(Upload { x: self.cursor_x, y: self.cursor_y, w, h, data });
+            entry = AtlasEntry {
+                x: self.cursor_x as u16,
+                y: self.cursor_y as u16,
+                w: w as u16,
+                h: h as u16,
+                xmin: bitmap.xmin as i16,
+                ymin: bitmap.ymin as i16,
+            };
+            self.uploads.push(Upload { x: self.cursor_x, y: self.cursor_y, w, h, data: bitmap.data });
             self.cursor_x += w + 1;
             self.row_height = self.row_height.max(h + 1);
         }
@@ -382,6 +551,10 @@ pub struct PlacedGlyph {
     pub rect: [f32; 4],
     /// Atlas texel rectangle.
     pub uv: [f32; 4],
+    /// Colour slot of the glyph's run.
+    pub ink: u8,
+    /// Fixed colour of an emoji layer (straight sRGB), overriding `ink`.
+    pub color: Option<[f32; 4]>,
 }
 
 impl TextLayout {
@@ -417,19 +590,33 @@ impl TextLayout {
             };
             let baseline = top + self.baseline;
             for glyph in &self.glyphs[line.start as usize..line.end as usize] {
-                let Some(entry) = atlas.get(fonts, self.font, glyph.index, self.px) else {
-                    return false;
-                };
-                if entry.w == 0 {
+                if glyph.space {
                     continue;
                 }
-                let gx = ox + dx + glyph.x.round() + f32::from(entry.xmin);
-                let gy = baseline - f32::from(entry.h) - f32::from(entry.ymin);
-                let (w, h) = (f32::from(entry.w), f32::from(entry.h));
-                emit(PlacedGlyph {
-                    rect: [gx / s, gy / s, w / s, h / s],
-                    uv: [f32::from(entry.x), f32::from(entry.y), w, h],
-                });
+                let ink = self.runs[usize::from(glyph.run)].ink;
+                let pen = ox + dx + glyph.x.round();
+                let mut place = |atlas: &mut GlyphAtlas, index: u16, color: Option<[f32; 4]>| -> bool {
+                    let Some(entry) = atlas.get(fonts, glyph.font, index, glyph.px) else {
+                        return false;
+                    };
+                    if entry.w > 0 {
+                        let (w, h) = (f32::from(entry.w), f32::from(entry.h));
+                        let gx = pen + f32::from(entry.xmin);
+                        let gy = baseline - h - f32::from(entry.ymin);
+                        emit(PlacedGlyph { rect: [gx / s, gy / s, w / s, h / s], uv: [f32::from(entry.x), f32::from(entry.y), w, h], ink, color });
+                    }
+                    true
+                };
+                let layers = if glyph.font == FontId::EMOJI { atlas.layers(fonts, glyph.font, glyph.index) } else { None };
+                let ok = match layers {
+                    Some(layers) => layers.iter().all(|&(index, rgba)| {
+                        place(atlas, index, rgba.map(|c| c.map(|v| f32::from(v) / 255.0)))
+                    }),
+                    None => place(atlas, glyph.index, None),
+                };
+                if !ok {
+                    return false;
+                }
             }
         }
         true
@@ -439,17 +626,6 @@ impl TextLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ui_symbols_exist_in_both_weights() {
-        // There is no font fallback, so every symbol the UI draws must be in Inter.
-        let fonts = Fonts::load();
-        for font in [FontId::Regular, FontId::SemiBold] {
-            for ch in ['✓', '↑', '…', '·', '→', '$', '×'] {
-                assert_ne!(fonts.get(font).lookup_glyph_index(ch), 0, "{ch:?} missing from {font:?}");
-            }
-        }
-    }
 
     fn layout(text: &str, width: Option<f32>) -> TextLayout {
         TextLayout::new(&Fonts::load(), text, Style::regular(16.0), width, 1.0)
@@ -490,5 +666,39 @@ mod tests {
         let mut l = TextLayout::new(&fonts, "a fairly long conversation title", Style::regular(14.0), None, 1.0);
         l.truncate(&fonts, 80.0);
         assert!(l.width() <= 80.0);
+    }
+
+    #[test]
+    fn emoji_sequences_are_single_clusters() {
+        let text = "a👨\u{200D}👩\u{200D}👧b🇳🇱c";
+        let l = layout(text, None);
+        // a, family, b, flag, c.
+        assert_eq!(l.glyphs.len(), 5);
+        assert!(l.glyphs.iter().filter(|g| g.font == FontId::EMOJI).count() == 2);
+        // The caret skips over a whole sequence.
+        let b = text.find('b').unwrap();
+        assert_eq!(l.hit(l.caret(b).0 + 0.1, 1.0), b);
+    }
+
+    #[test]
+    fn cjk_wraps_without_spaces() {
+        let l = layout(&"汉字".repeat(40), Some(120.0));
+        assert!(l.line_count() > 1);
+        assert!(l.width() <= 120.0);
+    }
+
+    #[test]
+    fn runs_style_ranges_and_links() {
+        let fonts = Fonts::load();
+        let link = Run { ink: 2, decoration: UNDERLINE, link: 1, ..Run::plain(FontId::REGULAR) };
+        let code = Run { decoration: BACKGROUND, ..Run::plain(FontId::MONO) };
+        let l = TextLayout::rich(&fonts, "see docs and code", &[(4..8, link), (13..17, code)], Style::regular(16.0), None, 1.0);
+        assert!(l.glyphs[4..8].iter().all(|g| g.run == 1));
+        assert!(l.glyphs[13..17].iter().all(|g| g.font == FontId::MONO));
+        let decorations = l.decorations();
+        assert_eq!(decorations.len(), 2);
+        let (x, _) = l.caret(5);
+        assert_eq!(l.link_at(x + 1.0, 4.0), Some(0));
+        assert_eq!(l.link_at(1.0, 4.0), None);
     }
 }

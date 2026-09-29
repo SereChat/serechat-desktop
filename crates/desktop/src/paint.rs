@@ -104,9 +104,9 @@ pub struct Painter<'a> {
 
 impl<'a> Painter<'a> {
     /// Starts a frame covering `viewport`.
-    pub fn new(fonts: &'a Fonts, atlas: &'a mut GlyphAtlas, out: &'a mut Vec<Instance>, scale: f32, viewport: Rect, theme: Palette) -> Self {
+    pub fn new(fonts: &'a Fonts, atlas: &'a mut GlyphAtlas, out: &'a mut Vec<Instance>, scale: f32, viewport: Rect, theme: &Palette) -> Self {
         out.clear();
-        Self { fonts, atlas, out, scale, clip: viewport, theme, atlas_full: false }
+        Self { fonts, atlas, out, scale, clip: viewport, theme: *theme, atlas_full: false }
     }
 
     /// Restricts subsequent drawing to `rect` (intersected with the current
@@ -114,6 +114,12 @@ impl<'a> Painter<'a> {
     pub fn push_clip(&mut self, rect: Rect) -> Rect {
         let clip = self.clip.intersect(rect);
         std::mem::replace(&mut self.clip, clip)
+    }
+
+    /// The current clip rectangle.
+    #[must_use]
+    pub fn clip(&self) -> Rect {
+        self.clip
     }
 
     /// Restores a clip returned by [`Painter::push_clip`].
@@ -166,9 +172,39 @@ impl<'a> Painter<'a> {
 
     /// Draws a laid-out block, aligning each line inside `width`.
     pub fn text_aligned(&mut self, layout: &TextLayout, x: f32, y: f32, align: Align, width: f32, color: Color) {
+        self.glyphs(layout, (x, y), (align, width), &[color]);
+    }
+
+    /// Draws a rich layout: run decorations first (code backgrounds,
+    /// underlines, strike-throughs), then glyphs. A run's `ink` indexes
+    /// `inks`; out-of-range slots use `inks[0]`. `code_bg` fills
+    /// [`BACKGROUND`](crate::text::BACKGROUND) runs.
+    pub fn rich(&mut self, layout: &TextLayout, x: f32, y: f32, inks: &[Color], code_bg: Color) {
+        use crate::text::{BACKGROUND, STRIKE, UNDERLINE};
+        for d in layout.decorations() {
+            let ink = inks.get(usize::from(d.run.ink)).or(inks.first()).copied().unwrap_or([1.0; 4]);
+            if d.run.decoration & BACKGROUND != 0 {
+                let pad = (d.h * 0.12).round();
+                self.rect(Rect::new(x + d.x - 3.0, y + d.y + pad, d.w + 6.0, d.h - 2.0 * pad), code_bg, 4.0);
+            }
+            if d.run.decoration & UNDERLINE != 0 {
+                self.rect(Rect::new(x + d.x, y + d.y + d.baseline + 2.0, d.w, 1.0), fade(ink, 0.5), 0.0);
+            }
+            if d.run.decoration & STRIKE != 0 {
+                self.rect(Rect::new(x + d.x, y + d.y + d.baseline * 0.68, d.w, 1.0), ink, 0.0);
+            }
+        }
+        self.glyphs(layout, (x, y), (Align::Left, 0.0), inks);
+    }
+
+    fn glyphs(&mut self, layout: &TextLayout, origin: (f32, f32), align: (Align, f32), inks: &[Color]) {
         let clip = self.clip;
         let out = &mut *self.out;
-        let ok = layout.place(self.fonts, self.atlas, (x, y), (align, width), (clip.y, clip.bottom()), |g| {
+        let fallback = inks.first().copied().unwrap_or([1.0; 4]);
+        let ok = layout.place(self.fonts, self.atlas, origin, align, (clip.y, clip.bottom()), |g| {
+            let ink = inks.get(usize::from(g.ink)).copied().unwrap_or(fallback);
+            // Emoji layers keep their own colours but follow the text's fade.
+            let color = g.color.map_or(ink, |c| [c[0], c[1], c[2], c[3] * ink[3]]);
             out.push(Instance {
                 rect: g.rect,
                 clip: [clip.x, clip.y, clip.right(), clip.bottom()],

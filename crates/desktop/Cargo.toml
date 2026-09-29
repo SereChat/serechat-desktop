@@ -15,9 +15,10 @@ path = "src/main.rs"
 serechat.workspace = true
 winit.workspace = true
 wgpu.workspace = true
-fontdue.workspace = true
+ttf-parser.workspace = true
 bytemuck.workspace = true
 arboard.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

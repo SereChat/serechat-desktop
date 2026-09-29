@@ -23,6 +23,10 @@ pub struct Ui {
     pub down: bool,
     /// Left button went down this frame.
     pub pressed: bool,
+    /// Clicks in the current burst: 1 single, 2 double, 3 triple…
+    pub clicks: u32,
+    /// When the last press happened (for click bursts).
+    last_press: f32,
     /// Left button went up this frame.
     pub released: bool,
     /// Accumulated wheel movement in logical pixels; positive scrolls down.
@@ -59,6 +63,17 @@ impl Ui {
         let frame = self.frame;
         self.anims.retain(|_, (_, used)| *used == frame);
         self.frame += 1;
+    }
+
+    /// Records a left-button press at the current mouse position, counting
+    /// quick presses in the same spot as one burst (double/triple click).
+    pub fn press(&mut self, now: f32) {
+        let near = (self.mouse.0 - self.press_pos.0).abs() < 4.0 && (self.mouse.1 - self.press_pos.1).abs() < 4.0;
+        self.clicks = if near && now - self.last_press < 0.4 { self.clicks + 1 } else { 1 };
+        self.last_press = now;
+        self.down = true;
+        self.pressed = true;
+        self.press_pos = self.mouse;
     }
 
     /// Clears one-shot input once a frame has consumed it.
@@ -175,6 +190,12 @@ pub fn chevron(p: &mut Painter, x: f32, y: f32, open: bool, color: Color) {
             p.rect(Rect::new(x + d, y + 6.0 - d, 1.5, 1.5), color, 0.0);
         }
     }
+}
+
+/// A 12×10 folder glyph with its top-left at `(x, y)`.
+pub fn folder_icon(p: &mut Painter, x: f32, y: f32, color: Color) {
+    p.rect(Rect::new(x, y, 5.0, 3.0), color, 1.0);
+    p.rect(Rect::new(x, y + 2.0, 12.0, 8.0), color, 1.5);
 }
 
 /// Draws a keyboard shortcut in a key cap whose right edge is at `right`.

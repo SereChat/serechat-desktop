@@ -30,6 +30,8 @@ pub struct Config {
     /// Reasoning effort for new messages (`none`, `low`, `medium`, `high`);
     /// absent means the model's default.
     pub reasoning: Option<String>,
+    /// Project folder new chats open in.
+    pub project: Option<String>,
     /// Colour scheme name, interpreted by the app.
     pub theme: Option<String>,
 }
@@ -113,6 +115,7 @@ impl Config {
                 "model" => config.model = Some(value),
                 "reasoning" => config.reasoning = Some(value),
                 "theme" => config.theme = Some(value),
+                "project" => config.project = Some(value),
                 _ => {}
             }
         }
@@ -123,7 +126,13 @@ impl Config {
     #[must_use]
     pub fn serialize(&self) -> String {
         let mut out = String::from("# SereChat desktop configuration.\n");
-        let fields = [("token", &self.token), ("model", &self.model), ("reasoning", &self.reasoning), ("theme", &self.theme)];
+        let fields = [
+            ("token", &self.token),
+            ("model", &self.model),
+            ("reasoning", &self.reasoning),
+            ("theme", &self.theme),
+            ("project", &self.project),
+        ];
         for (key, value) in fields {
             if let Some(value) = value {
                 out.push_str(key);
@@ -256,6 +265,7 @@ mod tests {
             model: Some("claude-sonnet-5.5".into()),
             reasoning: Some("high".into()),
             theme: Some("light".into()),
+            project: Some(r"C:\work\café".into()),
         };
         assert_eq!(Config::parse(&config.serialize()).unwrap(), config);
     }

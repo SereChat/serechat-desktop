@@ -9,14 +9,23 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod attachments;
 mod chat;
+mod doc;
 mod editor;
+mod font;
 mod gpu;
+mod highlight;
 mod login;
+mod markdown;
 mod paint;
+mod platform;
+mod raster;
 mod settings;
+mod spotlight;
 mod text;
 mod theme;
+mod tools;
 mod ui;
 
 use std::process::ExitCode;

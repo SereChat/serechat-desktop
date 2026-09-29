@@ -124,6 +124,22 @@ impl Login {
         }
     }
 
+    /// Text committed by an input method (e.g. full-width digits typed with
+    /// a CJK IME). Only ASCII digits are kept.
+    pub fn commit(&mut self, text: &str, actions: &mut Vec<Action>) {
+        if self.phase == Phase::AwaitingCode {
+            // Map full-width digits (０-９) to ASCII.
+            let digits: String = text
+                .chars()
+                .map(|c| if ('０'..='９').contains(&c) { char::from_u32(c as u32 - 0xFF10 + u32::from(b'0')).unwrap_or(c) } else { c })
+                .collect();
+            self.code.insert(&digits);
+            if self.code.text().len() == CODE_LEN {
+                self.verify(actions);
+            }
+        }
+    }
+
     /// Keyboard input.
     pub fn key(&mut self, event: &KeyEvent, mods: ModifiersState, cb: &mut Option<Clipboard>, actions: &mut Vec<Action>) {
         match (&event.logical_key, self.phase) {

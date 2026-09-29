@@ -55,9 +55,19 @@ pub struct Model {
     /// USD per million generated tokens; `0` when the server omits it.
     #[serde(default)]
     pub output_cost_per_million: f64,
+    /// Accepted input kinds, e.g. `text`, `image`, `audio`.
+    #[serde(default)]
+    pub input_types: Vec<String>,
 }
 
 impl Model {
+    /// Whether the model can read images. Unknown (no list) counts as yes so
+    /// an older server never blocks attachments.
+    #[must_use]
+    pub fn accepts_images(&self) -> bool {
+        self.input_types.is_empty() || self.input_types.iter().any(|t| t == "image")
+    }
+
     /// Cost in USD of a response with the given token counts.
     #[must_use]
     pub fn cost(&self, usage: crate::Usage) -> f64 {
@@ -130,6 +140,25 @@ impl Client {
         let response = self.agent.get(format!("{}/v1/models", self.base)).call()?;
         let body: Body = read_json(response)?;
         Ok(body.data)
+    }
+
+    /// Downloads a web page or text resource (no credentials are sent),
+    /// reading at most `limit` bytes. Returns the content type and body.
+    ///
+    /// # Errors
+    /// Network failure or a non-success status. Invalid UTF-8 is replaced.
+    pub fn fetch_text(&self, url: &str, limit: u64) -> Result<(String, String)> {
+        let mut response = check_status(self.agent.get(url).call()?)?;
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        // Truncate rather than fail: a long page is still useful.
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(response.body_mut().with_config().reader(), limit), &mut body)?;
+        Ok((content_type, String::from_utf8_lossy(&body).into_owned()))
     }
 
     /// POSTs `body` as JSON and returns the raw response after checking the

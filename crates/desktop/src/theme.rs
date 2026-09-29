@@ -43,6 +43,12 @@ pub struct Palette {
     pub danger: Color,
     /// Drop shadows under floating surfaces.
     pub shadow: Color,
+    /// Background of code blocks.
+    pub code_bg: Color,
+    /// Links in replies.
+    pub link: Color,
+    /// Syntax colours: keyword, string, number, comment, function, type.
+    pub syntax: [Color; 6],
 }
 
 impl Palette {
@@ -67,6 +73,9 @@ impl Palette {
             selection: m(self.selection, other.selection),
             danger: m(self.danger, other.danger),
             shadow: m(self.shadow, other.shadow),
+            code_bg: m(self.code_bg, other.code_bg),
+            link: m(self.link, other.link),
+            syntax: std::array::from_fn(|i| m(self.syntax[i], other.syntax[i])),
         }
     }
 }
@@ -89,6 +98,10 @@ pub const DARK: Palette = Palette {
     selection: hexa(0xFFFFFF, 0.16),
     danger: hex(0xEB6F6F),
     shadow: hexa(0x000000, 0.5),
+    code_bg: hex(0x1B1B1E),
+    link: hex(0x8AB4F8),
+    // GitHub Dark.
+    syntax: [hex(0xFF7B72), hex(0xA5D6FF), hex(0x79C0FF), hex(0x8B949E), hex(0xD2A8FF), hex(0xFFA657)],
 };
 
 /// Zed's "One Dark": slate greys with a blue accent.
@@ -109,6 +122,10 @@ pub const BLUE: Palette = Palette {
     selection: hexa(0x74ADE8, 0.24),
     danger: hex(0xD07277),
     shadow: hexa(0x000000, 0.35),
+    code_bg: hex(0x23272E),
+    link: hex(0x74ADE8),
+    // Zed One Dark.
+    syntax: [hex(0xB477CF), hex(0xA1C181), hex(0xBF956A), hex(0x5D636F), hex(0x73ADE9), hex(0x6EB4BF)],
 };
 
 /// Paper white with an ink accent.
@@ -129,6 +146,10 @@ pub const LIGHT: Palette = Palette {
     selection: hexa(0x2563EB, 0.18),
     danger: hex(0xD93636),
     shadow: hexa(0x000000, 0.1),
+    code_bg: hex(0xF6F6F8),
+    link: hex(0x2563EB),
+    // GitHub Light.
+    syntax: [hex(0xCF222E), hex(0x0A3069), hex(0x0550AE), hex(0x6E7781), hex(0x8250DF), hex(0x953800)],
 };
 
 /// The colour schemes offered in settings.

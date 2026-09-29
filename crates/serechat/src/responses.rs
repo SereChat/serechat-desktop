@@ -1,4 +1,5 @@
-//! Streaming access to `POST /v1/responses`.
+//! Streaming access to `POST /v1/responses`: messages with attachments,
+//! function tools and their results.
 
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,15 +21,6 @@ pub enum Role {
     Assistant,
 }
 
-/// One turn of a conversation, serialized as a Responses API input message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Message {
-    /// Who wrote it.
-    pub role: Role,
-    /// Plain-text content.
-    pub content: String,
-}
-
 /// Token accounting reported when a response completes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,6 +29,104 @@ pub struct Usage {
     pub input_tokens: u64,
     /// Generated tokens.
     pub output_tokens: u64,
+}
+
+/// A function call requested by the model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Identifier echoed back with the result.
+    pub call_id: String,
+    /// Tool name.
+    pub name: String,
+    /// Arguments as a JSON object in text form.
+    pub arguments: String,
+}
+
+/// A piece of a user message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part {
+    /// Plain text.
+    Text(String),
+    /// An image as a `data:` URL.
+    Image(String),
+    /// A document (e.g. a PDF) as a `data:` URL.
+    File {
+        /// File name shown to the model.
+        name: String,
+        /// The contents as a `data:` URL.
+        data_url: String,
+    },
+}
+
+/// One item of a request's `input`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputItem {
+    /// A chat turn.
+    Message {
+        /// Its author.
+        role: Role,
+        /// Its contents; assistant turns use text parts only.
+        parts: Vec<Part>,
+    },
+    /// A tool call the model made earlier in the conversation.
+    ToolCall(ToolCall),
+    /// The result of running a tool call.
+    ToolOutput {
+        /// The call this answers.
+        call_id: String,
+        /// What the tool returned (or why it did not run).
+        output: String,
+    },
+}
+
+impl InputItem {
+    /// A plain-text message.
+    #[must_use]
+    pub fn text(role: Role, text: impl Into<String>) -> Self {
+        Self::Message { role, parts: vec![Part::Text(text.into())] }
+    }
+
+    /// The Responses API JSON for this item.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        match self {
+            Self::Message { role: Role::Assistant, parts } => {
+                let text: Vec<&str> = parts.iter().filter_map(|p| if let Part::Text(t) = p { Some(t.as_str()) } else { None }).collect();
+                json!({ "role": "assistant", "content": text.join("\n\n") })
+            }
+            Self::Message { role: Role::User, parts } => match parts.as_slice() {
+                // A lone text part stays a plain string: every model accepts that.
+                [Part::Text(text)] => json!({ "role": "user", "content": text }),
+                parts => {
+                    let content: Vec<Value> = parts
+                        .iter()
+                        .map(|part| match part {
+                            Part::Text(text) => json!({ "type": "input_text", "text": text }),
+                            // SereChat wants the object form; a bare string fails upstream.
+                            Part::Image(url) => json!({ "type": "input_image", "image_url": { "url": url } }),
+                            Part::File { name, data_url } => json!({ "type": "input_file", "filename": name, "file_data": data_url }),
+                        })
+                        .collect();
+                    json!({ "role": "user", "content": content })
+                }
+            },
+            Self::ToolCall(call) => {
+                json!({ "type": "function_call", "call_id": call.call_id, "name": call.name, "arguments": call.arguments })
+            }
+            Self::ToolOutput { call_id, output } => json!({ "type": "function_call_output", "call_id": call_id, "output": output }),
+        }
+    }
+}
+
+/// A function the model may call.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolSpec<'a> {
+    /// Name the model uses.
+    pub name: &'a str,
+    /// What it does, for the model.
+    pub description: &'a str,
+    /// JSON Schema of its arguments.
+    pub parameters: &'a Value,
 }
 
 /// An incremental update from a streaming response.
@@ -58,6 +148,8 @@ pub struct Completion {
     /// The model's full reasoning. SereChat delivers it here rather than as
     /// [`StreamEvent::Reasoning`] deltas; empty for non-thinking models.
     pub reasoning: String,
+    /// Function calls the model wants run before it continues.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// Parameters for a single response.
@@ -70,8 +162,58 @@ pub struct ResponseRequest<'a> {
     /// Reasoning effort (`none`, `low`, `medium`, `high`); `None` leaves it
     /// to the model.
     pub reasoning: Option<&'a str>,
-    /// Conversation so far, oldest first; the last entry is the new prompt.
-    pub input: &'a [Message],
+    /// Conversation so far, oldest first.
+    pub input: &'a [InputItem],
+    /// Functions the model may call; empty for plain chat.
+    pub tools: &'a [ToolSpec<'a>],
+}
+
+impl ResponseRequest<'_> {
+    /// The request body.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "input": self.input.iter().map(InputItem::to_json).collect::<Vec<_>>(),
+            "stream": true,
+        });
+        if let Some(instructions) = self.instructions {
+            body["instructions"] = instructions.into();
+        }
+        if let Some(effort) = self.reasoning {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+        if !self.tools.is_empty() {
+            let tools: Vec<Value> = self
+                .tools
+                .iter()
+                .map(|t| json!({ "type": "function", "name": t.name, "description": t.description, "parameters": t.parameters }))
+                .collect();
+            body["tools"] = tools.into();
+        }
+        body
+    }
+}
+
+/// Encodes `bytes` as a `data:` URL of type `mime`.
+#[must_use]
+pub fn data_url(mime: &str, bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(mime.len() + 13 + bytes.len().div_ceil(3) * 4);
+    out.push_str("data:");
+    out.push_str(mime);
+    out.push_str(";base64,");
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 impl Client {
@@ -83,24 +225,8 @@ impl Client {
     ///
     /// # Errors
     /// Network failures, non-success statuses, and error events inside the stream.
-    pub fn stream_response(
-        &self,
-        request: &ResponseRequest<'_>,
-        cancel: &AtomicBool,
-        mut on_event: impl FnMut(StreamEvent),
-    ) -> Result<bool> {
-        let mut body = json!({
-            "model": request.model,
-            "input": request.input,
-            "stream": true,
-        });
-        if let Some(instructions) = request.instructions {
-            body["instructions"] = instructions.into();
-        }
-        if let Some(effort) = request.reasoning {
-            body["reasoning"] = json!({ "effort": effort });
-        }
-        let response = self.post("/v1/responses", &body, true)?;
+    pub fn stream_response(&self, request: &ResponseRequest<'_>, cancel: &AtomicBool, mut on_event: impl FnMut(StreamEvent)) -> Result<bool> {
+        let response = self.post("/v1/responses", &request.to_json(), true)?;
         let reader = std::io::BufReader::new(response.into_body().into_reader());
         let mut decoder = sse::Decoder::default();
 
@@ -140,7 +266,7 @@ fn parse_event(name: &str, data: &str) -> Result<Option<StreamEvent>> {
             let usage = value.pointer("/response/usage");
             let count = |key| usage.and_then(|u| u.get(key)).and_then(Value::as_u64).unwrap_or(0);
             let usage = Usage { input_tokens: count("input_tokens"), output_tokens: count("output_tokens") };
-            Some(StreamEvent::Completed(Completion { usage, reasoning: reasoning_text(&value) }))
+            Some(StreamEvent::Completed(Completion { usage, reasoning: reasoning_text(&value), tool_calls: tool_calls(&value) }))
         }
         "error" | "response.failed" | "response.incomplete" => {
             let source = value.pointer("/response/error").unwrap_or(&value);
@@ -155,10 +281,14 @@ fn parse_event(name: &str, data: &str) -> Result<Option<StreamEvent>> {
     })
 }
 
+fn output_items<'a>(completed: &'a Value, kind: &'a str) -> impl Iterator<Item = &'a Value> + 'a {
+    let items = completed.pointer("/response/output").and_then(Value::as_array).into_iter().flatten();
+    items.filter(move |item| item.get("type").and_then(Value::as_str) == Some(kind))
+}
+
 /// Joins the text of every `reasoning` output item of a completed response,
 /// preferring full reasoning over summaries.
 fn reasoning_text(completed: &Value) -> String {
-    let items = completed.pointer("/response/output").and_then(Value::as_array).into_iter().flatten();
     let texts = |item: &Value, key: &str| -> Vec<String> {
         item.get(key)
             .and_then(Value::as_array)
@@ -170,11 +300,21 @@ fn reasoning_text(completed: &Value) -> String {
             .collect()
     };
     let mut parts = Vec::new();
-    for item in items.filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning")) {
+    for item in output_items(completed, "reasoning") {
         let content = texts(item, "content");
         parts.extend(if content.is_empty() { texts(item, "summary") } else { content });
     }
     parts.join("\n\n")
+}
+
+/// The `function_call` output items of a completed response.
+fn tool_calls(completed: &Value) -> Vec<ToolCall> {
+    output_items(completed, "function_call")
+        .filter_map(|item| {
+            let field = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_owned);
+            Some(ToolCall { call_id: field("call_id").or_else(|| field("id"))?, name: field("name")?, arguments: field("arguments").unwrap_or_default() })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -193,25 +333,63 @@ mod tests {
         );
         assert_eq!(
             parse_event("response.completed", r#"{"response":{"usage":{"input_tokens":3,"output_tokens":4}}}"#).unwrap(),
-            Some(StreamEvent::Completed(Completion { usage: Usage { input_tokens: 3, output_tokens: 4 }, reasoning: String::new() }))
+            Some(StreamEvent::Completed(Completion { usage: Usage { input_tokens: 3, output_tokens: 4 }, ..Completion::default() }))
         );
-        // Shape captured from the live API: reasoning only arrives on completion.
-        let completed = r#"{"response":{"output":[
-            {"type":"message","content":[{"type":"output_text","text":"391"}]},
-            {"type":"reasoning","content":[{"type":"reasoning_text","text":"17*23=391\n"}]},
-            {"type":"reasoning","summary":[{"type":"summary_text","text":"Multiplied."}]}]}}"#;
-        let Some(StreamEvent::Completed(completion)) = parse_event("response.completed", completed).unwrap() else {
-            panic!("expected a completion");
-        };
-        assert_eq!(completion.reasoning, "17*23=391\n\nMultiplied.");
         let err = parse_event("", r#"{"type":"error","error":{"code":"x","message":"boom"}}"#).unwrap_err();
         assert_eq!(err.to_string(), "boom (HTTP 200)");
         assert!(parse_event("", "{").is_err());
     }
 
     #[test]
-    fn serializes_input() {
-        let input = [Message { role: Role::User, content: "hi".into() }];
-        assert_eq!(serde_json::to_string(&input).unwrap(), r#"[{"role":"user","content":"hi"}]"#);
+    fn completion_carries_reasoning_and_tool_calls() {
+        // Shapes captured from the live API.
+        let completed = r#"{"response":{"output":[
+            {"type":"message","content":[{"type":"output_text","text":"391"}]},
+            {"type":"reasoning","content":[{"type":"reasoning_text","text":"17*23=391\n"}]},
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"Multiplied."}]},
+            {"id":"call-1","type":"function_call","name":"list_directory","call_id":"call-1","arguments":"{\"path\":\".\"}","status":"completed"}]}}"#;
+        let Some(StreamEvent::Completed(completion)) = parse_event("response.completed", completed).unwrap() else {
+            panic!("expected a completion");
+        };
+        assert_eq!(completion.reasoning, "17*23=391\n\nMultiplied.");
+        assert_eq!(
+            completion.tool_calls,
+            [ToolCall { call_id: "call-1".into(), name: "list_directory".into(), arguments: r#"{"path":"."}"#.into() }]
+        );
+    }
+
+    #[test]
+    fn serializes_input_items() {
+        let items = [
+            InputItem::text(Role::User, "hi"),
+            InputItem::Message { role: Role::User, parts: vec![Part::Text("look".into()), Part::Image("data:image/png;base64,AA==".into())] },
+            InputItem::text(Role::Assistant, "ok"),
+            InputItem::ToolCall(ToolCall { call_id: "c".into(), name: "n".into(), arguments: "{}".into() }),
+            InputItem::ToolOutput { call_id: "c".into(), output: "done".into() },
+        ];
+        let json: Vec<String> = items.iter().map(|i| i.to_json().to_string()).collect();
+        assert_eq!(json[0], r#"{"content":"hi","role":"user"}"#);
+        assert_eq!(
+            json[1],
+            r#"{"content":[{"text":"look","type":"input_text"},{"image_url":{"url":"data:image/png;base64,AA=="},"type":"input_image"}],"role":"user"}"#
+        );
+        assert_eq!(json[3], r#"{"arguments":"{}","call_id":"c","name":"n","type":"function_call"}"#);
+        assert_eq!(json[4], r#"{"call_id":"c","output":"done","type":"function_call_output"}"#);
+
+        let schema = json!({"type": "object"});
+        let tools = [ToolSpec { name: "t", description: "d", parameters: &schema }];
+        let request = ResponseRequest { model: "m", instructions: Some("be brief"), reasoning: None, input: &items[..1], tools: &tools };
+        let body = request.to_json();
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["instructions"], "be brief");
+    }
+
+    #[test]
+    fn base64_data_urls() {
+        assert_eq!(data_url("text/plain", b""), "data:text/plain;base64,");
+        assert_eq!(data_url("a/b", b"f"), "data:a/b;base64,Zg==");
+        assert_eq!(data_url("a/b", b"fo"), "data:a/b;base64,Zm8=");
+        assert_eq!(data_url("a/b", b"foo"), "data:a/b;base64,Zm9v");
+        assert_eq!(data_url("a/b", &[0xFF, 0xFE, 0xFD, 0x00]), "data:a/b;base64,//79AA==");
     }
 }
