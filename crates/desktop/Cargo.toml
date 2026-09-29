@@ -1,0 +1,23 @@
+[package]
+name = "serechat-desktop"
+description = "Native GPU-rendered SereChat desktop client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "serechat"
+path = "src/main.rs"
+
+[dependencies]
+serechat.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+fontdue.workspace = true
+bytemuck.workspace = true
+arboard.workspace = true
+
+[lints]
+workspace = true
