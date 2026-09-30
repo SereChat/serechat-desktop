@@ -4,17 +4,14 @@
 //! The screen never touches the disk or network itself: it emits [`Action`]s
 //! (send, save, run a tool, import files, …) that the app carries out on
 //! worker threads, and receives their results through the `*_done` /
-//! `*_loaded` methods.
-//!
-//! Agent loop: a reply may request tool calls. Reading tools start at once;
-//! the rest wait for approval in the chat. When every call of a reply has a
-//! result, the conversation continues automatically with those results, up to
-//! [`MAX_STEPS`] times per prompt.
+//! `*_loaded` methods. The agent loop lives in `agent.rs`.
 
+mod agent;
 mod composer;
 mod menu;
 mod messages;
 mod sidebar;
+mod skills;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -23,8 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use arboard::Clipboard;
 use serechat::{
-    Attachment, Completion, Error, InputItem, Model, Part, Project, Role, Session, SessionSummary, StoredMessage, StreamEvent,
-    ToolCall, ToolRecord, ToolStatus, Usage, new_session_id, unix_now,
+    Attachment, Error, Model, Project, Role, Session, SessionSummary, StoredMessage, ToolRecord, ToolStatus, Usage, new_session_id, unix_now,
 };
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -38,16 +34,19 @@ use crate::spotlight::{Outcome, Pick, Spotlight};
 use crate::text::TextLayout;
 use crate::theme::{self, Scheme};
 use crate::ui::{Ui, copy, edit_key};
-use crate::{attachments, tools};
+use crate::tools;
+
+pub use agent::{SendJob, ToolJob, input_items};
+use agent::{ActiveStream, Retry};
 
 /// Model used until the user picks one.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5.5";
-/// Most tool rounds the agent may take for one prompt.
-const MAX_STEPS: u32 = 40;
 /// Name of the platform's primary shortcut modifier.
 const PRIMARY_KEY: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
 
-/// How much the model should think before answering.
+/// How much the model should think before answering. Models accept
+/// different efforts (see [`Model::reasoning_levels`]); one the selected
+/// model does not accept falls back to [`Reasoning::Auto`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Reasoning {
     /// Leave it to the model.
@@ -55,16 +54,22 @@ pub enum Reasoning {
     Auto,
     /// No reasoning.
     Off,
+    /// The least reasoning.
+    Minimal,
     /// Brief reasoning.
     Low,
     /// Balanced reasoning.
     Medium,
     /// Thorough reasoning.
     High,
+    /// More than high.
+    ExtraHigh,
+    /// As much as the model can.
+    Max,
 }
 
 impl Reasoning {
-    const ALL: [Self; 5] = [Self::Auto, Self::Off, Self::Low, Self::Medium, Self::High];
+    const ALL: [Self; 8] = [Self::Auto, Self::Off, Self::Minimal, Self::Low, Self::Medium, Self::High, Self::ExtraHigh, Self::Max];
 
     /// Value stored in the config file; also the API's effort name.
     #[must_use]
@@ -72,9 +77,12 @@ impl Reasoning {
         match self {
             Self::Auto => "auto",
             Self::Off => "none",
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::ExtraHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 
@@ -84,18 +92,22 @@ impl Reasoning {
         Self::ALL.into_iter().find(|r| Some(r.key()) == key).unwrap_or_default()
     }
 
-    /// The API's `reasoning.effort`, or `None` to omit it.
-    fn effort(self) -> Option<&'static str> {
-        (self != Self::Auto).then(|| self.key())
+    /// The choices for `model`: Auto plus the efforts it accepts, or every
+    /// effort while the model list is unknown.
+    fn choices(model: Option<&Model>) -> Vec<Self> {
+        Self::ALL.into_iter().filter(|r| *r == Self::Auto || model.is_none_or(|m| m.reasoning_levels.iter().any(|l| l == r.key()))).collect()
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
             Self::Off => "Off",
+            Self::Minimal => "Minimal",
             Self::Low => "Low",
             Self::Medium => "Medium",
             Self::High => "High",
+            Self::ExtraHigh => "Extra high",
+            Self::Max => "Max",
         }
     }
 
@@ -103,9 +115,55 @@ impl Reasoning {
         match self {
             Self::Auto => "Model default",
             Self::Off => "Answer right away",
+            Self::Minimal => "Barely think",
             Self::Low => "Think briefly",
             Self::Medium => "Balanced",
             Self::High => "Think it through",
+            Self::ExtraHigh => "Think longer",
+            Self::Max => "Think as long as needed",
+        }
+    }
+}
+
+/// How replies show the model's reasoning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReasoningView {
+    /// Never shown.
+    Hidden,
+    /// A "Thought for …" row that expands on click.
+    #[default]
+    Collapsed,
+    /// Shown in full, streaming live when the server sends it.
+    Expanded,
+}
+
+impl ReasoningView {
+    /// Every choice, in settings order.
+    pub const ALL: [Self; 3] = [Self::Hidden, Self::Collapsed, Self::Expanded];
+
+    /// Value stored in the config file.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::Collapsed => "collapsed",
+            Self::Expanded => "expanded",
+        }
+    }
+
+    /// Parses a config value; unknown values mean [`ReasoningView::Collapsed`].
+    #[must_use]
+    pub fn from_key(key: Option<&str>) -> Self {
+        Self::ALL.into_iter().find(|v| Some(v.key()) == key).unwrap_or_default()
+    }
+
+    /// Name shown in settings.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hidden => "Hidden",
+            Self::Collapsed => "Collapsed",
+            Self::Expanded => "Expanded",
         }
     }
 }
@@ -125,20 +183,13 @@ enum Menu {
     Project,
 }
 
-/// A reply being streamed.
-struct ActiveStream {
-    id: u64,
-    cancel: Arc<AtomicBool>,
-    /// Model answering, for pricing the reply.
-    model: String,
-}
-
 /// One message in a conversation, with its cached layouts.
 struct Entry {
     id: u64,
     message: StoredMessage,
-    /// The reasoning block is expanded.
-    show_reasoning: bool,
+    /// The user opened (`true`) or closed the reasoning block; `None`
+    /// follows the [`ReasoningView`] setting.
+    reasoning_open: Option<bool>,
     /// Tool cards whose output is expanded.
     open_tools: HashSet<usize>,
     doc: Option<Doc>,
@@ -148,6 +199,19 @@ struct Entry {
     reasoning_len: usize,
     /// Per tool card: body layout and what it was laid out for.
     tool_bodies: Vec<ToolBody>,
+    /// Tool calls the model is writing right now (never saved).
+    streaming_calls: Vec<StreamingCall>,
+}
+
+/// A tool call still being written, shown as it streams in.
+struct StreamingCall {
+    /// Its position in the response, as the stream identifies it.
+    index: u64,
+    name: String,
+    /// The JSON arguments so far.
+    arguments: String,
+    /// How the card reads, laid out for this many bytes of arguments.
+    shown: Option<(usize, tools::CallView, Option<TextLayout>)>,
 }
 
 impl Entry {
@@ -155,19 +219,25 @@ impl Entry {
         Self {
             id,
             message,
-            show_reasoning: false,
+            reasoning_open: None,
             open_tools: HashSet::new(),
             doc: None,
             doc_key: (0, false),
             reasoning_doc: None,
             reasoning_len: 0,
             tool_bodies: Vec::new(),
+            streaming_calls: Vec::new(),
         }
     }
 
     /// Drawn inside a bordered box (prompts and errors) rather than bare.
     fn boxed(&self) -> bool {
         self.message.role == Role::User || self.message.failed
+    }
+
+    /// Whether the reasoning text is shown under `view`.
+    fn reasoning_shown(&self, view: ReasoningView) -> bool {
+        view != ReasoningView::Hidden && !self.message.reasoning.is_empty() && self.reasoning_open.unwrap_or(view == ReasoningView::Expanded)
     }
 }
 
@@ -202,9 +272,13 @@ struct Conversation {
     indexed_tokens: u64,
     entries: Vec<Entry>,
     stream: Option<ActiveStream>,
+    /// A failed request waiting to be sent again.
+    retry: Option<Retry>,
+    /// USD billed for failed requests, not yet added to a message.
+    carried_cost: f64,
     /// Tools the user allowed to run without asking, for this session.
     allowed: HashSet<String>,
-    /// Tool rounds since the last prompt.
+    /// Tool rounds since the run started or was continued.
     steps: u32,
     /// Raised to stop running tools.
     tool_cancel: Arc<AtomicBool>,
@@ -225,6 +299,8 @@ impl Conversation {
             indexed_tokens: 0,
             entries: Vec::new(),
             stream: None,
+            retry: None,
+            carried_cost: 0.0,
             allowed: HashSet::new(),
             steps: 0,
             tool_cancel: Arc::default(),
@@ -253,7 +329,10 @@ impl Conversation {
     /// Snapshot for saving; the empty placeholder of a pending reply is skipped.
     fn to_session(&self) -> Session {
         debug_assert_eq!(self.load, Load::Loaded, "saving would drop unloaded messages");
+        let mut allowed_tools: Vec<String> = self.allowed.iter().cloned().collect();
+        allowed_tools.sort();
         Session {
+            allowed_tools,
             id: self.session_id.clone(),
             title: self.title.clone(),
             created: self.created,
@@ -288,81 +367,14 @@ impl Conversation {
             .map(|e| &mut e.message.tool_calls)
     }
 
-    /// Streaming, or a tool is running.
+    /// A tool of the last reply is running.
+    fn running(&self) -> bool {
+        self.entries.last().is_some_and(|e| e.message.tool_calls.iter().any(|t| t.status == ToolStatus::Running))
+    }
+
+    /// Streaming, waiting to retry, or a tool is running.
     fn busy(&self) -> bool {
-        self.stream.is_some()
-            || self.entries.last().is_some_and(|e| e.message.tool_calls.iter().any(|t| t.status == ToolStatus::Running))
-    }
-}
-
-/// Everything a worker thread needs to stream one reply.
-pub struct SendJob {
-    /// Conversation the reply belongs to.
-    pub conversation: u64,
-    /// Identifies this stream so late events from a stopped one are dropped.
-    pub stream: u64,
-    /// Model identifier.
-    pub model: String,
-    /// Reasoning effort, or `None` for the model default.
-    pub reasoning: Option<&'static str>,
-    /// System instructions.
-    pub instructions: String,
-    /// Conversation so far; attachments are read on the worker.
-    pub history: Vec<StoredMessage>,
-    /// Offer the agent's tools.
-    pub tools: bool,
-    /// Raised to abort the stream.
-    pub cancel: Arc<AtomicBool>,
-}
-
-/// A tool call to run on a worker thread.
-pub struct ToolJob {
-    /// Conversation that made the call.
-    pub conversation: u64,
-    /// The call.
-    pub call: ToolCall,
-    /// Project folder the tool is confined to.
-    pub root: PathBuf,
-    /// Raised to stop it.
-    pub cancel: Arc<AtomicBool>,
-}
-
-/// Converts saved messages into API input. Reads attachments from disk, so
-/// call it on a worker thread.
-///
-/// # Errors
-/// An attachment could not be read.
-pub fn input_items(history: &[StoredMessage]) -> Result<Vec<InputItem>, String> {
-    let mut items = Vec::with_capacity(history.len());
-    for message in history.iter().filter(|m| !m.failed) {
-        match message.role {
-            Role::User => items.push(InputItem::Message { role: Role::User, parts: attachments::parts(&message.content, &message.attachments)? }),
-            Role::Assistant => {
-                if !message.content.is_empty() {
-                    items.push(InputItem::Message { role: Role::Assistant, parts: vec![Part::Text(message.content.clone())] });
-                }
-                // Only answered calls go back; the API needs an output for each.
-                for record in message.tool_calls.iter().filter(|r| r.status.is_finished()) {
-                    items.push(InputItem::ToolCall(record.call.clone()));
-                    items.push(InputItem::ToolOutput { call_id: record.call.call_id.clone(), output: record.output.clone() });
-                }
-            }
-        }
-    }
-    Ok(items)
-}
-
-/// System instructions for a conversation.
-fn instructions(project: Option<&str>) -> String {
-    let os = std::env::consts::OS;
-    match project {
-        Some(root) => format!(
-            "You are SereChat, an AI assistant and coding agent in a desktop app on {os}. You are working in the project folder `{root}`; \
-             tool paths are relative to it. Look at the files with your tools before answering questions about the project, and use \
-             them to make changes when asked. Writing files, editing, running commands and fetching URLs need the user's approval, so \
-             say briefly what you are about to do. Answer in Markdown and keep answers focused."
-        ),
-        None => format!("You are SereChat, a helpful AI assistant in a desktop app on {os}. Answer in Markdown and keep answers focused."),
+        self.stream.is_some() || self.retry.is_some() || self.running()
     }
 }
 
@@ -404,18 +416,21 @@ pub struct Chat {
     models: Vec<Model>,
     model: String,
     reasoning: Reasoning,
+    reasoning_view: ReasoningView,
     projects: Vec<Project>,
-    /// Project new conversations open in, and whose sessions are listed.
+    /// The folder picked last, which the app reopens in.
     project: Option<String>,
     menu: Option<Menu>,
     /// Where the open menu was drawn last frame; blocks hover beneath it.
     menu_rect: Option<Rect>,
     menu_scroll: f32,
-    /// The sidebar's project switcher, anchoring the project menu.
+    /// The header's folder chip, anchoring the project menu.
     project_button: Rect,
     scroll: f32,
     scroll_target: f32,
     stick_to_bottom: bool,
+    /// Scroll offset when the scrollbar was grabbed, while it is dragged.
+    bar_drag: Option<f32>,
     /// Message selection: anchor and focus.
     selection: Option<(SelPos, SelPos)>,
     /// Dragging a message selection.
@@ -428,6 +443,8 @@ pub struct Chat {
     /// A file is dragged over the window; `true` if it is a folder.
     drop_hover: Option<bool>,
     spotlight: Option<Spotlight>,
+    /// Skill catalogs, by location.
+    skills: skills::SkillCache,
 }
 
 impl Chat {
@@ -455,8 +472,9 @@ impl Chat {
             models: Vec::new(),
             model: model.unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
             reasoning,
+            reasoning_view: ReasoningView::default(),
             projects,
-            project,
+            project: project.clone(),
             menu: None,
             menu_rect: None,
             menu_scroll: 0.0,
@@ -464,6 +482,7 @@ impl Chat {
             scroll: 0.0,
             scroll_target: 0.0,
             stick_to_bottom: true,
+            bar_drag: None,
             selection: None,
             dragging: false,
             sidebar_scroll: 0.0,
@@ -471,13 +490,26 @@ impl Chat {
             copied: None,
             drop_hover: None,
             spotlight: None,
+            skills: skills::SkillCache::default(),
         };
         for summary in sessions {
             let id = chat.next_id();
             chat.conversations.push(Conversation::from_summary(id, summary));
         }
         chat.new_conversation();
+        // Only the chat opened at startup resumes the folder picked last.
+        chat.current().project = project;
         chat
+    }
+
+    /// The selected model, once the model list has loaded.
+    fn selected_model(&self) -> Option<&Model> {
+        self.models.iter().find(|m| m.id == self.model)
+    }
+
+    /// The effort requests use: the chosen one if the model accepts it.
+    fn reasoning_in_use(&self) -> Reasoning {
+        if Reasoning::choices(self.selected_model()).contains(&self.reasoning) { self.reasoning } else { Reasoning::Auto }
     }
 
     fn next_id(&mut self) -> u64 {
@@ -515,24 +547,48 @@ impl Chat {
             conversation.load = Load::Loading;
             actions.push(Action::LoadSession { conversation: id, session: conversation.session_id.clone() });
         }
+        let project = conversation.project.clone();
+        self.ensure_skills(project.as_deref(), actions);
     }
 
-    /// Opens an empty conversation in the current project, reusing an empty one.
+    /// Opens an empty conversation with no project, reusing an empty one.
     fn new_conversation(&mut self) {
-        let project = self.project.clone();
         if let Some(fresh) = self.conversations.iter_mut().find(|c| c.is_fresh()) {
-            fresh.project = project;
+            fresh.project = None;
             let id = fresh.id;
             self.select(id);
             return;
         }
         let id = self.next_id();
-        self.conversations.insert(0, Conversation::new(id, project));
+        self.conversations.insert(0, Conversation::new(id, None));
         self.select(id);
     }
 
-    /// Switches the active project (or plain chat) and opens a fresh chat in it.
+    /// Changes the open conversation's working folder (`None`: plain chat,
+    /// no tools). The app reopens in the folder picked last.
     fn set_project(&mut self, project: Option<String>, actions: &mut Vec<Action>) {
+        let conversation = self.current();
+        if conversation.load != Load::Loaded {
+            return;
+        }
+        if conversation.busy() {
+            self.notify("Stop the reply before changing the folder.");
+            return;
+        }
+        if conversation.project != project {
+            conversation.project.clone_from(&project);
+            // Approvals were given for the old folder.
+            conversation.allowed.clear();
+            if let Some(calls) = conversation.tool_calls() {
+                for record in calls.iter_mut().filter(|r| r.status == ToolStatus::Pending) {
+                    record.status = ToolStatus::Denied;
+                    "Skipped: the user changed the working folder.".clone_into(&mut record.output);
+                }
+            }
+            if !conversation.is_fresh() {
+                actions.push(Action::SaveSession(conversation.to_session()));
+            }
+        }
         if let Some(path) = &project {
             // Most recently used first.
             if let Some(i) = self.projects.iter().position(|p| &p.path == path) {
@@ -541,13 +597,13 @@ impl Chat {
                 self.projects.insert(0, p);
             }
         }
+        self.ensure_skills(project.as_deref(), actions);
         self.project.clone_from(&project);
-        self.sidebar_scroll = 0.0;
         actions.push(Action::SetProject(project));
-        self.new_conversation();
     }
 
-    /// Adds a project the app just opened (after a folder pick or drop).
+    /// Adds a project the app just opened (after a folder pick or drop) and
+    /// makes it the open conversation's folder.
     pub fn project_opened(&mut self, project: Project, actions: &mut Vec<Action>) {
         self.projects.retain(|p| p.path != project.path);
         let path = project.path.clone();
@@ -566,6 +622,7 @@ impl Chat {
         }
         conversation.tool_cancel.store(true, Ordering::Relaxed);
         actions.push(Action::DeleteSession(conversation.session_id));
+        actions.push(Action::StopProcesses(conversation.id));
         if self.current == id {
             self.new_conversation();
         }
@@ -576,16 +633,18 @@ impl Chat {
         let Some(index) = self.conversations.iter().position(|c| c.id == conversation && c.load == Load::Loading) else {
             return;
         };
-        let mut messages = match result {
-            Ok(session) => session.messages,
+        let (mut messages, allowed) = match result {
+            Ok(session) => (session.messages, session.allowed_tools),
             Err(e) => {
                 self.conversations[index].load = Load::Failed(format!("This session could not be opened: {e}"));
                 return;
             }
         };
-        // Tools that were running when the app closed never finished.
+        // Tools that were running, or about to run, when the app closed never
+        // finished. Calls waiting for approval still can be approved.
         for record in messages.iter_mut().flat_map(|m| m.tool_calls.iter_mut()) {
-            if record.status == ToolStatus::Running {
+            let unstarted = record.status == ToolStatus::Pending && !tools::needs_approval(&record.call.name);
+            if record.status == ToolStatus::Running || unstarted {
                 record.status = ToolStatus::Failed;
                 "Interrupted: the app closed while this was running.".clone_into(&mut record.output);
             }
@@ -595,7 +654,18 @@ impl Chat {
         let entries = messages.into_iter().zip(first + 1..).map(|(m, id)| Entry::new(id, m)).collect();
         let conversation = &mut self.conversations[index];
         conversation.entries = entries;
+        conversation.allowed = allowed.into_iter().collect();
         conversation.load = Load::Loaded;
+    }
+
+    /// Sets how replies show reasoning. Blocks the user opened or closed
+    /// by hand start following the setting again.
+    pub fn set_reasoning_view(&mut self, view: ReasoningView) {
+        self.reasoning_view = view;
+        for entry in self.conversations.iter_mut().flat_map(|c| c.entries.iter_mut()) {
+            entry.reasoning_open = None;
+        }
+        self.selection = None;
     }
 
     /// Stores the model list, keeping the selection valid.
@@ -614,6 +684,7 @@ impl Chat {
             if let Some(stream) = conversation.stream.take() {
                 stream.cancel.store(true, Ordering::Relaxed);
             }
+            conversation.retry = None;
             conversation.tool_cancel.store(true, Ordering::Relaxed);
         }
     }
@@ -718,235 +789,22 @@ impl Chat {
         self.request_reply(id, actions);
     }
 
-    /// Appends an empty reply to conversation `id` and streams into it.
-    fn request_reply(&mut self, id: u64, actions: &mut Vec<Action>) {
-        let (reply_id, stream_id) = (self.next_id(), self.next_id());
-        let model = self.model.clone();
-        let reasoning = self.reasoning.effort();
-        let Some(conversation) = self.find(id) else { return };
-        let cancel = Arc::new(AtomicBool::new(false));
-        conversation.updated = unix_now();
-        conversation.tool_cancel = Arc::default();
-        let history: Vec<StoredMessage> = conversation.entries.iter().map(|e| e.message.clone()).collect();
-        conversation.entries.push(Entry::new(reply_id, StoredMessage::new(Role::Assistant, String::new())));
-        conversation.stream = Some(ActiveStream { id: stream_id, cancel: Arc::clone(&cancel), model: model.clone() });
-        actions.push(Action::SaveSession(conversation.to_session()));
-        let job = SendJob {
-            conversation: id,
-            stream: stream_id,
-            model,
-            reasoning,
-            instructions: instructions(conversation.project.as_deref()),
-            history,
-            tools: conversation.project.is_some(),
-            cancel,
-        };
-        if id == self.current {
-            self.stick_to_bottom = true;
-        }
-        actions.push(Action::Send(job));
-    }
-
-    fn stream_target(conversations: &mut [Conversation], conversation: u64, stream: u64) -> Option<&mut Conversation> {
-        conversations
-            .iter_mut()
-            .find(|c| c.id == conversation && c.stream.as_ref().is_some_and(|s| s.id == stream))
-    }
-
-    /// Applies one streamed update.
-    pub fn stream_event(&mut self, conversation: u64, stream: u64, event: StreamEvent) {
-        let Some(conversation) = Self::stream_target(&mut self.conversations, conversation, stream) else {
-            return;
-        };
-        let (Some(stream), Some(entry)) = (&conversation.stream, conversation.entries.last_mut()) else {
-            return;
-        };
-        let message = &mut entry.message;
-        match event {
-            StreamEvent::Text(delta) => {
-                // Models often open with blank lines; don't render them.
-                let delta = if message.content.is_empty() { delta.trim_start() } else { &delta };
-                message.content.push_str(delta);
-            }
-            StreamEvent::Reasoning(delta) => message.reasoning.push_str(&delta),
-            StreamEvent::Completed(Completion { usage, reasoning, tool_calls }) => {
-                if message.reasoning.is_empty() {
-                    message.reasoning = reasoning;
-                }
-                message.cost = self.models.iter().find(|m| m.id == stream.model).map_or(0.0, |m| m.cost(usage));
-                message.model = Some(stream.model.clone());
-                message.usage = usage;
-                message.tool_calls = tool_calls.into_iter().map(|call| ToolRecord { call, status: ToolStatus::Pending, output: String::new() }).collect();
-            }
+    fn toggle_settings(&mut self, actions: &mut Vec<Action>) {
+        if self.page == Page::Settings {
+            self.menu = None;
+            self.page = Page::Chat;
+        } else {
+            self.open_settings(actions);
         }
     }
 
-    /// Finishes a stream, queues a save and starts any tool calls. Returns
-    /// `true` if the server rejected our token.
-    pub fn stream_end(&mut self, conversation: u64, stream: u64, result: Result<bool, Error>, actions: &mut Vec<Action>) -> bool {
-        let unauthorized = result.as_ref().is_err_and(Error::is_unauthorized);
-        let next = self.next_id();
-        let Some(target) = Self::stream_target(&mut self.conversations, conversation, stream) else {
-            return false;
-        };
-        // A stream the user stopped is already detached, so anything short of
-        // a completed reply here is a failure worth showing.
-        target.stream = None;
-        target.updated = unix_now();
-        let reply = target.entries.last_mut().filter(|e| e.message.role == Role::Assistant && !e.message.failed);
-        let empty = reply.as_ref().is_none_or(|e| e.message.content.is_empty() && e.message.tool_calls.is_empty());
-        let error = match result {
-            Err(error) => Some(error.to_string()),
-            Ok(true) if empty => Some("The model returned an empty response.".to_owned()),
-            Ok(true) => None,
-            Ok(false) => Some("The connection closed before the reply finished.".to_owned()),
-        };
-        if let Some(error) = error {
-            match reply {
-                Some(entry) if entry.message.content.is_empty() && entry.message.tool_calls.is_empty() => {
-                    entry.message.content = error;
-                    entry.message.failed = true;
-                    entry.doc = None;
-                }
-                _ => {
-                    let mut message = StoredMessage::new(Role::Assistant, error);
-                    message.failed = true;
-                    target.entries.push(Entry::new(next, message));
-                }
-            }
-        }
-        actions.push(Action::SaveSession(target.to_session()));
-        self.advance(conversation, actions);
-        unauthorized
-    }
-
-    /// Starts tool calls that may run on their own, and continues the
-    /// conversation once every call of the last reply has a result.
-    fn advance(&mut self, id: u64, actions: &mut Vec<Action>) {
-        let Some(conversation) = self.find(id) else { return };
-        let root = conversation.project.clone().map(PathBuf::from);
-        let allowed = conversation.allowed.clone();
-        let cancel = Arc::clone(&conversation.tool_cancel);
-        let Some(calls) = conversation.tool_calls() else { return };
-        for record in calls.iter_mut().filter(|r| r.status == ToolStatus::Pending) {
-            let Some(root) = &root else {
-                record.status = ToolStatus::Failed;
-                "Tools are only available in a project.".clone_into(&mut record.output);
-                continue;
-            };
-            if !tools::needs_approval(&record.call.name) || allowed.contains(&record.call.name) {
-                record.status = ToolStatus::Running;
-                actions.push(Action::RunTool(ToolJob { conversation: id, call: record.call.clone(), root: root.clone(), cancel: Arc::clone(&cancel) }));
-            }
-        }
-        if !calls.iter().all(|r| r.status.is_finished()) {
-            return;
-        }
-        conversation.steps += 1;
-        if conversation.steps > MAX_STEPS {
-            let next = self.next_id();
-            let Some(conversation) = self.find(id) else { return };
-            let mut message = StoredMessage::new(Role::Assistant, format!("Stopped after {MAX_STEPS} tool rounds. Send a message to continue."));
-            message.failed = true;
-            conversation.entries.push(Entry::new(next, message));
-            actions.push(Action::SaveSession(conversation.to_session()));
-            return;
-        }
-        self.request_reply(id, actions);
-    }
-
-    /// Stores a finished tool call's result and moves the agent on.
-    pub fn tool_done(&mut self, conversation: u64, call_id: &str, result: Result<String, String>, actions: &mut Vec<Action>) {
-        let Some(target) = self.find(conversation) else { return };
-        let Some(record) = target
-            .entries
-            .iter_mut()
-            .rev()
-            .flat_map(|e| e.message.tool_calls.iter_mut())
-            .find(|r| r.call.call_id == call_id && r.status == ToolStatus::Running)
-        else {
-            return;
-        };
-        (record.status, record.output) = match result {
-            Ok(output) => (ToolStatus::Done, output),
-            Err(error) => (ToolStatus::Failed, error),
-        };
-        actions.push(Action::SaveSession(target.to_session()));
-        self.advance(conversation, actions);
-    }
-
-    /// Answers an approval prompt for tool call `index` of entry `entry`.
-    fn decide(&mut self, entry: usize, index: usize, decision: Decision, actions: &mut Vec<Action>) {
-        let id = self.current;
-        let conversation = self.current();
-        let Some(record) = conversation.entries.get_mut(entry).and_then(|e| e.message.tool_calls.get_mut(index)) else { return };
-        if record.status != ToolStatus::Pending {
-            return;
-        }
-        match decision {
-            Decision::Deny => {
-                record.status = ToolStatus::Denied;
-                "The user declined this tool call.".clone_into(&mut record.output);
-            }
-            Decision::Always => {
-                let name = record.call.name.clone();
-                conversation.allowed.insert(name);
-            }
-            Decision::Allow => {
-                // Approve just this call: run it right away.
-                let root = conversation.project.clone().map(PathBuf::from);
-                if let Some(root) = root {
-                    record.status = ToolStatus::Running;
-                    actions.push(Action::RunTool(ToolJob {
-                        conversation: id,
-                        call: record.call.clone(),
-                        root,
-                        cancel: Arc::clone(&conversation.tool_cancel),
-                    }));
-                }
-            }
-        }
-        actions.push(Action::SaveSession(self.current().to_session()));
-        self.advance(id, actions);
-    }
-
-    /// Stops the current conversation's stream and tools, keeping partial output.
-    fn stop(&mut self, actions: &mut Vec<Action>) {
-        let conversation = self.current();
-        let mut stopped = false;
-        if let Some(stream) = conversation.stream.take() {
-            stream.cancel.store(true, Ordering::Relaxed);
-            if conversation
-                .entries
-                .last()
-                .is_some_and(|e| e.message.role == Role::Assistant && e.message.content.is_empty() && e.message.tool_calls.is_empty())
-            {
-                conversation.entries.pop();
-            }
-            stopped = true;
-        }
-        conversation.tool_cancel.store(true, Ordering::Relaxed);
-        if let Some(calls) = conversation.tool_calls() {
-            for record in calls.iter_mut().filter(|r| !r.status.is_finished()) {
-                record.status = if record.status == ToolStatus::Running { ToolStatus::Failed } else { ToolStatus::Denied };
-                "Stopped by the user.".clone_into(&mut record.output);
-                stopped = true;
-            }
-        }
-        if stopped {
-            actions.push(Action::SaveSession(conversation.to_session()));
-        }
-    }
-
-    /// Whether anything is streaming or running (drives redraws for animations).
-    #[must_use]
-    pub fn is_busy(&self) -> bool {
-        self.conversations.iter().any(Conversation::busy)
-    }
-
-    fn toggle_settings(&mut self) {
+    /// Shows the settings page with the open chat's skills as known, and
+    /// rescans them in case the files changed.
+    fn open_settings(&mut self, actions: &mut Vec<Action>) {
         self.menu = None;
-        self.page = if self.page == Page::Settings { Page::Chat } else { Page::Settings };
+        self.page = Page::Settings;
+        self.show_skills();
+        self.refresh_skills(true, actions);
     }
 
     /// Text of the message selection, if any.
@@ -959,7 +817,8 @@ impl Chat {
         let conversation = self.conversations.iter().find(|c| c.id == self.current)?;
         let mut out = String::new();
         for (index, entry) in conversation.entries.iter().enumerate().take(to.0 + 1).skip(from.0) {
-            for (doc_id, doc) in [(0u8, entry.reasoning_doc.as_ref().filter(|_| entry.show_reasoning)), (1, entry.doc.as_ref())] {
+            let reasoning = entry.reasoning_doc.as_ref().filter(|_| entry.reasoning_shown(self.reasoning_view));
+            for (doc_id, doc) in [(0u8, reasoning), (1, entry.doc.as_ref())] {
                 let Some(doc) = doc else { continue };
                 if (index, doc_id) < (from.0, from.1) || (index, doc_id) > (to.0, to.1) {
                     continue;
@@ -1014,21 +873,15 @@ impl Chat {
         self.spotlight = None;
         match pick {
             Pick::NewChat => self.new_conversation(),
-            Pick::Settings => {
-                self.page = Page::Settings;
-            }
+            Pick::Settings => self.open_settings(actions),
             Pick::Theme(scheme) => actions.push(Action::SetTheme(scheme)),
             Pick::OpenFolder => actions.push(Action::OpenProject(None)),
             Pick::Attach => actions.push(Action::PickFiles),
             Pick::Project(path) => self.set_project(path, actions),
             Pick::Session(session) => {
-                let Some((id, project)) = self.conversations.iter().find(|c| c.session_id == session).map(|c| (c.id, c.project.clone())) else {
-                    return;
-                };
-                if project != self.project {
-                    self.set_project(project, actions);
+                if let Some(id) = self.conversations.iter().find(|c| c.session_id == session).map(|c| c.id) {
+                    self.open(id, actions);
                 }
-                self.open(id, actions);
             }
             Pick::Model(model) => {
                 self.model.clone_from(&model);
@@ -1053,7 +906,7 @@ impl Chat {
             Key::Named(NamedKey::Escape) if self.menu.is_some() => self.menu = None,
             Key::Named(NamedKey::Escape) if self.page == Page::Settings => self.page = Page::Chat,
             Key::Character(c) if primary && is(c, "k") => self.open_spotlight(),
-            Key::Character(c) if primary && is(c, ",") => self.toggle_settings(),
+            Key::Character(c) if primary && is(c, ",") => self.toggle_settings(actions),
             Key::Character(c) if primary && is(c, "n") => self.new_conversation(),
             Key::Character(c) if primary && is(c, "o") => actions.push(Action::OpenProject(None)),
             _ if self.page == Page::Settings => {}
@@ -1102,10 +955,10 @@ impl Chat {
         self.draw_sidebar(p, ui, sidebar, actions);
         let toolbar = if self.page == Page::Settings {
             let totals = self.totals();
-            self.settings.draw(p, ui, main, scheme, totals, actions);
+            self.settings.draw(p, ui, main, scheme, self.reasoning_view, totals, actions);
             [Rect::default(); 2]
         } else {
-            self.draw_header(p, main);
+            self.draw_header(p, ui, main);
             let (composer_top, toolbar) = self.draw_composer(p, ui, main, actions);
             let messages = Rect::new(main.x, theme::HEADER_HEIGHT, main.w, composer_top - theme::HEADER_HEIGHT - 12.0);
             self.draw_messages(p, ui, messages, actions);
@@ -1144,7 +997,7 @@ impl Chat {
     }
 
     /// Title bar of the chat area: session title, project folder and cost.
-    fn draw_header(&mut self, p: &mut Painter, main: Rect) {
+    fn draw_header(&mut self, p: &mut Painter, ui: &mut Ui, main: Rect) {
         let t = p.theme;
         let bar = Rect::new(main.x, 0.0, main.w, theme::HEADER_HEIGHT);
         p.rect(Rect::new(bar.x, bar.bottom() - 1.0, bar.w, 1.0), t.border, 0.0);
@@ -1160,16 +1013,30 @@ impl Chat {
             p.text(&spent, right, bar.y + (bar.h - spent.height()) * 0.5, t.text_faint);
             right -= 20.0;
         }
-        if let Some(path) = project {
-            // The working directory the agent's tools operate in.
-            let mut dir = p.layout(&display_path(&path), crate::text::Style::mono(12.0), None);
-            dir.truncate(p.fonts, (bar.w * 0.4).max(80.0));
-            let chip = Rect::new(right - dir.width() - 30.0, bar.y + 10.0, dir.width() + 30.0, bar.h - 20.0);
-            p.bordered(chip, t.surface, theme::RADIUS_SM, 1.0, t.border);
-            crate::ui::folder_icon(p, chip.x + 8.0, chip.y + (chip.h - 10.0) * 0.5, t.text_faint);
-            p.text(&dir, chip.x + 24.0, chip.y + (chip.h - dir.height()) * 0.5, t.text_muted);
-            right = chip.x - 12.0;
+        // The working directory the agent's tools operate in; click to change it.
+        let (label, style) = match &project {
+            Some(path) => (display_path(path), crate::text::Style::mono(12.0)),
+            None => ("No project".to_owned(), theme::SMALL),
+        };
+        let mut dir = p.layout(&label, style, None);
+        dir.truncate(p.fonts, (bar.w * 0.4).max(80.0));
+        let chip = Rect::new(right - dir.width() - 46.0, bar.y + 10.0, dir.width() + 46.0, bar.h - 20.0);
+        self.project_button = chip;
+        let open = self.menu == Some(Menu::Project);
+        let hovered = ui.hovered(chip);
+        let hover = ui.anim(crate::ui::id("folder-chip"), f32::from(u8::from(hovered || open)));
+        p.bordered(chip, crate::paint::mix(t.surface, t.hover, hover), theme::RADIUS_SM, 1.0, t.border);
+        crate::ui::folder_icon(p, chip.x + 8.0, chip.y + (chip.h - 10.0) * 0.5, t.text_faint);
+        p.text(&dir, chip.x + 24.0, chip.y + (chip.h - dir.height()) * 0.5, t.text_muted);
+        crate::ui::chevron(p, chip.right() - 16.0, chip.y + chip.h * 0.5 - 2.0, true, t.text_faint);
+        if hovered {
+            ui.cursor = winit::window::CursorIcon::Pointer;
+            if ui.clicked(chip) {
+                self.menu = if open { None } else { Some(Menu::Project) };
+                self.menu_scroll = 0.0;
+            }
         }
+        right = chip.x - 12.0;
         let mut layout = p.layout(&title, theme::LABEL, None);
         layout.truncate(p.fonts, (right - bar.x - 16.0).max(40.0));
         p.text(&layout, bar.x + 16.0, bar.y + (bar.h - layout.height()) * 0.5, t.text);
@@ -1276,6 +1143,8 @@ pub fn format_cost(usd: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serechat::{Completion, InputItem, Part, StreamEvent, ToolCall};
+
     use super::*;
 
     #[test]
@@ -1287,7 +1156,7 @@ mod tests {
         assert_eq!(format_cost(0.000_01), "<$0.0001");
         assert_eq!(format_cost(0.003_14), "$0.0031");
         assert_eq!(format_cost(1.5), "$1.50");
-        let usage = Usage { input_tokens: 1_000, output_tokens: 204 };
+        let usage = Usage::new(1_000, 204);
         assert_eq!(usage_caption("M", usage, 0.0031), "M  ·  1,204 tokens  ·  $0.0031");
         assert_eq!(usage_caption("M", usage, 0.0), "M  ·  1,204 tokens");
         assert_eq!(usage_caption("M", Usage::default(), 1.0), "M");
@@ -1308,9 +1177,70 @@ mod tests {
         for r in Reasoning::ALL {
             assert_eq!(Reasoning::from_key(Some(r.key())), r);
         }
-        assert_eq!(Reasoning::Auto.effort(), None);
-        assert_eq!(Reasoning::Off.effort(), Some("none"));
         assert_eq!(Reasoning::from_key(Some("bogus")), Reasoning::Auto);
+    }
+
+    #[test]
+    fn reasoning_follows_the_model() {
+        let model = |levels: &[&str]| Model {
+            id: "m".into(),
+            name: String::new(),
+            input_cost_per_million: 0.0,
+            output_cost_per_million: 0.0,
+            cache_read_cost_per_million: None,
+            cache_write_cost_per_million: None,
+            input_types: Vec::new(),
+            context_window: 0,
+            reasoning_levels: levels.iter().map(|l| (*l).to_owned()).collect(),
+        };
+        let claude = model(&["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(Reasoning::choices(Some(&claude))[..2], [Reasoning::Auto, Reasoning::Low]);
+        assert_eq!(Reasoning::choices(Some(&model(&[]))), [Reasoning::Auto], "a model that cannot reason");
+        assert_eq!(Reasoning::choices(None).len(), Reasoning::ALL.len());
+
+        let mut chat = Chat::new(Some("m".into()), Reasoning::Off, Vec::new(), Vec::new(), None);
+        assert_eq!(chat.reasoning_in_use(), Reasoning::Off, "unknown models keep the choice");
+        chat.set_models(vec![claude]);
+        assert_eq!(chat.reasoning_in_use(), Reasoning::Auto, "Off is not a level this model accepts");
+        chat.reasoning = Reasoning::Max;
+        assert_eq!(chat.reasoning_in_use(), Reasoning::Max);
+    }
+
+    #[test]
+    fn reasoning_visibility_follows_the_setting() {
+        for v in ReasoningView::ALL {
+            assert_eq!(ReasoningView::from_key(Some(v.key())), v);
+        }
+        assert_eq!(ReasoningView::from_key(None), ReasoningView::Collapsed);
+
+        let mut message = StoredMessage::new(Role::Assistant, "42".into());
+        message.reasoning = "6 × 7".into();
+        let mut entry = Entry::new(1, message);
+        assert!(!entry.reasoning_shown(ReasoningView::Collapsed));
+        assert!(entry.reasoning_shown(ReasoningView::Expanded));
+        entry.reasoning_open = Some(true);
+        assert!(entry.reasoning_shown(ReasoningView::Collapsed), "a click overrides the setting");
+        assert!(!entry.reasoning_shown(ReasoningView::Hidden), "hidden always wins");
+    }
+
+    #[test]
+    fn only_reasoning_replies_record_thinking_time() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        for reasoning in ["", "thought"] {
+            chat.composer.insert("hi");
+            let mut actions = Vec::new();
+            chat.send(&mut actions);
+            let Some(Action::Send(job)) = actions.pop() else { panic!("no send") };
+            if let Some(stream) = &mut chat.current().stream {
+                stream.started -= std::time::Duration::from_secs(3);
+            }
+            chat.stream_event(job.conversation, job.stream, StreamEvent::Text("answer".into()));
+            let completion = Completion { reasoning: reasoning.into(), ..Completion::default() };
+            chat.stream_event(job.conversation, job.stream, StreamEvent::Completed(completion));
+            chat.stream_end(job.conversation, job.stream, Ok(true), &mut Vec::new());
+            let ms = chat.current().entries.last().map(|e| e.message.reasoning_ms);
+            assert_eq!(ms.is_some_and(|ms| ms >= 3000), !reasoning.is_empty(), "reasoning {reasoning:?}");
+        }
     }
 
     fn reply_with(calls: &[(&str, &str)]) -> StoredMessage {
@@ -1326,7 +1256,7 @@ mod tests {
     fn sessions_round_trip_through_the_screen() {
         let mut reply = StoredMessage::new(Role::Assistant, "hello".into());
         reply.cost = 0.5;
-        reply.usage = Usage { input_tokens: 3, output_tokens: 4 };
+        reply.usage = Usage::new(3, 4);
         let session = Session {
             id: "abc".into(),
             title: "Hi".into(),
@@ -1334,6 +1264,7 @@ mod tests {
             updated: 2,
             project: None,
             messages: vec![StoredMessage::new(Role::User, "hi".into()), reply],
+            allowed_tools: Vec::new(),
         };
         let mut chat = Chat::new(None, Reasoning::Auto, vec![session.summary()], Vec::new(), None);
         // The saved session plus a fresh, unsaved conversation.
@@ -1345,6 +1276,8 @@ mod tests {
         let id = chat.conversations.iter().find(|c| c.session_id == "abc").map(|c| c.id).unwrap();
         let mut actions = Vec::new();
         chat.open(id, &mut actions);
+        // Opening also looks for the skills it can use.
+        actions.retain(|a| !matches!(a, Action::ScanSkills { .. }));
         assert!(matches!(&actions[..], [Action::LoadSession { session, .. }] if session == "abc"));
 
         // Sending must wait for the history, or saving would drop it.
@@ -1395,6 +1328,35 @@ mod tests {
     }
 
     #[test]
+    fn the_folder_belongs_to_the_session() {
+        let project = std::env::temp_dir().to_string_lossy().into_owned();
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), Some(project.clone()));
+        chat.composer.insert("go");
+        let mut actions = Vec::new();
+        chat.send(&mut actions);
+        let Some(Action::Send(job)) = actions.pop() else { panic!() };
+        let completion = Completion { tool_calls: reply_with(&[("a", "write_file")]).tool_calls.into_iter().map(|r| r.call).collect(), ..Completion::default() };
+        chat.stream_event(job.conversation, job.stream, StreamEvent::Completed(completion));
+        chat.stream_end(job.conversation, job.stream, Ok(true), &mut Vec::new());
+        chat.current().allowed.insert("run_command".into());
+
+        let mut actions = Vec::new();
+        chat.set_project(None, &mut actions);
+        let session = chat.current();
+        assert_eq!(session.project, None);
+        assert!(session.allowed.is_empty(), "approvals don't carry over to another folder");
+        assert!(session.tool_calls().unwrap().iter().all(|r| r.status == ToolStatus::Denied));
+        actions.retain(|a| !matches!(a, Action::ScanSkills { .. }));
+        assert!(matches!(&actions[..], [Action::SaveSession(s), Action::SetProject(None)] if s.project.is_none()));
+
+        // A new chat opens without a folder.
+        chat.set_project(Some(project), &mut Vec::new());
+        chat.new_conversation();
+        assert_eq!(chat.current().project, None);
+        assert_eq!(chat.conversations.iter().filter(|c| c.project.is_some()).count(), 1);
+    }
+
+    #[test]
     fn stopping_answers_every_open_call() {
         let project = std::env::temp_dir().to_string_lossy().into_owned();
         let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), Some(project));
@@ -1409,5 +1371,230 @@ mod tests {
         let calls = chat.current().tool_calls().cloned().unwrap();
         assert!(calls.iter().all(|r| r.status.is_finished()));
         assert!(!chat.is_busy());
+        assert!(chat.current().resumable(), "a stopped run can be continued");
+    }
+
+    fn project_chat() -> Chat {
+        Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), Some(std::env::temp_dir().to_string_lossy().into_owned()))
+    }
+
+    /// Sends `prompt` and returns the request.
+    fn start(chat: &mut Chat, prompt: &str) -> SendJob {
+        chat.composer.insert(prompt);
+        let mut actions = Vec::new();
+        chat.send(&mut actions);
+        next_send(actions).expect("a request")
+    }
+
+    /// Completes `job` with `completion` and returns what the chat asked for.
+    fn finish(chat: &mut Chat, job: &SendJob, completion: Completion) -> Vec<Action> {
+        chat.stream_event(job.conversation, job.stream, StreamEvent::Completed(completion));
+        let mut actions = Vec::new();
+        chat.stream_end(job.conversation, job.stream, Ok(true), &mut actions);
+        actions
+    }
+
+    fn next_send(actions: Vec<Action>) -> Option<SendJob> {
+        actions.into_iter().find_map(|a| if let Action::Send(job) = a { Some(job) } else { None })
+    }
+
+    fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall { call_id: id.into(), name: name.into(), arguments: arguments.into() }
+    }
+
+    #[test]
+    fn failed_requests_retry_then_give_up() {
+        use std::time::Instant;
+        let mut chat = project_chat();
+        let mut job = start(&mut chat, "hi");
+        for attempt in 1..=agent::MAX_RETRIES {
+            chat.stream_event(job.conversation, job.stream, StreamEvent::Text("partial".into()));
+            let error = Error::Response { code: Some("server_error".into()), message: "boom".into() };
+            chat.stream_end(job.conversation, job.stream, Err(error), &mut Vec::new());
+            let c = chat.current();
+            assert_eq!(c.retry.as_ref().map(|r| r.attempt), Some(attempt));
+            assert_eq!(c.entries.len(), 1, "the partial reply is dropped");
+            assert!(c.busy() && !c.resumable());
+            let mut actions = Vec::new();
+            chat.tick(Instant::now(), &mut actions);
+            assert!(actions.is_empty(), "not due yet");
+            chat.tick(chat.next_deadline().unwrap(), &mut actions);
+            job = next_send(actions).expect("retried");
+        }
+        let error = Error::Response { code: Some("server_error".into()), message: "boom".into() };
+        chat.stream_end(job.conversation, job.stream, Err(error), &mut Vec::new());
+        let c = chat.current();
+        assert!(c.retry.is_none() && c.entries.last().is_some_and(|e| e.message.failed && e.message.content == "boom"));
+        assert!(c.resumable(), "Continue tries again by hand");
+        let id = c.id;
+        let mut actions = Vec::new();
+        chat.resume(id, &mut actions);
+        let job = next_send(actions).expect("continued");
+
+        // Final errors are shown at once.
+        let error = Error::Response { code: Some("invalid_request_error".into()), message: "bad".into() };
+        chat.stream_end(job.conversation, job.stream, Err(error), &mut Vec::new());
+        assert!(chat.current().retry.is_none() && !chat.current().busy());
+    }
+
+    #[test]
+    fn silent_streams_are_retried() {
+        let mut chat = project_chat();
+        let job = start(&mut chat, "hi");
+        let mut actions = Vec::new();
+        chat.tick(chat.next_deadline().unwrap() + std::time::Duration::from_secs(1), &mut actions);
+        assert!(job.cancel.load(Ordering::Relaxed), "the dead stream is abandoned");
+        assert_eq!(chat.current().retry.as_ref().map(|r| r.attempt), Some(1));
+        // Its late end is ignored.
+        chat.stream_end(job.conversation, job.stream, Ok(true), &mut Vec::new());
+        assert!(chat.current().retry.is_some());
+    }
+
+    #[test]
+    fn replies_cut_off_never_run_their_calls() {
+        let mut chat = project_chat();
+        let job = start(&mut chat, "write it");
+        let cut = Some("max_output_tokens".to_owned());
+        let completion = Completion { tool_calls: vec![call("w", "write_file", r#"{"path":"a","con"#)], incomplete: cut.clone(), ..Completion::default() };
+        let actions = finish(&mut chat, &job, completion);
+        assert!(!actions.iter().any(|a| matches!(a, Action::RunTool(_))));
+        let record = chat.current().entries.iter().flat_map(|e| &e.message.tool_calls).next().cloned().unwrap();
+        assert!(record.status == ToolStatus::Failed && record.output.contains("output limit"));
+        let next = next_send(actions).expect("the model is told and tries again");
+
+        // A text reply that was cut off just says so.
+        chat.stream_event(next.conversation, next.stream, StreamEvent::Text("Long".into()));
+        let actions = finish(&mut chat, &next, Completion { incomplete: cut, ..Completion::default() });
+        assert!(next_send(actions).is_none());
+        assert!(chat.current().entries.last().is_some_and(|e| e.message.failed && e.message.content.contains("cut off")));
+    }
+
+    #[test]
+    fn long_conversations_are_summarised_with_their_plan() {
+        let mut chat = project_chat();
+        let job = start(&mut chat, "refactor");
+        let plan = call("p", "update_plan", r#"{"steps":[{"step":"Read","status":"done"},{"step":"Change","status":"in_progress"}]}"#);
+        let skill = call("s", "use_skill", r#"{"name":"review"}"#);
+        let skill_file = call("f", "use_skill", r#"{"name":"review","file":"references/GUIDE.md"}"#);
+        // The reply used most of the (default) window.
+        let completion = Completion { usage: Usage::new(120_000, 1_000), tool_calls: vec![plan, skill, skill_file], ..Completion::default() };
+        let actions = finish(&mut chat, &job, completion);
+        assert_eq!(actions.iter().filter(|a| matches!(a, Action::RunTool(_))).count(), 3, "none of them needs approval");
+        chat.tool_done(job.conversation, "p", Ok("Plan updated: 2 steps.".into()), &mut Vec::new());
+        chat.tool_done(job.conversation, "f", Ok("The guide.".into()), &mut Vec::new());
+        let mut actions = Vec::new();
+        chat.tool_done(job.conversation, "s", Ok("<skill_content name=\"review\">Check everything.</skill_content>".into()), &mut actions);
+
+        let summary = next_send(actions).expect("a summary request");
+        assert_eq!(summary.tool_choice, Some("none"));
+        assert!(summary.tools, "tools stay declared for the tool history");
+        assert!(summary.history.last().is_some_and(|m| m.role == Role::User && m.content.contains("summary")));
+        chat.stream_event(summary.conversation, summary.stream, StreamEvent::Text("Read the code.".into()));
+        let actions = finish(&mut chat, &summary, Completion { usage: Usage::new(121_000, 50), ..Completion::default() });
+
+        let reply = next_send(actions).expect("the reply it was made for");
+        assert_eq!(reply.tool_choice, None);
+        let items = input_items(&reply.history).unwrap();
+        assert_eq!(items.len(), 1, "only the summary reaches the model");
+        let InputItem::Message { parts, .. } = &items[0] else { panic!("a message") };
+        assert!(matches!(&parts[0], Part::Text(t) if t.contains("Read the code.") && t.contains("→ Change")));
+        // The skills in use keep their instructions; files they read don't.
+        assert!(matches!(&parts[0], Part::Text(t) if t.contains("Check everything.") && !t.contains("The guide.")));
+        // The history itself is kept for the user.
+        assert!(chat.current().entries.len() >= 3);
+    }
+
+    #[test]
+    fn skills_work_without_a_project() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        let skill = crate::skills::Skill { name: "notes".into(), description: "d".into(), path: "x".into(), scope: crate::skills::Scope::User };
+        let mine = Arc::new(crate::skills::Catalog { skills: vec![skill], ..crate::skills::Catalog::default() });
+        chat.skills_scanned(None, None, Arc::clone(&mine));
+
+        let job = start(&mut chat, "take notes");
+        assert!(!job.tools && job.project.is_none());
+        assert_eq!(job.user_skills.as_deref(), Some(&*mine), "the request uses the cached catalog");
+        let calls = vec![call("s", "use_skill", r#"{"name":"notes"}"#), call("r", "read_file", r#"{"path":"a"}"#)];
+        let actions = finish(&mut chat, &job, Completion { tool_calls: calls, ..Completion::default() });
+        let runs: Vec<&ToolJob> = actions.iter().filter_map(|a| if let Action::RunTool(t) = a { Some(t) } else { None }).collect();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].call.name == "use_skill" && runs[0].root.is_none() && runs[0].skills.len() == 1);
+        let calls = chat.current().tool_calls().cloned().unwrap();
+        assert!(calls[1].status == ToolStatus::Failed && calls[1].output.contains("only available in a project"));
+    }
+
+    #[test]
+    fn tool_calls_show_while_written_and_runs_add_up() {
+        let mut chat = project_chat();
+        let priced = Model {
+            id: DEFAULT_MODEL.into(),
+            name: String::new(),
+            input_cost_per_million: 1_000_000.0,
+            output_cost_per_million: 0.0,
+            cache_read_cost_per_million: None,
+            cache_write_cost_per_million: None,
+            input_types: Vec::new(),
+            context_window: 0,
+            reasoning_levels: Vec::new(),
+        };
+        chat.set_models(vec![priced]);
+        let job = start(&mut chat, "write it");
+        chat.stream_event(job.conversation, job.stream, StreamEvent::ToolCallStarted { index: 1, name: "write_file".into() });
+        chat.stream_event(job.conversation, job.stream, StreamEvent::ToolCallDelta { index: 1, delta: r#"{"path":"a.txt","content":"hi"#.into() });
+        let live = &chat.current().entries.last().unwrap().streaming_calls;
+        assert_eq!((live.len(), live[0].arguments.as_str()), (1, r#"{"path":"a.txt","content":"hi"#));
+
+        // The attempt fails after being billed $2; the retry succeeds for $1.
+        chat.stream_event(job.conversation, job.stream, StreamEvent::Charged(Usage::new(2, 0)));
+        let error = Error::Response { code: Some("server_error".into()), message: "boom".into() };
+        chat.stream_end(job.conversation, job.stream, Err(error), &mut Vec::new());
+        let mut actions = Vec::new();
+        chat.tick(chat.next_deadline().unwrap(), &mut actions);
+        let retry = next_send(actions).unwrap();
+        let completion = Completion { usage: Usage::new(1, 0), tool_calls: vec![call("w", "write_file", "{}")], ..Completion::default() };
+        finish(&mut chat, &retry, completion);
+        let reply = chat.current().entries.iter().find(|e| !e.message.tool_calls.is_empty()).unwrap();
+        assert!(reply.streaming_calls.is_empty(), "the finished call replaces its preview");
+        assert!((reply.message.cost - 3.0).abs() < 1e-9, "failed attempts are billed with the reply");
+        let (steps, cost) = chat.current().run_stats();
+        assert_eq!(steps, 1);
+        assert!((cost - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overflowing_requests_compact_and_keep_the_new_prompt() {
+        let mut chat = project_chat();
+        let job = start(&mut chat, "first");
+        chat.stream_event(job.conversation, job.stream, StreamEvent::Text("ok".into()));
+        finish(&mut chat, &job, Completion { usage: Usage::new(1_000, 10), ..Completion::default() });
+
+        let job = start(&mut chat, "second");
+        let mut actions = Vec::new();
+        let overflow = Error::Response { code: Some("context_length_exceeded".into()), message: "too long".into() };
+        chat.stream_end(job.conversation, job.stream, Err(overflow), &mut actions);
+        let summary = next_send(actions).expect("a summary request");
+        assert!(summary.history.iter().all(|m| m.content != "second"), "the new prompt is not summarised");
+        chat.stream_event(summary.conversation, summary.stream, StreamEvent::Text("They said first.".into()));
+        let reply = next_send(finish(&mut chat, &summary, Completion::default())).expect("the reply");
+        let items = input_items(&reply.history).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[1], InputItem::Message { parts, .. } if matches!(&parts[0], Part::Text(t) if t == "second")));
+    }
+
+    #[test]
+    fn long_runs_pause_and_continue() {
+        let mut chat = project_chat();
+        let job = start(&mut chat, "go");
+        chat.current().steps = agent::STEP_BUDGET;
+        let actions = finish(&mut chat, &job, Completion { tool_calls: vec![call("r", "read_file", "{}")], ..Completion::default() });
+        assert!(next_send(actions).is_none());
+        let mut actions = Vec::new();
+        chat.tool_done(job.conversation, "r", Ok("x".into()), &mut actions);
+        assert!(next_send(actions).is_none(), "paused");
+        assert!(chat.current().resumable());
+        let mut actions = Vec::new();
+        chat.resume(job.conversation, &mut actions);
+        assert!(next_send(actions).is_some());
+        assert_eq!(chat.current().steps, 0);
     }
 }

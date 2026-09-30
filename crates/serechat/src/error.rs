@@ -21,6 +21,16 @@ pub enum Error {
         /// Human-readable description suitable for display.
         message: String,
     },
+    /// A streamed response failed after it started (`response.failed` or an
+    /// `error` event). The server's codes: `server_error` and
+    /// `rate_limit_exceeded` are worth retrying, `context_length_exceeded`
+    /// means the input must shrink, `invalid_request_error` is final.
+    Response {
+        /// Machine-readable error code, when the server sent one.
+        code: Option<String>,
+        /// Human-readable description suitable for display.
+        message: String,
+    },
     /// A response body could not be decoded into the expected shape.
     Decode(serde_json::Error),
     /// A filesystem operation failed.
@@ -48,9 +58,40 @@ impl Error {
     #[must_use]
     pub fn code(&self) -> Option<&str> {
         match self {
-            Self::Api { code, .. } => code.as_deref(),
+            Self::Api { code, .. } | Self::Response { code, .. } => code.as_deref(),
             _ => None,
         }
+    }
+
+    /// Whether trying the same request again later may succeed: network
+    /// failures, dropped connections, rate limits and server errors.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        use std::io::ErrorKind;
+        match self {
+            Self::Transport(_) => true,
+            Self::Io(e) => matches!(
+                e.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::TimedOut
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::NetworkDown
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::HostUnreachable
+            ),
+            Self::Api { status, .. } => *status == 429 || *status >= 500,
+            Self::Response { code, .. } => matches!(code.as_deref(), Some("server_error" | "rate_limit_exceeded") | None),
+            Self::Decode(_) | Self::Config { .. } | Self::NoHomeDir => false,
+        }
+    }
+
+    /// Whether the request was too long for the model's context window.
+    #[must_use]
+    pub fn is_context_overflow(&self) -> bool {
+        self.code() == Some("context_length_exceeded")
     }
 }
 
@@ -59,6 +100,7 @@ impl fmt::Display for Error {
         match self {
             Self::Transport(e) => write!(f, "network error: {e}"),
             Self::Api { status, message, .. } => write!(f, "{message} (HTTP {status})"),
+            Self::Response { message, .. } => f.write_str(message),
             Self::Decode(e) => write!(f, "malformed JSON: {e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Config { line, message } => write!(f, "config line {line}: {message}"),
@@ -73,7 +115,7 @@ impl std::error::Error for Error {
             Self::Transport(e) => Some(e.as_ref()),
             Self::Decode(e) => Some(e),
             Self::Io(e) => Some(e),
-            Self::Api { .. } | Self::Config { .. } | Self::NoHomeDir => None,
+            Self::Api { .. } | Self::Response { .. } | Self::Config { .. } | Self::NoHomeDir => None,
         }
     }
 }
@@ -97,5 +139,22 @@ impl From<serde_json::Error> for Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn classifies_failures() {
+        let response = |code: &str| Error::Response { code: Some(code.into()), message: String::new() };
+        let api = |status| Error::Api { status, code: None, message: String::new() };
+        assert!(response("server_error").is_retryable() && response("rate_limit_exceeded").is_retryable());
+        assert!(!response("invalid_request_error").is_retryable());
+        assert!(response("context_length_exceeded").is_context_overflow() && !response("context_length_exceeded").is_retryable());
+        assert!(api(503).is_retryable() && api(429).is_retryable() && !api(402).is_retryable() && !api(401).is_retryable());
+        assert!(Error::Io(std::io::ErrorKind::ConnectionReset.into()).is_retryable());
+        assert!(!Error::Io(std::io::Error::other("attachment missing")).is_retryable());
     }
 }

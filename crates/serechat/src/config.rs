@@ -34,6 +34,8 @@ pub struct Config {
     pub project: Option<String>,
     /// Colour scheme name, interpreted by the app.
     pub theme: Option<String>,
+    /// How replies show the model's reasoning, interpreted by the app.
+    pub reasoning_view: Option<String>,
 }
 
 impl Config {
@@ -116,6 +118,7 @@ impl Config {
                 "reasoning" => config.reasoning = Some(value),
                 "theme" => config.theme = Some(value),
                 "project" => config.project = Some(value),
+                "reasoning_view" => config.reasoning_view = Some(value),
                 _ => {}
             }
         }
@@ -132,6 +135,7 @@ impl Config {
             ("reasoning", &self.reasoning),
             ("theme", &self.theme),
             ("project", &self.project),
+            ("reasoning_view", &self.reasoning_view),
         ];
         for (key, value) in fields {
             if let Some(value) = value {
@@ -266,6 +270,7 @@ mod tests {
             reasoning: Some("high".into()),
             theme: Some("light".into()),
             project: Some(r"C:\work\café".into()),
+            reasoning_view: Some("expanded".into()),
         };
         assert_eq!(Config::parse(&config.serialize()).unwrap(), config);
     }

@@ -31,6 +31,8 @@ pub struct Ui {
     pub released: bool,
     /// Accumulated wheel movement in logical pixels; positive scrolls down.
     pub scroll: f32,
+    /// Accumulated sideways wheel movement; positive scrolls right.
+    pub scroll_x: f32,
     /// Keyboard modifiers.
     pub mods: ModifiersState,
     /// Seconds since the previous frame.
@@ -81,6 +83,7 @@ impl Ui {
         self.pressed = false;
         self.released = false;
         self.scroll = 0.0;
+        self.scroll_x = 0.0;
     }
 
     /// Whether the mouse is over `rect` and not over an overlay.

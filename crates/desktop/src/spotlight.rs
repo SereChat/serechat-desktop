@@ -35,7 +35,7 @@ pub enum Pick {
     OpenFolder,
     /// Attach files.
     Attach,
-    /// Switch project (`None`: no project).
+    /// Set the open chat's folder (`None`: no project).
     Project(Option<String>),
     /// Open a session by id.
     Session(String),

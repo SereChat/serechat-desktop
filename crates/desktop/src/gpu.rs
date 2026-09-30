@@ -20,7 +20,7 @@ pub struct Instance {
     pub color: [f32; 4],
     /// Border colour.
     pub color2: [f32; 4],
-    /// Glyph atlas rectangle in texels.
+    /// Glyph or image atlas rectangle in texels.
     pub uv: [f32; 4],
     /// Corner radius, border width, blur radius, primitive kind.
     pub params: [f32; 4],
@@ -92,6 +92,8 @@ pub struct Renderer {
     bind_group: wgpu::BindGroup,
     globals: wgpu::Buffer,
     atlas: wgpu::Texture,
+    /// RGBA thumbnails, the same size as the glyph atlas.
+    images: wgpu::Texture,
     instances: wgpu::Buffer,
     linear_output: bool,
 }
@@ -158,17 +160,23 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let atlas = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("glyph atlas"),
-            size: wgpu::Extent3d { width: ATLAS_SIZE, height: ATLAS_SIZE, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let texture = |label, format| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: ATLAS_SIZE, height: ATLAS_SIZE, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let atlas = texture("glyph atlas", wgpu::TextureFormat::R8Unorm);
         let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+        // Unorm, not sRGB: texels are sRGB values like every other colour here.
+        let images = texture("image atlas", wgpu::TextureFormat::Rgba8Unorm);
+        let images_view = images.create_view(&wgpu::TextureViewDescriptor::default());
         // Glyph quads land exactly on texels, so filtering never blends
         // neighbours; linear only smooths float rounding error.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -207,6 +215,16 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -216,6 +234,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&atlas_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&images_view) },
             ],
         });
 
@@ -265,6 +284,7 @@ impl Renderer {
             bind_group,
             globals,
             atlas,
+            images,
             instances,
             linear_output: format.is_srgb(),
         })
@@ -289,23 +309,25 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Uploads pending glyphs and draws `instances` over `clear`.
+    /// Uploads pending glyphs and thumbnails and draws `instances` over `clear`.
     ///
     /// Returns `false` when no frame could be acquired (window occluded,
     /// timeout); the caller should simply try again on the next redraw.
-    pub fn render(&mut self, instances: &[Instance], uploads: &mut Vec<Upload>, scale: f32, clear: [f32; 4]) -> bool {
-        for upload in uploads.drain(..) {
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.atlas,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: upload.x, y: upload.y, z: 0 },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &upload.data,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(upload.w), rows_per_image: None },
-                wgpu::Extent3d { width: upload.w, height: upload.h, depth_or_array_layers: 1 },
-            );
+    pub fn render(&mut self, instances: &[Instance], glyphs: &mut Vec<Upload>, images: &mut Vec<Upload>, scale: f32, clear: [f32; 4]) -> bool {
+        for (texture, bytes_per_texel, uploads) in [(&self.atlas, 1, glyphs), (&self.images, 4, images)] {
+            for upload in uploads.drain(..) {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: upload.x, y: upload.y, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &upload.data,
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(upload.w * bytes_per_texel), rows_per_image: None },
+                    wgpu::Extent3d { width: upload.w, height: upload.h, depth_or_array_layers: 1 },
+                );
+            }
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -377,4 +399,17 @@ impl Renderer {
 
 fn srgb_to_linear(c: f64) -> f64 {
     if c <= 0.040_45 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+#[cfg(test)]
+mod tests {
+    use wgpu::naga;
+
+    #[test]
+    fn shader_compiles() {
+        let module = naga::front::wgsl::parse_str(include_str!("shader.wgsl")).unwrap_or_else(|e| panic!("{}", e.emit_to_string(include_str!("shader.wgsl"))));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+    }
 }

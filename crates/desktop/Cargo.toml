@@ -18,6 +18,8 @@ wgpu.workspace = true
 ttf-parser.workspace = true
 bytemuck.workspace = true
 arboard.workspace = true
+png.workspace = true
+zune-jpeg.workspace = true
 serde_json.workspace = true
 
 [lints]

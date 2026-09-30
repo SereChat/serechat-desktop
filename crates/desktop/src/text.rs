@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 
+use crate::atlas::{NO_SHELF, Shelves};
 pub use crate::font::{FontId, Fonts};
 use crate::font::{Layer, is_cjk, is_emoji_joiner, is_invisible};
 
@@ -465,6 +466,8 @@ pub struct AtlasEntry {
     pub xmin: i16,
     /// Bottom of the bitmap relative to the baseline (y up).
     pub ymin: i16,
+    /// Atlas shelf holding it ([`NO_SHELF`] for glyphs without ink).
+    pub shelf: u16,
 }
 
 /// A rectangle of atlas texels waiting to be copied to the GPU.
@@ -482,20 +485,23 @@ pub struct Upload {
     pub data: Vec<u8>,
 }
 
-/// CPU side of the glyph atlas: a shelf packer plus lookup tables.
-///
-/// ponytail: when the atlas fills up it is wiped and the frame redrawn;
-/// fine for UI text volumes, add an LRU if many sizes/scripts appear.
-#[derive(Default)]
+/// CPU side of the glyph atlas: a shelf packer plus lookup tables. When
+/// full, glyphs not drawn recently are evicted a shelf at a time; only if a
+/// single frame needs more than the whole atlas is it wiped and the frame
+/// redrawn.
 pub struct GlyphAtlas {
     entries: HashMap<(FontId, u16, u32), AtlasEntry>,
     /// Colour layers per glyph (`None`: not a colour glyph).
     layers: HashMap<(FontId, u16), Option<Rc<[Layer]>>>,
-    cursor_x: u32,
-    cursor_y: u32,
-    row_height: u32,
+    shelves: Shelves,
     /// Rasterised glyphs not yet copied to the GPU texture.
     pub uploads: Vec<Upload>,
+}
+
+impl Default for GlyphAtlas {
+    fn default() -> Self {
+        Self { entries: HashMap::new(), layers: HashMap::new(), shelves: Shelves::new(ATLAS_SIZE), uploads: Vec::new() }
+    }
 }
 
 impl GlyphAtlas {
@@ -503,6 +509,11 @@ impl GlyphAtlas {
     /// texels are about to be reused.
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    /// Starts a frame, for least-recently-used eviction.
+    pub fn next_frame(&mut self) {
+        self.shelves.next_frame();
     }
 
     fn layers(&mut self, fonts: &Fonts, font: FontId, index: u16) -> Option<Rc<[Layer]>> {
@@ -514,35 +525,44 @@ impl GlyphAtlas {
     fn get(&mut self, fonts: &Fonts, font: FontId, index: u16, px: f32) -> Option<AtlasEntry> {
         let key = (font, index, px.to_bits());
         if let Some(entry) = self.entries.get(&key) {
+            self.shelves.touch(entry.shelf);
             return Some(*entry);
         }
-        let mut entry = AtlasEntry { x: 0, y: 0, w: 0, h: 0, xmin: 0, ymin: 0 };
+        let mut entry = AtlasEntry { x: 0, y: 0, w: 0, h: 0, xmin: 0, ymin: 0, shelf: NO_SHELF };
         if let Some(bitmap) = fonts.face(font).rasterize(index, px) {
             let (w, h) = (bitmap.w, bitmap.h);
             // One texel of padding keeps linear filtering from bleeding.
-            if self.cursor_x + w + 1 > ATLAS_SIZE {
-                self.cursor_x = 0;
-                self.cursor_y += self.row_height;
-                self.row_height = 0;
-            }
-            if self.cursor_y + h + 1 > ATLAS_SIZE || w + 1 > ATLAS_SIZE {
-                return None;
+            let slot = self.shelves.alloc(w + 1, h + 1)?;
+            if let Some(shelf) = slot.evicted {
+                self.entries.retain(|_, e| e.shelf != shelf);
             }
             entry = AtlasEntry {
-                x: self.cursor_x as u16,
-                y: self.cursor_y as u16,
+                x: slot.x as u16,
+                y: slot.y as u16,
                 w: w as u16,
                 h: h as u16,
                 xmin: bitmap.xmin as i16,
                 ymin: bitmap.ymin as i16,
+                shelf: slot.shelf,
             };
-            self.uploads.push(Upload { x: self.cursor_x, y: self.cursor_y, w, h, data: bitmap.data });
-            self.cursor_x += w + 1;
-            self.row_height = self.row_height.max(h + 1);
+            // The padding is uploaded too: an evicted glyph may have left ink there.
+            self.uploads.push(Upload { x: slot.x, y: slot.y, w: w + 1, h: h + 1, data: pad(&bitmap.data, w, h, 1) });
         }
         self.entries.insert(key, entry);
         Some(entry)
     }
+}
+
+/// `data` (`w`×`h` texels of `bpp` bytes) with a transparent column on the
+/// right and row at the bottom.
+#[must_use]
+pub fn pad(data: &[u8], w: u32, h: u32, bpp: usize) -> Vec<u8> {
+    let (row, padded) = (w as usize * bpp, (w as usize + 1) * bpp);
+    let mut out = vec![0; padded * (h as usize + 1)];
+    for (src, dst) in data.chunks_exact(row).zip(out.chunks_exact_mut(padded)) {
+        dst[..row].copy_from_slice(src);
+    }
+    out
 }
 
 /// A glyph ready to be turned into a GPU instance, in logical pixels.
@@ -558,8 +578,8 @@ pub struct PlacedGlyph {
 }
 
 impl TextLayout {
-    /// Resolves glyphs of rows intersecting `y_min..y_max` to atlas quads at
-    /// logical origin `(x, y)`, aligned within `box_width`.
+    /// Resolves glyphs inside the `visible` rectangle `[x0, y0, x1, y1]` to
+    /// atlas quads at logical origin `(x, y)`, aligned within `box_width`.
     ///
     /// Returns `false` if the atlas overflowed; the frame must be redrawn
     /// after [`GlyphAtlas::clear`].
@@ -569,13 +589,13 @@ impl TextLayout {
         atlas: &mut GlyphAtlas,
         origin: (f32, f32),
         align: (Align, f32),
-        visible: (f32, f32),
+        visible: [f32; 4],
         mut emit: impl FnMut(PlacedGlyph),
     ) -> bool {
         let s = self.scale;
         let ox = (origin.0 * s).round();
         let oy = (origin.1 * s).round();
-        let (y_min, y_max) = (visible.0 * s, visible.1 * s);
+        let [x_min, y_min, x_max, y_max] = visible.map(|v| v * s);
         for (row, line) in self.lines.iter().enumerate() {
             let top = oy + row as f32 * self.line_height;
             if top + self.line_height < y_min {
@@ -595,6 +615,10 @@ impl TextLayout {
                 }
                 let ink = self.runs[usize::from(glyph.run)].ink;
                 let pen = ox + dx + glyph.x.round();
+                // Ink may overhang the advance a little; an em of margin covers it.
+                if pen + glyph.advance + glyph.px < x_min || pen - glyph.px > x_max {
+                    continue;
+                }
                 let mut place = |atlas: &mut GlyphAtlas, index: u16, color: Option<[f32; 4]>| -> bool {
                     let Some(entry) = atlas.get(fonts, glyph.font, index, glyph.px) else {
                         return false;

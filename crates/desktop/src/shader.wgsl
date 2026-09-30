@@ -5,6 +5,8 @@
 //   0 = rounded rectangle, optionally bordered (border colour in `color2`)
 //       or blurred into a soft shadow (`params.z` > 0)
 //   1 = glyph, alpha sampled from the R8 atlas
+//   2 = image, RGBA sampled from the image atlas, clipped to a rounded
+//       rectangle (radius `params.x`) and faded by `color.a`
 //
 // Geometry arrives in logical pixels and is scaled to physical pixels here.
 // Colours are straight-alpha sRGB; output is premultiplied.
@@ -20,6 +22,7 @@ struct Globals {
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
+@group(0) @binding(3) var images: texture_2d<f32>;
 
 struct Instance {
     @location(0) rect: vec4<f32>,    // x, y, w, h
@@ -62,7 +65,9 @@ fn vs_main(@builtin(vertex_index) vertex: u32, inst: Instance) -> VertexOut {
     var out: VertexOut;
     out.position = vec4<f32>(p / globals.viewport * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
     out.local = p - (origin + size * 0.5);
-    out.uv = (inst.uv.xy + corner * inst.uv.zw) / globals.atlas_size;
+    // Relative to the unpadded quad, so padding samples just outside it.
+    let rel = (p - origin) / max(size, vec2<f32>(1e-3));
+    out.uv = (inst.uv.xy + rel * inst.uv.zw) / globals.atlas_size;
     out.half_size = size * 0.5;
     out.color = inst.color;
     out.color2 = inst.color2;
@@ -96,6 +101,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if kind == 1.0 {
         let coverage = textureSampleLevel(atlas, atlas_sampler, in.uv, 0.0).r;
         color = vec4<f32>(in.color.rgb, in.color.a * coverage);
+    } else if kind == 2.0 {
+        let texel = textureSampleLevel(images, atlas_sampler, in.uv, 0.0);
+        let d = rounded_box(in.local, in.half_size, in.params.x);
+        color = vec4<f32>(texel.rgb, texel.a * in.color.a * clamp(0.5 - d, 0.0, 1.0));
     } else {
         let d = rounded_box(in.local, in.half_size, in.params.x);
         let blur = in.params.z;

@@ -1,0 +1,70 @@
+# Lint, test and build on every OS we ship. Pushing a `v*` tag also
+# publishes release binaries to a GitHub release of that name.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  release:
+    name: Release (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive: serechat-linux-x86_64.tar.gz
+          - os: windows-latest
+            archive: serechat-windows-x86_64.zip
+          - os: macos-latest
+            archive: serechat-macos-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p serechat-desktop
+      - name: Package
+        shell: bash
+        run: |
+          cd target/release
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "../../${{ matrix.archive }}" serechat.exe
+          else
+            tar czf "../../${{ matrix.archive }}" serechat
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive }}

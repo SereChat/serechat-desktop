@@ -11,7 +11,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -19,7 +18,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use serechat::{Client, ToolCall};
 
-use crate::platform::no_window;
+use crate::process;
 
 /// Longest tool output returned to the model, in bytes.
 const MAX_OUTPUT: usize = 32 * 1024;
@@ -107,6 +106,41 @@ pub fn all() -> &'static [Tool] {
                 true,
             ),
             tool(
+                "start_process",
+                &format!(
+                    "Start a long-running command with {shell} in the project folder without waiting for it to finish: a dev server, a \
+                     watcher, a slow build. Returns its id and first output. Check on it with read_process and end it with \
+                     stop_process. The user must approve."
+                ),
+                json!({ "type": "object", "properties": { "command": string("The command line.") }, "required": ["command"] }),
+                true,
+            ),
+            tool(
+                "read_process",
+                "Read the new output of a process from start_process, and whether it is still running.",
+                json!({ "type": "object", "properties": {
+                    "id": integer("The process id."),
+                    "wait_seconds": integer(&format!("Wait up to this long for output first, 0 to {} (default 0).", process::MAX_WAIT_SECS)) },
+                    "required": ["id"] }),
+                false,
+            ),
+            tool(
+                "stop_process",
+                "Stop a process from start_process, and everything it started.",
+                json!({ "type": "object", "properties": { "id": integer("The process id.") }, "required": ["id"] }),
+                false,
+            ),
+            tool(
+                "update_plan",
+                "Keep a checklist for multi-step work: send the whole plan each time, marking steps done as you finish them and \
+                 exactly one step in_progress. The user sees it, and it survives when older messages are summarised.",
+                json!({ "type": "object", "properties": { "steps": { "type": "array", "items": { "type": "object", "properties": {
+                    "step": string("What to do, in a few words."),
+                    "status": { "type": "string", "enum": ["pending", "in_progress", "done"] } },
+                    "required": ["step", "status"] } } }, "required": ["steps"] }),
+                false,
+            ),
+            tool(
                 "fetch_url",
                 "Fetch a web page or text file over HTTP(S) and return its text; HTML is reduced to readable text. The user must approve.",
                 json!({ "type": "object", "properties": { "url": string("An http:// or https:// URL.") }, "required": ["url"] }),
@@ -116,10 +150,11 @@ pub fn all() -> &'static [Tool] {
     })
 }
 
-/// Whether `name` needs approval (unknown tools always do).
+/// Whether `name` needs approval (unknown tools always do). `use_skill`,
+/// offered only when there are skills, just reads inside skill folders.
 #[must_use]
 pub fn needs_approval(name: &str) -> bool {
-    all().iter().find(|t| t.name == name).is_none_or(|t| t.approval)
+    name != "use_skill" && all().iter().find(|t| t.name == name).is_none_or(|t| t.approval)
 }
 
 /// How a call reads in the chat: a verb, its target, and an optional preview.
@@ -143,9 +178,20 @@ fn arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// Describes a call for display.
 #[must_use]
 pub fn view(call: &ToolCall) -> CallView {
-    let a = args(call);
-    let s = |key| arg(&a, key).unwrap_or_default().to_owned();
-    let (verb, target, preview) = match call.name.as_str() {
+    view_args(&call.name, &args(call), &call.arguments)
+}
+
+/// Describes a call from `arguments` the model is still writing: JSON that
+/// may stop anywhere.
+#[must_use]
+pub fn view_partial(name: &str, arguments: &str) -> CallView {
+    view_args(name, &Value::Object(partial_strings(arguments)), arguments)
+}
+
+/// Describes a call to `name` with parsed arguments `a` (`raw` as sent).
+fn view_args(name: &str, a: &Value, raw: &str) -> CallView {
+    let s = |key| arg(a, key).unwrap_or_default().to_owned();
+    let (verb, target, preview) = match name {
         "list_directory" => ("List", s("path"), None),
         "read_file" => ("Read", s("path"), None),
         "search_files" => ("Search", format!("\"{}\"", s("query")), None),
@@ -156,18 +202,124 @@ pub fn view(call: &ToolCall) -> CallView {
             ("Edit", s("path"), Some(format!("{}\n{}", diff(s("old_string"), '-'), diff(s("new_string"), '+'))))
         }
         "run_command" => ("Run", s("command"), None),
+        "start_process" => ("Start", s("command"), None),
+        "read_process" => ("Check", format!("process {}", a.get("id").map_or_else(String::new, Value::to_string)), None),
+        "stop_process" => ("Stop", format!("process {}", a.get("id").map_or_else(String::new, Value::to_string)), None),
         "fetch_url" => ("Fetch", s("url"), None),
-        other => ("Call", other.to_owned(), Some(call.arguments.clone())),
+        "use_skill" => match arg(a, "file") {
+            Some(file) => ("Skill", format!("{} · {file}", s("name")), None),
+            None => ("Skill", s("name"), None),
+        },
+        "update_plan" => {
+            let steps = plan_steps(a).unwrap_or_default();
+            let done = steps.iter().filter(|(_, status)| *status == "done").count();
+            ("Plan", format!("{done} of {} done", steps.len()), plan_lines(a))
+        }
+        other => ("Call", other.to_owned(), Some(raw.to_owned())),
     };
     CallView { verb, target, preview }
 }
 
-/// Runs `call` inside `root`. `cancel` aborts long-running commands.
+/// The string fields of a JSON object that may be cut off anywhere. A string
+/// cut off part-way keeps what arrived; other values are skipped.
+fn partial_strings(json: &str) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    let mut chars = json.chars().peekable();
+    let skip_space = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        while chars.next_if(|c| c.is_whitespace() || *c == ',').is_some() {}
+    };
+    skip_space(&mut chars);
+    if chars.next() != Some('{') {
+        return out;
+    }
+    loop {
+        skip_space(&mut chars);
+        if chars.next() != Some('"') {
+            return out;
+        }
+        let (key, done) = json_string(&mut chars);
+        skip_space(&mut chars);
+        if !done || chars.next() != Some(':') {
+            return out;
+        }
+        skip_space(&mut chars);
+        if chars.next_if_eq(&'"').is_some() {
+            let (value, done) = json_string(&mut chars);
+            out.insert(key, Value::String(value));
+            if !done {
+                return out;
+            }
+        } else if !skip_json_value(&mut chars) {
+            return out;
+        }
+    }
+}
+
+/// Reads the rest of a JSON string whose opening quote was consumed.
+/// Returns the text and whether the closing quote arrived.
+fn json_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> (String, bool) {
+    let mut out = String::new();
+    let hex = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        let digits: String = chars.by_ref().take(4).collect();
+        u32::from_str_radix(&digits, 16).ok().filter(|_| digits.len() == 4)
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return (out, true),
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('b') => out.push('\u{8}'),
+                Some('f') => out.push('\u{c}'),
+                Some('u') => {
+                    let Some(mut code) = hex(chars) else { return (out, false) };
+                    // A high surrogate pairs with the escape after it.
+                    if (0xD800..0xDC00).contains(&code) && chars.next_if_eq(&'\\').is_some() && chars.next_if_eq(&'u').is_some() {
+                        let Some(low) = hex(chars) else { return (out, false) };
+                        code = if (0xDC00..0xE000).contains(&low) { 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00) } else { 0xFFFD };
+                    }
+                    out.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+                }
+                Some(other) => out.push(other),
+                None => return (out, false),
+            },
+            c => out.push(c),
+        }
+    }
+    (out, false)
+}
+
+/// Skips a non-string JSON value; returns `false` if the input ended first.
+fn skip_json_value(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    let mut depth = 0usize;
+    while let Some(&c) = chars.peek() {
+        match c {
+            '"' => {
+                chars.next();
+                if !json_string(chars).1 {
+                    return false;
+                }
+                continue;
+            }
+            '{' | '[' => depth += 1,
+            // The value ends at the object's close or the next field.
+            '}' | ']' | ',' if depth == 0 => return true,
+            '}' | ']' => depth -= 1,
+            _ => {}
+        }
+        chars.next();
+    }
+    false
+}
+
+/// Runs `call` inside `root` for conversation `owner` (whose background
+/// processes it may see). `cancel` aborts long-running commands.
 ///
 /// # Errors
 /// A message for the model: bad arguments, a path outside the project, or
 /// the operation's own failure.
-pub fn run(root: &Path, client: &Client, call: &ToolCall, cancel: &AtomicBool) -> Result<String, String> {
+pub fn run(root: &Path, owner: u64, client: &Client, call: &ToolCall, cancel: &AtomicBool) -> Result<String, String> {
     let a = args(call);
     if !a.is_object() {
         return Err("Arguments must be a JSON object.".into());
@@ -206,14 +358,55 @@ pub fn run(root: &Path, client: &Client, call: &ToolCall, cancel: &AtomicBool) -
         }
         "run_command" => run_command(root, required("command")?, number("timeout_seconds").unwrap_or(120).clamp(1, 600), cancel),
         "fetch_url" => fetch_url(client, required("url")?),
+        "start_process" => process::start(root, owner, required("command")?, cancel),
+        "read_process" => process::read(owner, process_id(&a)?, Duration::from_secs(number("wait_seconds").unwrap_or(0).min(process::MAX_WAIT_SECS)), cancel),
+        "stop_process" => process::stop(owner, process_id(&a)?),
+        "update_plan" => plan_steps(&a).map(|steps| format!("Plan updated: {} steps.", steps.len())),
         other => Err(format!("There is no tool named '{other}'.")),
     }?;
     Ok(truncate_middle(output, MAX_OUTPUT))
 }
 
+/// The `id` argument of a process tool.
+fn process_id(args: &Value) -> Result<u32, String> {
+    args.get("id").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()).ok_or_else(|| "Missing the 'id' argument.".to_owned())
+}
+
+/// The `(step, status)` pairs of an `update_plan` call.
+fn plan_steps(args: &Value) -> Result<Vec<(&str, &str)>, String> {
+    let steps = args.get("steps").and_then(Value::as_array).filter(|s| !s.is_empty()).ok_or("The plan needs at least one step.")?;
+    steps
+        .iter()
+        .map(|s| match (arg(s, "step"), arg(s, "status")) {
+            (Some(step), Some(status @ ("pending" | "in_progress" | "done"))) => Ok((step, status)),
+            _ => Err("Every step needs a 'step' text and a status of pending, in_progress or done.".to_owned()),
+        })
+        .collect()
+}
+
+/// An `update_plan` call as a checklist, one step per line.
+#[must_use]
+pub fn plan_text(call: &ToolCall) -> Option<String> {
+    plan_lines(&args(call))
+}
+
+/// The checklist of `update_plan` arguments `a`.
+fn plan_lines(a: &Value) -> Option<String> {
+    let steps = plan_steps(a).ok()?;
+    let line = |(step, status): (&str, &str)| {
+        let mark = match status {
+            "done" => '✓',
+            "in_progress" => '→',
+            _ => '○',
+        };
+        format!("{mark} {}", step.replace('\n', " "))
+    };
+    Some(steps.into_iter().map(line).collect::<Vec<_>>().join("\n"))
+}
+
 /// Resolves `path` (relative to `root`, or absolute inside it) and makes sure
 /// it cannot escape the project, even through `..` or symlinks.
-fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     let requested = Path::new(path.trim());
     let joined = if requested.is_absolute() { requested.to_path_buf() } else { root.join(requested) };
     let mut normal = PathBuf::new();
@@ -244,7 +437,7 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
 }
 
 /// `path` relative to `root`, with `/` separators.
-fn relative(root: &Path, path: &Path) -> String {
+pub(crate) fn relative(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     let text = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
     if text.is_empty() { ".".into() } else { text }
@@ -253,7 +446,7 @@ fn relative(root: &Path, path: &Path) -> String {
 /// Visits files and folders under `dir` breadth-first (sorted, ignored
 /// folders and symlinks skipped), calling `visit(path, is_dir, depth)`.
 /// Stops when `visit` returns `false` or after [`MAX_WALK`] entries.
-fn walk(dir: &Path, max_depth: usize, mut visit: impl FnMut(&Path, bool, usize) -> bool) {
+pub(crate) fn walk(dir: &Path, max_depth: usize, mut visit: impl FnMut(&Path, bool, usize) -> bool) {
     let mut stack = vec![(dir.to_path_buf(), 0usize)];
     let mut seen = 0;
     while let Some((folder, depth)) = stack.pop() {
@@ -302,7 +495,7 @@ fn list_directory(root: &Path, dir: &Path, depth: usize) -> Result<String, Strin
     Ok(lines.join("\n"))
 }
 
-fn read_file(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
+pub(crate) fn read_file(path: &Path, offset: u64, limit: u64) -> Result<String, String> {
     let meta = fs::metadata(path).map_err(|e| e.to_string())?;
     if meta.is_dir() {
         return Err("That is a folder; use list_directory.".into());
@@ -393,22 +586,7 @@ fn find_files(root: &Path, pattern: &str) -> Result<String, String> {
 }
 
 fn run_command(root: &Path, command: &str, timeout: u64, cancel: &AtomicBool) -> Result<String, String> {
-    let mut process = if cfg!(target_os = "windows") {
-        let mut c = Command::new("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", command]);
-        c
-    };
-    let mut child = no_window(&mut process)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("The command could not start: {e}"))?;
+    let mut child = process::shell(root, command).spawn().map_err(|e| format!("The command could not start: {e}"))?;
     // Drain both pipes on their own threads so a chatty command never blocks.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
@@ -428,8 +606,9 @@ fn run_command(root: &Path, command: &str, timeout: u64, cancel: &AtomicBool) ->
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if cancel.load(Ordering::Relaxed) || started.elapsed() > Duration::from_secs(timeout) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                // The whole tree: a child still holding the pipes would keep
+                // the output threads waiting forever.
+                process::kill_tree(&mut child);
                 break None;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(40)),
@@ -543,7 +722,7 @@ mod tests {
     }
 
     fn exec(root: &Path, name: &str, arguments: &Value) -> Result<String, String> {
-        run(root, &Client::new(None), &call(name, arguments), &AtomicBool::new(false))
+        run(root, 0, &Client::new(None), &call(name, arguments), &AtomicBool::new(false))
     }
 
     #[test]
@@ -590,7 +769,7 @@ mod tests {
         assert!(out.starts_with("exit code: 0") && out.contains("hi"), "{out}");
         let cancelled = AtomicBool::new(true);
         let slow = if cfg!(target_os = "windows") { "Start-Sleep 30" } else { "sleep 30" };
-        let out = run(&root, &Client::new(None), &call("run_command", &json!({ "command": slow })), &cancelled).unwrap();
+        let out = run(&root, 0, &Client::new(None), &call("run_command", &json!({ "command": slow })), &cancelled).unwrap();
         assert!(out.starts_with("stopped by the user"), "{out}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -603,5 +782,39 @@ mod tests {
         let cut = truncate_middle(long, 21);
         assert!(cut.contains("omitted") && cut.is_char_boundary(cut.len()));
         assert!(needs_approval("run_command") && !needs_approval("read_file") && needs_approval("unknown"));
+        assert!(needs_approval("start_process") && !needs_approval("read_process") && !needs_approval("use_skill"));
+    }
+
+    #[test]
+    fn partial_arguments() {
+        let map = |json: &str| Value::Object(partial_strings(json));
+        assert_eq!(map(r#"{"path": "src/a.rs", "content": "fn main() {\n  pri"#), json!({ "path": "src/a.rs", "content": "fn main() {\n  pri" }));
+        // JSON escapes are built at run time so no tool rewrites them in this file.
+        let u = |hex: &str| format!("{}u{hex}", char::from(92));
+        let escaped = format!(r#"{{"depth": 2, "items": [1, {{"a": "}}"}}], "path": "x{}{}{}"}}"#, u("00e9"), u("d83d"), u("de00"));
+        assert_eq!(map(&escaped), json!({ "path": "xé😀" }));
+        assert_eq!(map(&format!(r#"{{"path": "a{}"#, &u("00e9")[..4])), json!({ "path": "a" }), "a cut escape is dropped");
+        assert_eq!(map(r#"{"pa"#), json!({}));
+        let lone = format!(r#"{{"a": "{}{}"}}"#, u("d800"), u("0041"));
+        assert_eq!(map(&lone), json!({ "a": "\u{fffd}" }), "a bad surrogate pair cannot panic");
+        assert_eq!(map(&format!(r#"{{"a": "{}A"}}"#, u("d800"))), json!({ "a": "\u{fffd}A" }));
+        for bad in ["", "[", "{\"a\" 1}", "{\"a\":", "\"x\""] {
+            assert!(partial_strings(bad).is_empty(), "{bad:?}");
+        }
+        let view = view_partial("write_file", r#"{"path":"out.txt","content":"one\ntw"#);
+        assert_eq!((view.verb, view.target.as_str(), view.preview.as_deref()), ("Write", "out.txt", Some("one\ntw")));
+    }
+
+    #[test]
+    fn plans() {
+        let root = std::env::temp_dir();
+        let steps = json!({ "steps": [{ "step": "Read", "status": "done" }, { "step": "Fix", "status": "in_progress" }, { "step": "Test", "status": "pending" }] });
+        assert_eq!(exec(&root, "update_plan", &steps).unwrap(), "Plan updated: 3 steps.");
+        let c = call("update_plan", &steps);
+        assert_eq!(plan_text(&c).unwrap(), "✓ Read\n→ Fix\n○ Test");
+        assert_eq!(view(&c).target, "1 of 3 done");
+        assert!(exec(&root, "update_plan", &json!({ "steps": [] })).is_err());
+        assert!(exec(&root, "update_plan", &json!({ "steps": [{ "step": "x", "status": "maybe" }] })).is_err());
+        assert!(!needs_approval("update_plan"));
     }
 }

@@ -25,10 +25,29 @@ pub enum Role {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Usage {
-    /// Prompt tokens.
+    /// Prompt tokens, including those read from or written to the cache.
     pub input_tokens: u64,
     /// Generated tokens.
     pub output_tokens: u64,
+    /// Prompt tokens read from the provider's prompt cache.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cached_tokens: u64,
+    /// Prompt tokens written to the prompt cache.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+}
+
+impl Usage {
+    /// Plain input and output counts, without cache details.
+    #[must_use]
+    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
+        Self { input_tokens, output_tokens, ..Self::default() }
+    }
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde's skip_serializing_if passes a reference")]
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A function call requested by the model.
@@ -136,7 +155,28 @@ pub enum StreamEvent {
     Text(String),
     /// A chunk of the model's reasoning, for servers that stream it.
     Reasoning(String),
-    /// The response finished successfully.
+    /// A keep-alive from the server; it sends one every 15 seconds while the
+    /// model works, so a silent connection means a dead one.
+    Ping,
+    /// The model started writing a tool call. `index` identifies it in the
+    /// [`StreamEvent::ToolCallDelta`]s that follow.
+    ToolCallStarted {
+        /// Position of the call in the response's output.
+        index: u64,
+        /// Tool name.
+        name: String,
+    },
+    /// More of a tool call's JSON arguments, for showing it as it is written.
+    /// The complete call arrives in [`StreamEvent::Completed`].
+    ToolCallDelta {
+        /// The call, as in [`StreamEvent::ToolCallStarted`].
+        index: u64,
+        /// The next piece of the arguments.
+        delta: String,
+    },
+    /// What a failed response was billed for; sent just before the error.
+    Charged(Usage),
+    /// The response finished, possibly cut short (see [`Completion::incomplete`]).
     Completed(Completion),
 }
 
@@ -145,11 +185,15 @@ pub enum StreamEvent {
 pub struct Completion {
     /// Token accounting.
     pub usage: Usage,
-    /// The model's full reasoning. SereChat delivers it here rather than as
-    /// [`StreamEvent::Reasoning`] deltas; empty for non-thinking models.
+    /// The model's full reasoning, for servers that only send it at the end;
+    /// empty for non-thinking models.
     pub reasoning: String,
     /// Function calls the model wants run before it continues.
     pub tool_calls: Vec<ToolCall>,
+    /// Why the response stopped early (`max_output_tokens`,
+    /// `content_filter`); `None` when it finished. Tool calls of an
+    /// incomplete response may have truncated arguments and must not run.
+    pub incomplete: Option<String>,
 }
 
 /// Parameters for a single response.
@@ -166,6 +210,8 @@ pub struct ResponseRequest<'a> {
     pub input: &'a [InputItem],
     /// Functions the model may call; empty for plain chat.
     pub tools: &'a [ToolSpec<'a>],
+    /// `auto` (the default when `None`), `none` or `required`.
+    pub tool_choice: Option<&'a str>,
 }
 
 impl ResponseRequest<'_> {
@@ -177,6 +223,9 @@ impl ResponseRequest<'_> {
             "input": self.input.iter().map(InputItem::to_json).collect::<Vec<_>>(),
             "stream": true,
         });
+        if let Some(choice) = self.tool_choice {
+            body["tool_choice"] = choice.into();
+        }
         if let Some(instructions) = self.instructions {
             body["instructions"] = instructions.into();
         }
@@ -219,12 +268,14 @@ pub fn data_url(mime: &str, bytes: &[u8]) -> String {
 impl Client {
     /// Streams a response, invoking `on_event` for every update.
     ///
-    /// Returns `Ok(true)` when the response completed and `Ok(false)` when
-    /// `cancel` was raised or the stream ended early. `cancel` is checked
-    /// between SSE lines, so cancellation takes effect at the next token.
+    /// Returns `Ok(true)` when the response completed (or was cut short, see
+    /// [`Completion::incomplete`]) and `Ok(false)` when `cancel` was raised or
+    /// the stream ended early. `cancel` is checked between SSE lines, which
+    /// arrive at least every 15 seconds thanks to the server's keep-alives.
     ///
     /// # Errors
-    /// Network failures, non-success statuses, and error events inside the stream.
+    /// Network failures, non-success statuses, and failures reported inside
+    /// the stream ([`Error::Response`]).
     pub fn stream_response(&self, request: &ResponseRequest<'_>, cancel: &AtomicBool, mut on_event: impl FnMut(StreamEvent)) -> Result<bool> {
         let response = self.post("/v1/responses", &request.to_json(), true)?;
         let reader = std::io::BufReader::new(response.into_body().into_reader());
@@ -235,7 +286,18 @@ impl Client {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            let Some(event) = decoder.line(&line?) else { continue };
+            let line = line?;
+            if line.starts_with(':') {
+                on_event(StreamEvent::Ping);
+                continue;
+            }
+            let Some(event) = decoder.line(&line) else { continue };
+            if event.name == "response.failed"
+                && let Ok(value) = serde_json::from_str::<Value>(&event.data)
+                && let Some(usage) = usage_at(&value).filter(|u| *u != Usage::default())
+            {
+                on_event(StreamEvent::Charged(usage));
+            }
             if let Some(event) = parse_event(&event.name, &event.data)? {
                 let done = matches!(event, StreamEvent::Completed(_));
                 on_event(event);
@@ -262,22 +324,42 @@ fn parse_event(name: &str, data: &str) -> Result<Option<StreamEvent>> {
         "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" | "response.reasoning.delta" => {
             Some(StreamEvent::Reasoning(delta()))
         }
-        "response.completed" => {
-            let usage = value.pointer("/response/usage");
-            let count = |key| usage.and_then(|u| u.get(key)).and_then(Value::as_u64).unwrap_or(0);
-            let usage = Usage { input_tokens: count("input_tokens"), output_tokens: count("output_tokens") };
-            Some(StreamEvent::Completed(Completion { usage, reasoning: reasoning_text(&value), tool_calls: tool_calls(&value) }))
+        "response.output_item.added" if value.pointer("/item/type").and_then(Value::as_str) == Some("function_call") => {
+            let name = value.pointer("/item/name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            Some(StreamEvent::ToolCallStarted { index: output_index(&value), name })
         }
-        "error" | "response.failed" | "response.incomplete" => {
+        "response.function_call_arguments.delta" => Some(StreamEvent::ToolCallDelta { index: output_index(&value), delta: delta() }),
+        "response.completed" | "response.incomplete" => {
+            let usage = usage_at(&value).unwrap_or_default();
+            let incomplete = (kind == "response.incomplete").then(|| {
+                let reason = value.pointer("/response/incomplete_details/reason").and_then(Value::as_str);
+                reason.unwrap_or("unknown").to_owned()
+            });
+            Some(StreamEvent::Completed(Completion { usage, reasoning: reasoning_text(&value), tool_calls: tool_calls(&value), incomplete }))
+        }
+        "error" | "response.failed" => {
             let source = value.pointer("/response/error").unwrap_or(&value);
             let (code, message) = parse_error_body(&source.to_string());
-            return Err(Error::Api {
-                status: 200,
-                code,
-                message: message.unwrap_or_else(|| format!("the response stream reported `{kind}`")),
-            });
+            return Err(Error::Response { code, message: message.unwrap_or_else(|| format!("The response stream reported `{kind}`.")) });
         }
         _ => None,
+    })
+}
+
+/// An event's `output_index`.
+fn output_index(value: &Value) -> u64 {
+    value.get("output_index").and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// The `response.usage` of a terminal event, if it has one.
+fn usage_at(value: &Value) -> Option<Usage> {
+    let usage = value.pointer("/response/usage").filter(|u| u.is_object())?;
+    let count = |path: &str| usage.pointer(path).and_then(Value::as_u64).unwrap_or(0);
+    Some(Usage {
+        input_tokens: count("/input_tokens"),
+        output_tokens: count("/output_tokens"),
+        cached_tokens: count("/input_tokens_details/cached_tokens"),
+        cache_write_tokens: count("/input_tokens_details/cache_write_tokens"),
     })
 }
 
@@ -333,11 +415,45 @@ mod tests {
         );
         assert_eq!(
             parse_event("response.completed", r#"{"response":{"usage":{"input_tokens":3,"output_tokens":4}}}"#).unwrap(),
-            Some(StreamEvent::Completed(Completion { usage: Usage { input_tokens: 3, output_tokens: 4 }, ..Completion::default() }))
+            Some(StreamEvent::Completed(Completion { usage: Usage::new(3, 4), ..Completion::default() }))
         );
         let err = parse_event("", r#"{"type":"error","error":{"code":"x","message":"boom"}}"#).unwrap_err();
-        assert_eq!(err.to_string(), "boom (HTTP 200)");
+        assert_eq!(err.to_string(), "boom");
         assert!(parse_event("", "{").is_err());
+    }
+
+    #[test]
+    fn terminal_events() {
+        // Shapes from the server's ResponseBuilder.
+        let incomplete = r#"{"type":"response.incomplete","response":{"status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":6,"cache_write_tokens":2},"output_tokens":5}}}"#;
+        let Some(StreamEvent::Completed(done)) = parse_event("response.incomplete", incomplete).unwrap() else { panic!("expected a completion") };
+        assert_eq!(done.incomplete.as_deref(), Some("max_output_tokens"));
+        assert_eq!(done.usage, Usage { input_tokens: 10, output_tokens: 5, cached_tokens: 6, cache_write_tokens: 2 });
+
+        let failed = r#"{"response":{"status":"failed","error":{"code":"context_length_exceeded","message":"Too long."},"usage":{"input_tokens":7,"output_tokens":1}}}"#;
+        let err = parse_event("response.failed", failed).unwrap_err();
+        assert!(err.is_context_overflow() && !err.is_retryable());
+        assert_eq!(err.to_string(), "Too long.");
+        assert_eq!(usage_at(&serde_json::from_str(failed).unwrap()), Some(Usage::new(7, 1)));
+        assert_eq!(usage_at(&json!({ "response": { "usage": null } })), None);
+    }
+
+    #[test]
+    fn tool_calls_stream_as_they_are_written() {
+        let added = r#"{"output_index":2,"item":{"type":"function_call","name":"write_file","arguments":""}}"#;
+        assert_eq!(
+            parse_event("response.output_item.added", added).unwrap(),
+            Some(StreamEvent::ToolCallStarted { index: 2, name: "write_file".into() })
+        );
+        let text_item = r#"{"output_index":0,"item":{"type":"message"}}"#;
+        assert_eq!(parse_event("response.output_item.added", text_item).unwrap(), None);
+        let delta = r#"{"output_index":2,"delta":"{\"path\":"}"#;
+        assert_eq!(
+            parse_event("response.function_call_arguments.delta", delta).unwrap(),
+            Some(StreamEvent::ToolCallDelta { index: 2, delta: r#"{"path":"#.into() })
+        );
     }
 
     #[test]
@@ -378,10 +494,12 @@ mod tests {
 
         let schema = json!({"type": "object"});
         let tools = [ToolSpec { name: "t", description: "d", parameters: &schema }];
-        let request = ResponseRequest { model: "m", instructions: Some("be brief"), reasoning: None, input: &items[..1], tools: &tools };
+        let request = ResponseRequest { model: "m", instructions: Some("be brief"), reasoning: None, input: &items[..1], tools: &tools, tool_choice: None };
         let body = request.to_json();
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["instructions"], "be brief");
+        assert!(body.get("tool_choice").is_none());
+        assert_eq!(ResponseRequest { tool_choice: Some("none"), ..request }.to_json()["tool_choice"], "none");
     }
 
     #[test]

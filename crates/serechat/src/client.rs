@@ -55,9 +55,22 @@ pub struct Model {
     /// USD per million generated tokens; `0` when the server omits it.
     #[serde(default)]
     pub output_cost_per_million: f64,
+    /// USD per million prompt tokens read from the cache; the input price when omitted.
+    #[serde(default)]
+    pub cache_read_cost_per_million: Option<f64>,
+    /// USD per million prompt tokens written to the cache; the input price when omitted.
+    #[serde(default)]
+    pub cache_write_cost_per_million: Option<f64>,
     /// Accepted input kinds, e.g. `text`, `image`, `audio`.
     #[serde(default)]
     pub input_types: Vec<String>,
+    /// Prompt plus output tokens the model accepts; `0` when the server omits it.
+    #[serde(default)]
+    pub context_window: u64,
+    /// Reasoning efforts the model accepts (`none`, `minimal`, `low`,
+    /// `medium`, `high`, `xhigh`, `max`); empty when it cannot reason.
+    #[serde(default)]
+    pub reasoning_levels: Vec<String>,
 }
 
 impl Model {
@@ -68,10 +81,17 @@ impl Model {
         self.input_types.is_empty() || self.input_types.iter().any(|t| t == "image")
     }
 
-    /// Cost in USD of a response with the given token counts.
+    /// Cost in USD of a response with the given token counts, pricing cached
+    /// prompt tokens the way the server bills them.
     #[must_use]
     pub fn cost(&self, usage: crate::Usage) -> f64 {
-        (usage.input_tokens as f64 * self.input_cost_per_million + usage.output_tokens as f64 * self.output_cost_per_million)
+        let cached = usage.cached_tokens;
+        let written = usage.cache_write_tokens;
+        let uncached = usage.input_tokens.saturating_sub(cached + written);
+        (uncached as f64 * self.input_cost_per_million
+            + cached as f64 * self.cache_read_cost_per_million.unwrap_or(self.input_cost_per_million)
+            + written as f64 * self.cache_write_cost_per_million.unwrap_or(self.input_cost_per_million)
+            + usage.output_tokens as f64 * self.output_cost_per_million)
             / 1_000_000.0
     }
 }
@@ -226,10 +246,19 @@ mod tests {
     fn model_pricing() {
         let json = r#"{"id":"m","name":"M","input_cost_per_million":2,"output_cost_per_million":10}"#;
         let model: Model = serde_json::from_str(json).unwrap();
-        let cost = model.cost(Usage { input_tokens: 1_000, output_tokens: 500 });
+        let cost = model.cost(Usage::new(1_000, 500));
         assert!((cost - 0.007).abs() < 1e-12);
         let bare: Model = serde_json::from_str(r#"{"id":"m"}"#).unwrap();
-        assert!(bare.cost(Usage { input_tokens: 5, output_tokens: 5 }).abs() < f64::EPSILON);
+        assert!(bare.cost(Usage::new(5, 5)).abs() < f64::EPSILON);
+        assert_eq!(bare.context_window, 0);
+
+        // 1M input: 600k cached at 0.2, 100k written at 2.5, 300k plain at 2.
+        let json = r#"{"id":"m","input_cost_per_million":2,"output_cost_per_million":10,
+            "cache_read_cost_per_million":0.2,"cache_write_cost_per_million":2.5,"context_window":1000000}"#;
+        let cached: Model = serde_json::from_str(json).unwrap();
+        let usage = Usage { input_tokens: 1_000_000, output_tokens: 0, cached_tokens: 600_000, cache_write_tokens: 100_000 };
+        assert!((cached.cost(usage) - (0.6 + 0.12 + 0.25)).abs() < 1e-9);
+        assert_eq!(cached.context_window, 1_000_000);
     }
 
     #[test]

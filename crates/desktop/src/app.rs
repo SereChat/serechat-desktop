@@ -3,31 +3,34 @@
 //! Threading model: the winit thread owns all state and renders. Network
 //! calls, tools, file imports, dialogs and searches run on short-lived
 //! worker threads that report back through [`WorkerEvent`]s posted to the
-//! event loop, so the UI never blocks.
+//! event loop, and every file the app writes goes through one [`Writer`]
+//! thread, so the UI never blocks.
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use serechat::{
-    AccessToken, Attachment, Client, Config, Error, Model, Projects, ResponseRequest, SearchHit, Session, SessionStore, StreamEvent,
-    ToolSpec,
+    AccessToken, Attachment, Client, Config, Error, Model, Projects, ResponseRequest, SearchHit, Session, SessionStore, SessionSummary,
+    StreamEvent, ToolSpec,
 };
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
-use winit::window::{CursorIcon, Theme, Window};
+use winit::window::{CursorIcon, Theme, UserAttentionType, Window};
 
-use crate::chat::{self, Chat, Reasoning, SendJob, ToolJob};
+use crate::chat::{self, Chat, Reasoning, ReasoningView, SendJob, ToolJob};
 use crate::gpu::{GpuError, Instance, Renderer};
+use crate::image::{self, ImageAtlas, ImageKey};
 use crate::login::Login;
 use crate::paint::{Painter, Rect};
 use crate::text::{Fonts, GlyphAtlas};
 use crate::theme::{Palette, Scheme};
 use crate::ui::{Ui, copy};
-use crate::{attachments, platform, tools};
+use crate::{attachments, platform, skills, tools};
 
 /// Length of the cross-fade when the colour scheme changes.
 const THEME_FADE_SECS: f32 = 0.25;
@@ -90,6 +93,17 @@ pub enum WorkerEvent {
         /// Matching sessions.
         hits: Vec<SearchHit>,
     },
+    /// A thumbnail was decoded (or could not be).
+    Thumbnail(ImageKey, Result<Vec<u8>, String>),
+    /// The skills (and `AGENTS.md`) of a project were found.
+    Skills {
+        /// Project folder scanned; `None` for the user's skills.
+        project: Option<String>,
+        /// The scan's number, or `None` for one a request made on its own.
+        generation: Option<u64>,
+        /// What it found.
+        catalog: Arc<skills::Catalog>,
+    },
 }
 
 /// Something a screen wants done that needs app-level resources.
@@ -115,6 +129,8 @@ pub enum Action {
     SetReasoning(Reasoning),
     /// Switch and persist the colour scheme.
     SetTheme(Scheme),
+    /// Switch and persist how replies show reasoning.
+    SetReasoningView(ReasoningView),
     /// Read a session's messages on a worker thread.
     LoadSession {
         /// Conversation waiting for them.
@@ -126,6 +142,15 @@ pub enum Action {
     SaveSession(Session),
     /// Delete a session file by id.
     DeleteSession(String),
+    /// Stop the background processes a conversation started.
+    StopProcesses(u64),
+    /// Look for the skills of a project (`None`: the user's only).
+    ScanSkills {
+        /// Project folder, or `None` for the user's skills.
+        project: Option<String>,
+        /// Numbers the scan so an older result never replaces a newer one.
+        generation: u64,
+    },
     /// Search every session's messages.
     Search {
         /// Text to find.
@@ -151,6 +176,8 @@ pub enum Action {
     OpenPath(String),
     /// Put text on the clipboard.
     Copy(String),
+    /// A run finished or needs the user: flash the window if it is in the background.
+    Attention,
     /// Forget the token and return to sign-in.
     SignOut,
 }
@@ -194,6 +221,7 @@ pub struct App {
     renderer: Renderer,
     fonts: Fonts,
     atlas: GlyphAtlas,
+    images: ImageAtlas,
     instances: Vec<Instance>,
     proxy: EventLoopProxy<WorkerEvent>,
     clipboard: Option<Clipboard>,
@@ -202,8 +230,10 @@ pub struct App {
     last_frame: Instant,
     config: Config,
     client: Client,
-    /// Saved sessions; `None` when there is no home directory.
-    store: Option<SessionStore>,
+    /// Where sessions are saved; `None` when there is no home directory.
+    sessions_dir: Option<PathBuf>,
+    /// Performs every file write, in order, off the UI thread.
+    writer: Writer,
     /// Project folders; `None` when there is no home directory.
     projects: Option<Projects>,
     screen: Screen,
@@ -250,7 +280,10 @@ impl App {
         let renderer = block_on(Renderer::new(Arc::clone(&window), event_loop.owned_display_handle())).map_err(StartupError::Gpu)?;
 
         let client = Client::new(config.token.clone());
-        let store = SessionStore::open().inspect_err(|e| eprintln!("serechat: sessions will not be saved: {e}")).ok();
+        let sessions_dir = SessionStore::open()
+            .inspect_err(|e| eprintln!("serechat: sessions will not be saved: {e}"))
+            .ok()
+            .map(|store| store.dir().to_owned());
         let projects = Projects::load().inspect_err(|e| eprintln!("serechat: cannot read projects: {e}")).ok();
         let now = Instant::now();
         let mut app = Self {
@@ -258,6 +291,7 @@ impl App {
             renderer,
             fonts: Fonts::load(),
             atlas: GlyphAtlas::default(),
+            images: ImageAtlas::default(),
             instances: Vec::new(),
             proxy,
             clipboard: None,
@@ -267,7 +301,8 @@ impl App {
             screen: Screen::Login(Login::new(None)),
             config,
             client,
-            store,
+            writer: Writer::start(sessions_dir.clone()),
+            sessions_dir,
             projects,
             scheme,
             palette: *scheme.palette(),
@@ -289,23 +324,17 @@ impl App {
 
     fn enter_chat(&mut self) {
         // Only the index is read here; messages load when a session opens.
-        let sessions = match self.store.as_mut().map(SessionStore::list) {
-            Some(Ok((sessions, errors))) => {
-                for e in errors {
-                    eprintln!("serechat: skipping unreadable session: {e}");
-                }
-                sessions
-            }
-            Some(Err(e)) => {
-                eprintln!("serechat: cannot list sessions: {e}");
-                Vec::new()
-            }
-            None => Vec::new(),
-        };
+        let sessions = self.writer.list_sessions();
         let reasoning = Reasoning::from_key(self.config.reasoning.as_deref());
         let projects = self.projects.as_ref().map(|p| p.list.clone()).unwrap_or_default();
-        self.screen = Screen::Chat(Box::new(Chat::new(self.config.model.clone(), reasoning, sessions, projects, self.config.project.clone())));
+        let mut chat = Chat::new(self.config.model.clone(), reasoning, sessions, projects, self.config.project.clone());
+        chat.set_reasoning_view(ReasoningView::from_key(self.config.reasoning_view.as_deref()));
+        // Skills are known before the first message: the user's and the open project's.
+        let mut actions = Vec::new();
+        chat.refresh_skills(true, &mut actions);
+        self.screen = Screen::Chat(Box::new(chat));
         self.spawn(|client, _| WorkerEvent::Models(client.models()));
+        self.apply(actions);
     }
 
     /// Starts a cross-fade to `scheme` and persists it.
@@ -327,16 +356,20 @@ impl App {
         self.screen = Screen::Login(Login::new(reason));
     }
 
-    fn save_config(&self) {
-        if let Err(e) = self.config.save() {
-            eprintln!("serechat: could not save config: {e}");
+    fn save_config(&mut self) {
+        self.writer.send(Job::SaveConfig(self.config.clone()));
+    }
+
+    fn save_projects(&mut self) {
+        if let Some(projects) = &self.projects {
+            self.writer.send(Job::SaveProjects(projects.clone()));
         }
     }
 
-    fn save_projects(&self) {
-        if let Some(Err(e)) = self.projects.as_ref().map(Projects::save) {
-            eprintln!("serechat: could not save projects: {e}");
-        }
+    /// A store for reading sessions on a worker thread. Reads never see a
+    /// half-written file: the writer replaces files by atomic rename.
+    fn reader(&self) -> Option<SessionStore> {
+        self.sessions_dir.clone().map(SessionStore::at)
     }
 
     /// Runs `job` on a worker thread and posts its result to the event loop.
@@ -364,7 +397,13 @@ impl App {
                 return;
             }
             WindowEvent::Resized(size) => self.renderer.resize(size.width, size.height),
-            WindowEvent::Focused(focused) => self.ui.focused = focused,
+            WindowEvent::Focused(focused) => {
+                self.ui.focused = focused;
+                // Skills or AGENTS.md may have been edited in another app.
+                if let (true, Screen::Chat(chat)) = (focused, &mut self.screen) {
+                    chat.refresh_skills(false, &mut actions);
+                }
+            }
             WindowEvent::ModifiersChanged(mods) => self.ui.mods = mods.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.mouse = (position.x as f32 / scale, position.y as f32 / scale);
@@ -379,10 +418,14 @@ impl App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.ui.scroll -= match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * 48.0,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / scale,
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x * 100.0, y * 100.0),
+                    MouseScrollDelta::PixelDelta(p) => (p.x as f32 / scale, p.y as f32 / scale),
                 };
+                // Shift turns a plain wheel sideways, as everywhere else.
+                let (dx, dy) = if self.ui.mods.shift_key() && dx == 0.0 { (dy, 0.0) } else { (dx, dy) };
+                self.ui.scroll -= dy;
+                self.ui.scroll_x -= dx;
             }
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if event.state == ElementState::Pressed => {
                 match &mut self.screen {
@@ -426,6 +469,7 @@ impl App {
     pub fn worker_event(&mut self, event: WorkerEvent) {
         let mut actions = Vec::new();
         match (event, &mut self.screen) {
+            (WorkerEvent::Thumbnail(key, pixels), _) => self.images.insert(key, pixels),
             (WorkerEvent::AuthRequested(result), Screen::Login(login)) => {
                 if let Some(request_id) = login.requested(result) {
                     self.open_auth_page(&request_id);
@@ -460,6 +504,7 @@ impl App {
             (WorkerEvent::FilesPicked(paths), Screen::Chat(chat)) => chat.attach(paths, &mut actions),
             (WorkerEvent::FolderPicked(Some(path)), Screen::Chat(_)) => actions.push(Action::OpenProject(Some(path))),
             (WorkerEvent::SearchResults { generation, hits }, Screen::Chat(chat)) => chat.search_results(generation, hits),
+            (WorkerEvent::Skills { project, generation, catalog }, Screen::Chat(chat)) => chat.skills_scanned(project, generation, catalog),
             // Results for a screen that is no longer shown.
             _ => return,
         }
@@ -487,17 +532,36 @@ impl App {
                 let result = match chat::input_items(&job.history) {
                     Err(message) => Err(Error::Io(std::io::Error::other(message))),
                     Ok(input) => {
-                        let specs: Vec<ToolSpec<'_>> = if job.tools {
-                            tools::all().iter().map(|t| ToolSpec { name: t.name, description: &t.description, parameters: &t.parameters }).collect()
-                        } else {
-                            Vec::new()
+                        // Catalogs not scanned yet are scanned here, and cached for next time.
+                        let scanned = |project: Option<String>, catalog: skills::Catalog| {
+                            let catalog = Arc::new(catalog);
+                            let _ = proxy.send_event(WorkerEvent::Skills { project, generation: None, catalog: Arc::clone(&catalog) });
+                            catalog
                         };
+                        let user = job.user_skills.clone().unwrap_or_else(|| scanned(None, skills::scan_user()));
+                        let project = match (&job.project, &job.project_skills) {
+                            (Some(root), None) => Some(scanned(Some(root.clone()), skills::scan_project(std::path::Path::new(root)))),
+                            (_, known) => known.clone(),
+                        };
+                        let (list, _) = skills::merge(project.as_deref(), Some(&user));
+                        let agents_md = project.as_ref().and_then(|c| c.agents_md.as_deref());
+                        let instructions = format!("{}{}", job.instructions, skills::prompt(agents_md, &list));
+                        let skill_tool = skills::tool(&list);
+                        let mut specs: Vec<ToolSpec<'_>> = Vec::new();
+                        if job.tools {
+                            specs.extend(tools::all().iter().map(|t| ToolSpec { name: t.name, description: &t.description, parameters: &t.parameters }));
+                        }
+                        // Skills work in every chat, with or without a project.
+                        if let Some((description, parameters)) = &skill_tool {
+                            specs.push(ToolSpec { name: "use_skill", description, parameters });
+                        }
                         let request = ResponseRequest {
                             model: &job.model,
-                            instructions: Some(&job.instructions),
+                            instructions: Some(&instructions),
                             reasoning: job.reasoning,
                             input: &input,
                             tools: &specs,
+                            tool_choice: job.tool_choice,
                         };
                         client.stream_response(&request, &job.cancel, |event| {
                             let _ = proxy.send_event(WorkerEvent::Stream { conversation, stream, event });
@@ -507,7 +571,11 @@ impl App {
                 WorkerEvent::StreamEnded { conversation, stream, result }
             }),
             Action::RunTool(job) => self.spawn(move |client, _| {
-                let result = tools::run(&job.root, client, &job.call, &job.cancel);
+                let result = match &job.root {
+                    _ if job.call.name == "use_skill" => skills::run(&job.skills, &job.call.arguments),
+                    Some(root) => tools::run(root, job.conversation, client, &job.call, &job.cancel),
+                    None => Err("Tools are only available in a project.".to_owned()),
+                };
                 WorkerEvent::ToolDone { conversation: job.conversation, call_id: job.call.call_id, result }
             }),
             Action::SelectModel(model) => {
@@ -519,34 +587,37 @@ impl App {
                 self.save_config();
             }
             Action::SetTheme(scheme) => self.set_scheme(scheme),
+            Action::SetReasoningView(view) => {
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.set_reasoning_view(view);
+                }
+                self.config.reasoning_view = Some(view.key().to_owned());
+                self.save_config();
+            }
             Action::LoadSession { conversation, session } => {
-                if let Some(store) = &self.store {
-                    let store = SessionStore::at(store.dir().to_owned());
+                if let Some(store) = self.reader() {
                     self.spawn(move |_, _| WorkerEvent::SessionLoaded { conversation, result: store.load(&session) });
                 }
             }
-            // ponytail: session files and the index are written on the UI
-            // thread; they are small and only saved when a turn starts or
-            // ends. Move to a writer thread if large histories stutter.
-            Action::SaveSession(session) => {
-                if let Some(Err(e)) = self.store.as_mut().map(|store| store.save(&session)) {
-                    eprintln!("serechat: could not save session: {e}");
-                }
-            }
-            Action::DeleteSession(id) => {
-                if let Some(Err(e)) = self.store.as_mut().map(|store| store.delete(&id)) {
-                    eprintln!("serechat: could not delete session: {e}");
-                }
-            }
+            Action::SaveSession(session) => self.writer.send(Job::SaveSession(session)),
+            Action::DeleteSession(id) => self.writer.send(Job::DeleteSession(id)),
+            // Stopping waits for the processes to exit, so off the UI thread.
+            Action::ScanSkills { project, generation } => self.spawn(move |_, _| {
+                let catalog = match &project {
+                    Some(root) => skills::scan_project(std::path::Path::new(root)),
+                    None => skills::scan_user(),
+                };
+                WorkerEvent::Skills { project, generation: Some(generation), catalog: Arc::new(catalog) }
+            }),
+            Action::StopProcesses(owner) => std::mem::drop(std::thread::Builder::new().spawn(move || crate::process::stop_owner(owner))),
             Action::Search { query, generation } => {
-                if let Some(store) = &self.store {
-                    let store = SessionStore::at(store.dir().to_owned());
+                if let Some(store) = self.reader() {
                     self.spawn(move |_, _| WorkerEvent::SearchResults { generation, hits: store.search(&query, 30).unwrap_or_default() });
                 }
             }
             Action::PickFiles => self.spawn(|_, _| WorkerEvent::FilesPicked(platform::pick_files().unwrap_or_default())),
             Action::ImportFiles(paths) => {
-                let dir = self.store.as_ref().map_or_else(|| std::env::temp_dir().join("serechat-attachments"), SessionStore::attachments_dir);
+                let dir = self.reader().map_or_else(|| std::env::temp_dir().join("serechat-attachments"), |store| store.attachments_dir());
                 self.spawn(move |_, _| WorkerEvent::Imported(paths.iter().map(|path| attachments::import(path, &dir)).collect()));
             }
             Action::OpenProject(None) => self.spawn(|_, _| WorkerEvent::FolderPicked(platform::pick_folder().ok().flatten())),
@@ -577,10 +648,10 @@ impl App {
                 self.save_projects();
             }
             Action::OpenDataDir => {
-                if let Some(store) = &self.store {
+                if let Some(dir) = &self.sessions_dir {
                     // The folder may not exist before the first save.
-                    let _ = std::fs::create_dir_all(store.dir());
-                    if let Err(e) = platform::open_folder(store.dir()) {
+                    let _ = std::fs::create_dir_all(dir);
+                    if let Err(e) = platform::open_folder(dir) {
                         eprintln!("serechat: cannot open the data folder: {e}");
                     }
                 }
@@ -598,6 +669,8 @@ impl App {
                 }
             }
             Action::Copy(text) => copy(&mut self.clipboard, &text),
+            Action::Attention if !self.ui.focused => self.window.request_user_attention(Some(UserAttentionType::Informational)),
+            Action::Attention => {}
             Action::SignOut => self.sign_out(None),
         }
     }
@@ -615,6 +688,7 @@ impl App {
 
     /// Builds and presents one frame.
     fn frame(&mut self) {
+        self.tick();
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
@@ -641,7 +715,7 @@ impl App {
         let mut actions = Vec::new();
         // A second pass runs only if the glyph atlas overflowed mid-frame.
         for _ in 0..2 {
-            let mut painter = Painter::new(&self.fonts, &mut self.atlas, &mut self.instances, scale, view, &self.palette);
+            let mut painter = Painter::new(&self.fonts, (&mut self.atlas, &mut self.images), &mut self.instances, scale, view, &self.palette);
             match &mut self.screen {
                 Screen::Login(login) => login.draw(&mut painter, &mut self.ui, view, &mut actions),
                 Screen::Chat(chat) => chat.draw(&mut painter, &mut self.ui, view, self.scheme, &mut actions),
@@ -655,7 +729,7 @@ impl App {
             self.ui.end();
         }
 
-        self.renderer.render(&self.instances, &mut self.atlas.uploads, scale, self.palette.bg);
+        self.renderer.render(&self.instances, &mut self.atlas.uploads, &mut self.images.uploads, scale, self.palette.bg);
         self.ui.end();
         if !self.shown {
             self.shown = true;
@@ -681,24 +755,159 @@ impl App {
         }
         let busy = matches!(&self.screen, Screen::Chat(chat) if chat.is_busy());
         self.apply(actions);
+        // One worker per frame's misses, decoding them in turn, so a page
+        // of images never decodes dozens at once.
+        let mut wanted = self.images.take_wanted();
+        if let Some(last) = wanted.pop() {
+            let proxy = self.proxy.clone();
+            self.spawn(move |_, _| {
+                for key in wanted {
+                    let pixels = image::thumbnail(&key);
+                    let _ = proxy.send_event(WorkerEvent::Thumbnail(key, pixels));
+                }
+                let pixels = image::thumbnail(&last);
+                WorkerEvent::Thumbnail(last, pixels)
+            });
+        }
         if self.ui.animating || busy {
             self.window.request_redraw();
         }
     }
 
-    /// How long the event loop may sleep: until the caret blinks next.
+    /// How long the event loop may sleep: until the caret blinks next or the
+    /// agent has something to do (a retry, a stream to check on).
     pub fn control_flow(&self) -> ControlFlow {
-        if self.ui.focused {
-            let wait = Duration::from_secs_f32(self.ui.next_blink().max(0.01));
-            ControlFlow::WaitUntil(self.last_frame + wait)
-        } else {
-            ControlFlow::Wait
+        let blink = self.ui.focused.then(|| self.last_frame + Duration::from_secs_f32(self.ui.next_blink().max(0.01)));
+        let agent = match &self.screen {
+            Screen::Chat(chat) => chat.next_deadline(),
+            Screen::Login(_) => None,
+        };
+        match blink.into_iter().chain(agent).min() {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Wait,
         }
     }
 
-    /// Requests a redraw (used when a blink timer fires).
-    pub fn redraw(&self) {
+    /// A timer fired: runs the agent's due work, even while the window is
+    /// hidden and gets no frames, and redraws for the caret.
+    pub fn wake(&mut self) {
+        self.tick();
         self.window.request_redraw();
+    }
+
+    /// Sends due retries and drops silent streams.
+    fn tick(&mut self) {
+        let mut actions = Vec::new();
+        if let Screen::Chat(chat) = &mut self.screen {
+            chat.tick(Instant::now(), &mut actions);
+        }
+        self.apply(actions);
+    }
+}
+
+/// A file write for the [`Writer`] thread.
+enum Job {
+    SaveSession(Session),
+    DeleteSession(String),
+    SaveConfig(Config),
+    SaveProjects(Projects),
+    /// List the saved sessions and send them back.
+    ListSessions(mpsc::Sender<Vec<SessionSummary>>),
+}
+
+impl Job {
+    /// Performs the job against `store` (`None`: sessions are not saved).
+    fn run(self, store: Option<&mut SessionStore>) {
+        let result = match (self, store) {
+            (Self::SaveSession(session), Some(store)) => store.save(&session).map_err(|e| ("save the session", e)),
+            (Self::DeleteSession(id), Some(store)) => store.delete(&id).map_err(|e| ("delete the session", e)),
+            (Self::SaveSession(_) | Self::DeleteSession(_), None) => Ok(()),
+            (Self::SaveConfig(config), _) => config.save().map_err(|e| ("save the config", e)),
+            (Self::SaveProjects(projects), _) => projects.save().map_err(|e| ("save the projects", e)),
+            (Self::ListSessions(reply), store) => {
+                let sessions = match store.map(SessionStore::list) {
+                    Some(Ok((sessions, errors))) => {
+                        for e in errors {
+                            eprintln!("serechat: skipping unreadable session: {e}");
+                        }
+                        sessions
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("serechat: cannot list sessions: {e}");
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                };
+                // The receiver only disappears if the app is exiting.
+                let _ = reply.send(sessions);
+                Ok(())
+            }
+        };
+        if let Err((what, e)) = result {
+            eprintln!("serechat: could not {what}: {e}");
+        }
+    }
+}
+
+/// Owns the session store on a background thread and performs every file
+/// write in the order it was queued, so the UI never waits on the disk.
+/// Dropping it finishes the queue first, so nothing is lost on exit.
+struct Writer {
+    queue: Option<mpsc::Sender<Job>>,
+    thread: Option<JoinHandle<()>>,
+    /// Used on the calling thread if the writer thread could not start.
+    inline: Option<SessionStore>,
+}
+
+impl Writer {
+    /// Starts the thread for sessions in `dir` (`None`: not saved).
+    fn start(dir: Option<PathBuf>) -> Self {
+        let (queue, jobs) = mpsc::channel::<Job>();
+        let fallback = dir.clone();
+        let spawned = std::thread::Builder::new().name("serechat-writer".into()).spawn(move || {
+            let mut store = dir.map(SessionStore::at);
+            for job in jobs {
+                job.run(store.as_mut());
+            }
+        });
+        match spawned {
+            Ok(thread) => Self { queue: Some(queue), thread: Some(thread), inline: None },
+            Err(e) => {
+                eprintln!("serechat: cannot start the writer thread, saving on the UI thread: {e}");
+                Self { queue: None, thread: None, inline: fallback.map(SessionStore::at) }
+            }
+        }
+    }
+
+    /// Queues `job`.
+    fn send(&mut self, job: Job) {
+        let job = match &self.queue {
+            Some(queue) => match queue.send(job) {
+                Ok(()) => return,
+                // The thread is gone; still don't lose the write.
+                Err(mpsc::SendError(job)) => job,
+            },
+            None => job,
+        };
+        job.run(self.inline.as_mut());
+    }
+
+    /// The saved sessions, newest first. Waits for the writes queued before
+    /// it, which only happens when the chat screen opens.
+    fn list_sessions(&mut self) -> Vec<SessionSummary> {
+        let (reply, sessions) = mpsc::channel();
+        self.send(Job::ListSessions(reply));
+        sessions.recv().unwrap_or_default()
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Closing the queue ends the thread once everything is written.
+        self.queue = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -723,5 +932,27 @@ fn block_on<F: Future>(future: F) -> F::Output {
             return output;
         }
         std::thread::park();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_keeps_order_and_flushes_on_drop() {
+        let dir = std::env::temp_dir().join(format!("serechat-writer-{}", std::process::id())).join("sessions");
+        let session = |id: &str, updated| Session { id: id.into(), title: id.into(), updated, ..Session::default() };
+        let mut writer = Writer::start(Some(dir.clone()));
+        writer.send(Job::SaveSession(session("a", 1)));
+        writer.send(Job::SaveSession(session("b", 2)));
+        writer.send(Job::DeleteSession("a".into()));
+        // Listing waits for the writes queued before it.
+        let ids: Vec<String> = writer.list_sessions().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, ["b"]);
+        writer.send(Job::SaveSession(session("c", 3)));
+        drop(writer);
+        assert!(dir.join("c.json").exists(), "dropping the writer finishes its queue");
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 }

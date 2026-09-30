@@ -56,11 +56,18 @@ pub struct TextPiece {
     pub sep: &'static str,
     /// Link targets of this piece's link runs.
     links: Vec<String>,
+    /// For code: the code block's number and its frame width.
+    code: Option<(usize, f32)>,
 }
 
 impl TextPiece {
-    fn rect(&self) -> Rect {
-        Rect::new(self.x, self.y, self.layout.width().max(4.0), self.layout.height())
+    /// The visible part, with code scrolled by `scroll`.
+    fn rect(&self, scroll: f32) -> Rect {
+        let w = self.layout.width().max(4.0);
+        match self.code {
+            Some((_, window)) => Rect::new(self.x, self.y, (w - scroll).min(window - 2.0 * CODE_PAD), self.layout.height()),
+            None => Rect::new(self.x, self.y, w, self.layout.height()),
+        }
     }
 }
 
@@ -82,6 +89,8 @@ pub enum Deco {
         w: f32,
         /// Frame height.
         h: f32,
+        /// Width of the code plus padding; more than `w` when it scrolls.
+        content_w: f32,
         /// Language label.
         lang: String,
         /// The code, for the copy button.
@@ -142,6 +151,10 @@ pub struct Doc {
     block_ends: Vec<(usize, usize, usize, f32)>,
     /// Width and scale the layout is valid for.
     key: (u32, u32),
+    /// Sideways scroll of each code block, which never wraps.
+    code_scroll: Vec<f32>,
+    /// Code block whose scrollbar is being dragged, and its scroll at the press.
+    code_drag: Option<(usize, f32)>,
 }
 
 /// Layout state while building.
@@ -160,7 +173,7 @@ impl Doc {
         let layout = TextLayout::new(fonts, text, style, Some(width), scale);
         let height = layout.height();
         Self {
-            texts: vec![TextPiece { x: 0.0, y: 0.0, layout, text: text.to_owned(), sep: "", links: Vec::new() }],
+            texts: vec![TextPiece { x: 0.0, y: 0.0, layout, text: text.to_owned(), sep: "", links: Vec::new(), code: None }],
             height,
             key: (width.to_bits(), scale.to_bits()),
             ..Self::default()
@@ -171,13 +184,15 @@ impl Doc {
     /// same width and scale, donates every leading block that is unchanged.
     /// `base_ink` colours plain text (e.g. [`INK_MUTED`] for reasoning).
     #[must_use]
-    pub fn markdown(fonts: &Fonts, src: &str, width: f32, scale: f32, base_ink: u8, previous: Option<Self>) -> Self {
+    pub fn markdown(fonts: &Fonts, src: &str, width: f32, scale: f32, base_ink: u8, mut previous: Option<Self>) -> Self {
         let blocks = markdown::parse(src);
         let key = (width.to_bits(), scale.to_bits());
         let mut b = Builder { fonts, scale, texts: Vec::new(), decos: Vec::new(), codes: 0 };
         let mut block_ends = Vec::with_capacity(blocks.len());
         let mut y = 0.0;
         let mut reused = 0;
+        // Code blocks keep their scroll while a reply streams in.
+        let (mut code_scroll, code_drag) = previous.as_mut().map(|p| (std::mem::take(&mut p.code_scroll), p.code_drag)).unwrap_or_default();
         if let Some(prev) = previous.filter(|p| p.key == key) {
             reused = prev.blocks.iter().zip(&blocks).take_while(|(a, b)| a == b).count();
             // The last reused block's end marks where rebuilding resumes.
@@ -202,7 +217,13 @@ impl Doc {
             y += b.block(block, 0.0, y, width, base_ink, sep);
             block_ends.push((b.texts.len(), b.decos.len(), b.codes, y));
         }
-        Self { texts: b.texts, decos: b.decos, height: y, blocks, block_ends, key }
+        code_scroll.resize(b.codes, 0.0);
+        Self { texts: b.texts, decos: b.decos, height: y, blocks, block_ends, key, code_scroll, code_drag }
+    }
+
+    /// How far a piece is scrolled sideways (code only).
+    fn scroll_of(&self, piece: &TextPiece) -> f32 {
+        piece.code.and_then(|(index, _)| self.code_scroll.get(index)).copied().unwrap_or(0.0)
     }
 
     /// Whether the layout was made for this width and scale.
@@ -220,8 +241,9 @@ impl Doc {
             // Rows matter more than columns: prefer the piece on this line.
             dy * 4.0 + dx
         };
-        let (index, piece) = self.texts.iter().enumerate().min_by(|a, b| distance(a.1.rect()).total_cmp(&distance(b.1.rect())))?;
-        let byte = piece.layout.hit(x - piece.x, (y - piece.y).clamp(0.0, piece.layout.height() - 0.01));
+        let rect = |piece: &TextPiece| piece.rect(self.scroll_of(piece));
+        let (index, piece) = self.texts.iter().enumerate().min_by(|a, b| distance(rect(a.1)).total_cmp(&distance(rect(b.1))))?;
+        let byte = piece.layout.hit(x - piece.x + self.scroll_of(piece), (y - piece.y).clamp(0.0, piece.layout.height() - 0.01));
         Some((index, byte))
     }
 
@@ -268,6 +290,9 @@ impl Doc {
             let last = if index == to.0 { to.1 } else { piece.text.len() };
             let continues = index < to.0;
             let line_h = piece.layout.line_height();
+            let left = origin.0 + piece.x - self.scroll_of(piece);
+            // Scrolled code stays inside its frame.
+            let clip = piece.code.map(|(_, window)| p.push_clip(code_window(origin, piece, window)));
             for (start, end, y) in piece.layout.line_spans() {
                 let (s, e) = (first.max(start), last.min(end));
                 let past_line = last > end || continues;
@@ -276,7 +301,10 @@ impl Doc {
                 }
                 let x0 = piece.layout.caret(s).0;
                 let x1 = piece.layout.caret(e).0 + if past_line && e == end { 6.0 } else { 0.0 };
-                p.rect(Rect::new(origin.0 + piece.x + x0, origin.1 + piece.y + y, x1 - x0, line_h), color, 2.0);
+                p.rect(Rect::new(left + x0, origin.1 + piece.y + y, x1 - x0, line_h), color, 2.0);
+            }
+            if let Some(clip) = clip {
+                p.set_clip(clip);
             }
         }
     }
@@ -284,7 +312,7 @@ impl Doc {
     /// Draws the document at `origin`. `interactive` enables hover and clicks;
     /// `copied` is the code block currently showing "Copied".
     pub fn draw(
-        &self,
+        &mut self,
         p: &mut Painter,
         ui: &mut crate::ui::Ui,
         origin: (f32, f32),
@@ -301,7 +329,7 @@ impl Doc {
             match &piece.deco {
                 Deco::Rule { w } => p.rect(Rect::new(x, y, *w, 1.0), t.border, 0.0),
                 Deco::QuoteBar { h } => p.rect(Rect::new(x, y, 3.0, *h), t.border_strong, 1.5),
-                Deco::Code { w, h, lang, index, .. } => {
+                Deco::Code { w, h, content_w, lang, index, .. } => {
                     if piece.y > bottom || piece.y + h < top {
                         continue;
                     }
@@ -318,6 +346,12 @@ impl Doc {
                     let clicked = crate::ui::button(p, ui, button, copy, crate::ui::ButtonStyle::Ghost, enabled);
                     if clicked {
                         event.copy_code = Some(*index);
+                    }
+                    if content_w > w {
+                        let body = Rect::new(x, y + CODE_HEADER, *w, h - CODE_HEADER);
+                        let scroll = &mut self.code_scroll[*index];
+                        let dragging = &mut self.code_drag;
+                        scroll_code(p, ui, body, *content_w, (scroll, dragging, *index), interactive);
                     }
                 }
                 Deco::Table { cols, rows } => {
@@ -351,8 +385,12 @@ impl Doc {
             if piece.y > bottom || piece.y + piece.layout.height() < top {
                 continue;
             }
-            let (x, y) = (origin.0 + piece.x, origin.1 + piece.y);
+            let (x, y) = (origin.0 + piece.x - self.scroll_of(piece), origin.1 + piece.y);
+            let clip = piece.code.map(|(_, window)| p.push_clip(code_window(origin, piece, window)));
             p.rich(&piece.layout, x, y, &inks, code_bg);
+            if let Some(clip) = clip {
+                p.set_clip(clip);
+            }
             if interactive && !piece.links.is_empty() && ui.hovered(Rect::new(x, y, piece.layout.width(), piece.layout.height())) {
                 let under = |(mx, my): (f32, f32)| piece.layout.link_at(mx - x, my - y);
                 if let Some(index) = under(ui.mouse) {
@@ -420,7 +458,7 @@ impl Builder<'_> {
 
     fn text(&mut self, x: f32, y: f32, layout: TextLayout, inline: &Inline, sep: &'static str) -> f32 {
         let h = layout.height();
-        self.texts.push(TextPiece { x, y, layout, text: inline.text.clone(), sep, links: inline.links.clone() });
+        self.texts.push(TextPiece { x, y, layout, text: inline.text.clone(), sep, links: inline.links.clone(), code: None });
         h
     }
 
@@ -458,11 +496,25 @@ impl Builder<'_> {
                         (range, Run { ink: INK_SYNTAX + slot, ..Run::plain(FontId::MONO) })
                     })
                     .collect();
-                let layout = TextLayout::rich(self.fonts, code, &spans, CODE_STYLE, Some(width - 2.0 * CODE_PAD), self.scale);
-                let h = CODE_HEADER + layout.height() + 2.0 * CODE_PAD - 4.0;
-                self.decos.push(DecoPiece { x, y, deco: Deco::Code { w: width, h, lang: lang.clone(), code: code.clone(), index: self.codes } });
+                // Code never wraps: lines keep their shape and the block scrolls.
+                let layout = TextLayout::rich(self.fonts, code, &spans, CODE_STYLE, None, self.scale);
+                let content_w = layout.width() + 2.0 * CODE_PAD;
+                // Room for the scrollbar when the code is wider than the frame.
+                let bar = if content_w > width { 6.0 } else { 0.0 };
+                let h = CODE_HEADER + layout.height() + 2.0 * CODE_PAD - 4.0 + bar;
+                let index = self.codes;
+                self.decos.push(DecoPiece { x, y, deco: Deco::Code { w: width, h, content_w, lang: lang.clone(), code: code.clone(), index } });
                 self.codes += 1;
-                self.texts.push(TextPiece { x: x + CODE_PAD, y: y + CODE_HEADER + CODE_PAD - 2.0, layout, text: code.clone(), sep, links: Vec::new() });
+                let piece = TextPiece {
+                    x: x + CODE_PAD,
+                    y: y + CODE_HEADER + CODE_PAD - 2.0,
+                    layout,
+                    text: code.clone(),
+                    sep,
+                    links: Vec::new(),
+                    code: Some((index, width)),
+                };
+                self.texts.push(piece);
                 h
             }
             Block::Quote(blocks) => {
@@ -565,6 +617,51 @@ impl Builder<'_> {
     }
 }
 
+/// The part of a code block's frame its text shows through.
+fn code_window(origin: (f32, f32), piece: &TextPiece, frame_w: f32) -> Rect {
+    Rect::new(origin.0 + piece.x - CODE_PAD + 1.0, origin.1 + piece.y - 4.0, frame_w - 2.0, piece.layout.height() + 8.0)
+}
+
+/// Scrolls a code block sideways (wheel, trackpad or its scrollbar) and draws
+/// the scrollbar along the bottom of `body`. `state` is the block's scroll,
+/// the document's drag (block number and scroll at the press) and the
+/// block's number.
+fn scroll_code(p: &mut Painter, ui: &mut crate::ui::Ui, body: Rect, content_w: f32, state: (&mut f32, &mut Option<(usize, f32)>, usize), interactive: bool) {
+    let (scroll, drag, index) = state;
+    let max = content_w - body.w;
+    if interactive && ui.hovered(body) && ui.scroll_x != 0.0 {
+        *scroll += ui.scroll_x;
+        ui.scroll_x = 0.0;
+    }
+    let track = Rect::new(body.x + 6.0, body.bottom() - 9.0, body.w - 12.0, 6.0);
+    let thumb_w = (track.w * body.w / content_w).max(24.0);
+    // Easier to grab than it looks.
+    let grab = Rect::new(track.x, track.y - 4.0, track.w, track.h + 6.0);
+    let over = interactive && ui.hovered(grab);
+    if over {
+        ui.cursor = winit::window::CursorIcon::Pointer;
+        if ui.pressed {
+            *drag = Some((index, *scroll));
+        }
+    }
+    let dragging = drag.is_some_and(|(i, _)| i == index);
+    if dragging {
+        if ui.down {
+            let start = drag.map_or(0.0, |(_, s)| s);
+            *scroll = start + (ui.mouse.0 - ui.press_pos.0) * max / (track.w - thumb_w).max(1.0);
+            // Keep the pointer cursor so a drag never turns into a text selection.
+            ui.cursor = winit::window::CursorIcon::Pointer;
+        } else {
+            *drag = None;
+        }
+    }
+    *scroll = scroll.clamp(0.0, max);
+    let t = p.theme;
+    let alpha = if over || dragging { 0.3 } else if ui.hovered(body) { 0.16 } else { 0.08 };
+    let thumb = Rect::new(track.x + (track.w - thumb_w) * (*scroll / max), track.y + 1.0, thumb_w, 4.0);
+    p.rect(thumb, fade(t.text, alpha), 2.0);
+}
+
 /// Quotes render their text muted unless already coloured.
 fn markdown_quote_ink(ink: u8) -> u8 {
     if ink == INK_TEXT { INK_MUTED } else { ink }
@@ -644,6 +741,22 @@ mod tests {
         let second = &d.texts[1];
         assert_eq!(d.hit(1.0, second.y + 2.0).map(|p| p.0), Some(1));
         assert_eq!(d.hit(1.0, -50.0), Some((0, 0)));
+    }
+
+    #[test]
+    fn code_scrolls_instead_of_wrapping() {
+        let fonts = Fonts::load();
+        let src = format!("```\n{}\n```", "x".repeat(300));
+        let mut d = Doc::markdown(&fonts, &src, 400.0, 1.0, INK_TEXT, None);
+        assert_eq!(d.texts[0].layout.line_count(), 1);
+        assert!(matches!(d.decos[0].deco, Deco::Code { content_w, .. } if content_w > 400.0));
+        let (x, y) = (d.texts[0].x + 10.0, d.texts[0].y + 2.0);
+        let unscrolled = d.hit(x, y).unwrap().1;
+        d.code_scroll[0] = 200.0;
+        assert!(d.hit(x, y).unwrap().1 > unscrolled + 10, "hits land on the scrolled text");
+        // A streamed rebuild keeps the scroll.
+        let next = Doc::markdown(&fonts, &format!("{src}\n\nmore"), 400.0, 1.0, INK_TEXT, Some(d));
+        assert!((next.code_scroll[0] - 200.0).abs() < f32::EPSILON);
     }
 
     #[test]

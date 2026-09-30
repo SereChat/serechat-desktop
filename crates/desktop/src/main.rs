@@ -9,6 +9,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod atlas;
 mod attachments;
 mod chat;
 mod doc;
@@ -16,12 +17,15 @@ mod editor;
 mod font;
 mod gpu;
 mod highlight;
+mod image;
 mod login;
 mod markdown;
 mod paint;
 mod platform;
+mod process;
 mod raster;
 mod settings;
+mod skills;
 mod spotlight;
 mod text;
 mod theme;
@@ -47,8 +51,8 @@ struct Handler {
 
 impl ApplicationHandler<WorkerEvent> for Handler {
     fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
-        if let (StartCause::ResumeTimeReached { .. }, Some(app)) = (cause, &self.app) {
-            app.redraw();
+        if let (StartCause::ResumeTimeReached { .. }, Some(app)) = (cause, &mut self.app) {
+            app.wake();
         }
     }
 
@@ -93,7 +97,10 @@ fn main() -> ExitCode {
         }
     };
     let mut handler = Handler { app: None, proxy: event_loop.create_proxy(), error: None };
-    if let Err(e) = event_loop.run_app(&mut handler) {
+    let result = event_loop.run_app(&mut handler);
+    // Dev servers and watchers the agent started must not outlive the app.
+    process::stop_all();
+    if let Err(e) = result {
         eprintln!("serechat: event loop failed: {e}");
         return ExitCode::FAILURE;
     }

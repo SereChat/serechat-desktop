@@ -1,5 +1,5 @@
 //! Drop-down menus: model and reasoning (above the composer toolbar) and
-//! project (below the sidebar's switcher).
+//! project (below the header's folder chip).
 
 use winit::window::CursorIcon;
 
@@ -32,18 +32,20 @@ impl Chat {
                 (toolbar[0], 360.0, false, ("Model", "Input / output per 1M tokens"), items)
             }
             Menu::Reasoning => {
-                let items = Reasoning::ALL
-                    .iter()
-                    .map(|r| MenuItem { label: r.label().to_owned(), detail: r.detail().to_owned(), selected: *r == self.reasoning })
+                let in_use = self.reasoning_in_use();
+                let items = Reasoning::choices(self.selected_model())
+                    .into_iter()
+                    .map(|r| MenuItem { label: r.label().to_owned(), detail: r.detail().to_owned(), selected: r == in_use })
                     .collect();
                 (toolbar[1], 280.0, false, ("Reasoning effort", ""), items)
             }
             Menu::Project => {
-                let mut items = vec![MenuItem { label: "No project".into(), detail: "Chat without tools".into(), selected: self.project.is_none() }];
+                let current = self.current().project.clone();
+                let mut items = vec![MenuItem { label: "No project".into(), detail: "Chat without tools".into(), selected: current.is_none() }];
                 items.extend(self.projects.iter().map(|p| MenuItem {
                     label: p.name.clone(),
                     detail: display_path(&p.path),
-                    selected: self.project.as_deref() == Some(p.path.as_str()),
+                    selected: current.as_deref() == Some(p.path.as_str()),
                 }));
                 items.push(MenuItem { label: "Open folder…".into(), detail: format!("{PRIMARY_KEY}+O"), selected: false });
                 (self.project_button, 320.0, true, ("Project", ""), items)
@@ -60,8 +62,10 @@ impl Chat {
                     }
                 }
                 Menu::Reasoning => {
-                    self.reasoning = Reasoning::ALL[index];
-                    actions.push(Action::SetReasoning(self.reasoning));
+                    if let Some(choice) = Reasoning::choices(self.selected_model()).get(index) {
+                        self.reasoning = *choice;
+                        actions.push(Action::SetReasoning(self.reasoning));
+                    }
                 }
                 Menu::Project if index == 0 => self.set_project(None, actions),
                 Menu::Project if index > self.projects.len() => actions.push(Action::OpenProject(None)),
@@ -105,7 +109,9 @@ impl Chat {
         let room = if below { view_h - anchor.bottom() - 16.0 } else { anchor.y - 16.0 };
         let height = (header_h + content_h + 2.0 * pad).min(room.max(header_h + row_h * 3.0));
         let y = if below { anchor.bottom() + 6.0 } else { anchor.y - 6.0 - height };
-        let area = Rect::new(anchor.x, y, width, height);
+        // Kept inside the window when the anchor sits near its right edge.
+        let x = anchor.x.min(p.clip().right() - width - 8.0).max(8.0);
+        let area = Rect::new(x, y, width, height);
         self.menu_rect = Some(area);
 
         p.shadow(Rect::new(area.x, area.y + 6.0, area.w, area.h), t.shadow, theme::RADIUS, 18.0);

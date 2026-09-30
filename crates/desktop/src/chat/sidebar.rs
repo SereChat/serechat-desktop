@@ -1,15 +1,14 @@
-//! The sidebar: project switcher, search, new chat, the sessions of the
-//! current project, and settings.
+//! The sidebar: new chat, every saved session, and settings.
 
 use serechat::unix_now;
 use winit::window::CursorIcon;
 
-use super::{Chat, Menu, Page, PRIMARY_KEY, ago};
+use super::{Chat, Page, PRIMARY_KEY, ago};
 use crate::app::Action;
 use crate::paint::{Painter, Rect, fade, mix};
 use crate::text::Style;
 use crate::theme;
-use crate::ui::{Ui, chevron, folder_icon, id};
+use crate::ui::{Ui, id};
 
 impl Chat {
     pub(super) fn draw_sidebar(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, actions: &mut Vec<Action>) {
@@ -22,15 +21,9 @@ impl Chat {
         let brand = p.layout("SereChat", Style::semibold(14.5), None);
         p.text(&brand, 18.0, top + 18.0 - brand.height() * 0.5, t.text);
 
-        self.draw_project_switcher(p, ui, Rect::new(8.0, top + 40.0, area.w - 16.0, 36.0));
-
         let on_chat = self.page == Page::Chat;
-        let search = Rect::new(8.0, top + 84.0, area.w - 16.0, 30.0);
-        if list_row(p, ui, search, id("search"), "Search", Some(&format!("{PRIMARY_KEY}+K")), self.spotlight.is_some()) {
-            self.open_spotlight();
-        }
         let fresh = self.conversations.iter().any(|c| c.id == self.current && c.is_fresh());
-        let new_chat = Rect::new(8.0, search.bottom() + 2.0, area.w - 16.0, 30.0);
+        let new_chat = Rect::new(8.0, top + 40.0, area.w - 16.0, 30.0);
         if list_row(p, ui, new_chat, id("new-chat"), "New chat", Some(&format!("{PRIMARY_KEY}+N")), on_chat && fresh) {
             self.new_conversation();
         }
@@ -39,16 +32,14 @@ impl Chat {
         p.label("Sessions", theme::CAPTION, 18.0, list_top, t.text_faint);
         let list = Rect::new(0.0, list_top + 24.0, area.w, area.h - list_top - 24.0 - 52.0);
         let item_h = 30.0;
-        let project = self.project.clone();
-        let shown = |c: &&super::Conversation| !c.is_fresh() && c.project == project;
+        let shown = |c: &&super::Conversation| !c.is_fresh();
         let content_h = self.conversations.iter().filter(shown).count() as f32 * (item_h + 1.0);
         if ui.hovered(list) {
             self.sidebar_scroll += ui.scroll;
         }
         self.sidebar_scroll = self.sidebar_scroll.clamp(0.0, (content_h - list.h).max(0.0));
         if content_h == 0.0 {
-            let empty = if project.is_some() { "No sessions in this project yet" } else { "No sessions yet" };
-            p.label(empty, theme::SMALL, 18.0, list.y + 6.0, t.text_faint);
+            p.label("No sessions yet", theme::SMALL, 18.0, list.y + 6.0, t.text_faint);
         }
 
         let clip = p.push_clip(list);
@@ -134,37 +125,7 @@ impl Chat {
         p.rect(Rect::new(0.0, area.h - 47.0, area.w - 1.0, 1.0), t.border, 0.0);
         let settings = Rect::new(8.0, area.h - 39.0, area.w - 16.0, 30.0);
         if list_row(p, ui, settings, id("settings"), "Settings", Some(&format!("{PRIMARY_KEY}+,")), !on_chat) {
-            self.toggle_settings();
-        }
-    }
-
-    /// The current project (or "No project") with a menu to switch.
-    fn draw_project_switcher(&mut self, p: &mut Painter, ui: &mut Ui, rect: Rect) {
-        let t = p.theme;
-        self.project_button = rect;
-        let open = self.menu == Some(Menu::Project);
-        let hovered = ui.hovered(rect);
-        let hover = ui.anim(id("project-switcher"), f32::from(u8::from(hovered || open)));
-        p.bordered(rect, mix(t.surface, t.hover, hover), theme::RADIUS, 1.0, t.border);
-        folder_icon(p, rect.x + 11.0, rect.y + (rect.h - 10.0) * 0.5, if self.project.is_some() { t.text_muted } else { t.text_faint });
-        let name = self
-            .project
-            .as_deref()
-            .map(|path| self.projects.iter().find(|p| p.path == path).map_or_else(|| super::display_path(path), |p| p.name.clone()));
-        let (label, color) = match &name {
-            Some(name) => (name.as_str(), t.text),
-            None => ("No project", t.text_muted),
-        };
-        let mut layout = p.layout(label, theme::LABEL, None);
-        layout.truncate(p.fonts, rect.w - 56.0);
-        p.text(&layout, rect.x + 30.0, rect.y + (rect.h - layout.height()) * 0.5, color);
-        chevron(p, rect.right() - 20.0, rect.y + rect.h * 0.5 - 2.0, true, t.text_faint);
-        if hovered {
-            ui.cursor = CursorIcon::Pointer;
-            if ui.clicked(rect) {
-                self.menu = if open { None } else { Some(Menu::Project) };
-                self.menu_scroll = 0.0;
-            }
+            self.toggle_settings(actions);
         }
     }
 }

@@ -35,7 +35,7 @@ impl Project {
 }
 
 /// The project list and where it is stored.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Projects {
     path: PathBuf,
     /// Projects, most recently used first.

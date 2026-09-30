@@ -4,10 +4,12 @@
 use serechat::ToolStatus;
 use winit::window::CursorIcon;
 
-use super::composer::file_badge;
-use super::{Chat, Decision, Entry, Load, PRIMARY_KEY, SelPos, model_name, usage_caption};
+use super::composer::{file_badge, file_icon};
+use super::agent::MAX_RETRIES;
+use super::{Chat, Decision, Entry, Load, PRIMARY_KEY, ReasoningView, SelPos, StreamingCall, format_cost, model_name, usage_caption};
 use crate::app::Action;
 use crate::doc::{Doc, INK_MUTED, INK_TEXT};
+use crate::image::{self, Lookup};
 use crate::paint::{Painter, Rect, fade, mix};
 use crate::text::{Align, Style, TextLayout};
 use crate::theme;
@@ -28,8 +30,14 @@ const TOOL_ROW: f32 = 34.0;
 const TOOL_BODY_MAX: f32 = 260.0;
 /// Height of the approval buttons row.
 const APPROVAL_ROW: f32 = 44.0;
+/// Height of the retry status or Continue button under the messages.
+const FOOTER_H: f32 = 44.0;
 /// Height of a row of attachment chips under a prompt.
 const CHIPS_ROW: f32 = 36.0;
+/// Size of an image attachment's thumbnail tile.
+const IMAGE_TILE: (f32, f32) = (160.0, 120.0);
+/// Lines of a tool call's content shown while the model writes it.
+const STREAM_LINES: usize = 14;
 /// Style of tool output.
 const TOOL_STYLE: Style = Style { line_height: 1.5, ..Style::mono(12.0) };
 
@@ -42,10 +50,28 @@ struct Target {
 }
 
 impl Entry {
+    /// Waiting for the first words of a live reply.
+    fn thinking(&self, live: bool) -> bool {
+        live && self.message.content.is_empty() && self.message.tool_calls.is_empty() && self.streaming_calls.is_empty()
+    }
+
+    /// Whether the reasoning header row is drawn: while a live reply
+    /// thinks, and above a finished reply that reasoned.
+    fn reasoning_row(&self, live: bool, view: ReasoningView) -> bool {
+        view != ReasoningView::Hidden && (self.thinking(live) || !self.message.reasoning.is_empty())
+    }
+
     /// Rebuilds stale documents and returns the entry's height at `width`.
-    fn measure(&mut self, p: &Painter, width: f32, live: bool) -> f32 {
+    fn measure(&mut self, p: &Painter, width: f32, live: bool, view: ReasoningView) -> f32 {
         let boxed = self.boxed();
-        let wrap = if boxed { width - 2.0 * BOX_PAD.0 } else { width };
+        let summary = self.message.compaction && !boxed;
+        let wrap = if boxed {
+            width - 2.0 * BOX_PAD.0
+        } else if summary {
+            width - 14.0
+        } else {
+            width
+        };
         let key = (self.message.content.len(), boxed);
         if self.doc.as_ref().is_none_or(|d| !d.fits(wrap, p.scale)) || self.doc_key != key {
             let previous = self.doc.take();
@@ -58,15 +84,20 @@ impl Entry {
         }
         let doc_h = self.doc.as_ref().map_or(0.0, |d| d.height);
         if boxed {
-            let chips = if self.message.attachments.is_empty() { 0.0 } else { CHIPS_ROW * chip_rows(p, &self.message.attachments, wrap) as f32 };
+            let chips = attachment_layout(p, &self.message.attachments, wrap).1;
             let text = if self.message.content.is_empty() { 0.0 } else { doc_h };
             return text + chips + 2.0 * BOX_PAD.1 - if text == 0.0 && chips > 0.0 { 6.0 } else { 0.0 };
         }
+        if summary {
+            let open = !live && self.reasoning_open == Some(true);
+            return REASONING_ROW + if open { doc_h + 12.0 } else { 0.0 };
+        }
 
         let mut height = 0.0;
-        if !self.message.reasoning.is_empty() {
+        let thinking = self.thinking(live);
+        if self.reasoning_row(live, view) {
             height += REASONING_ROW;
-            if self.show_reasoning {
+            if self.reasoning_shown(view) {
                 let rwrap = width - 14.0;
                 if self.reasoning_doc.as_ref().is_none_or(|d| !d.fits(rwrap, p.scale)) || self.reasoning_len != self.message.reasoning.len() {
                     let previous = self.reasoning_doc.take();
@@ -75,16 +106,25 @@ impl Entry {
                 }
                 height += self.reasoning_doc.as_ref().map_or(0.0, |d| d.height) + 12.0;
             }
+        } else if thinking {
+            // The bare "thinking" dots.
+            height += 18.0;
         }
-        let thinking = live && self.message.content.is_empty() && self.message.tool_calls.is_empty();
-        height += if thinking { 18.0 } else { doc_h };
+        if !thinking {
+            height += doc_h;
+        }
         self.tool_bodies.resize_with(self.message.tool_calls.len(), || None);
         for index in 0..self.message.tool_calls.len() {
             height += 8.0 + self.tool_height(p, index, width);
         }
+        if live {
+            for call in &mut self.streaming_calls {
+                height += 8.0 + call.measure(p, width);
+            }
+        }
         if !live {
             height += META_H;
-        } else if !self.message.tool_calls.is_empty() {
+        } else if !self.message.tool_calls.is_empty() || !self.streaming_calls.is_empty() {
             height += 6.0;
         }
         height
@@ -94,6 +134,9 @@ impl Entry {
     /// for approval, the output once expanded.
     fn tool_body(&self, index: usize) -> Option<String> {
         let record = &self.message.tool_calls[index];
+        if shows_plan(record) {
+            return tools::plan_text(&record.call);
+        }
         let text = match record.status {
             ToolStatus::Pending if tools::needs_approval(&record.call.name) => tools::view(&record.call).preview?,
             ToolStatus::Done | ToolStatus::Failed | ToolStatus::Denied if self.open_tools.contains(&index) => record.output.clone(),
@@ -131,19 +174,51 @@ impl Entry {
     }
 }
 
-/// How many rows of chips `attachments` need at `width`.
-fn chip_rows(p: &Painter, attachments: &[serechat::Attachment], width: f32) -> usize {
-    let mut rows = 1;
-    let mut x = 0.0;
-    for attachment in attachments {
-        let chip_w = p.layout(&attachment.name, theme::SMALL, None).width().min(170.0) + 60.0;
-        if x > 0.0 && x + chip_w > width {
-            rows += 1;
-            x = 0.0;
+impl StreamingCall {
+    /// Refreshes the card for the arguments so far and returns its height.
+    /// The body shows the end of what is being written.
+    fn measure(&mut self, p: &Painter, width: f32) -> f32 {
+        if self.shown.as_ref().is_none_or(|(len, ..)| *len != self.arguments.len()) {
+            let view = tools::view_partial(&self.name, &self.arguments);
+            let body = view.preview.as_deref().filter(|text| !text.is_empty()).map(|text| {
+                let lines: Vec<&str> = text.lines().collect();
+                let tail = lines[lines.len().saturating_sub(STREAM_LINES)..].join("\n");
+                TextLayout::new(p.fonts, &tail, TOOL_STYLE, Some(width - 24.0), p.scale)
+            });
+            self.shown = Some((self.arguments.len(), view, body));
         }
-        x += chip_w + 6.0;
+        let body = self.shown.as_ref().and_then(|(_, _, body)| body.as_ref());
+        TOOL_ROW + body.map_or(0.0, |b| b.height().min(TOOL_BODY_MAX) + 14.0)
     }
-    rows
+}
+
+/// Where each of a prompt's attachments goes, relative to the attachment
+/// area: images with thumbnails as tiles first, then the other files as
+/// chips, each group wrapping to `width`. Also returns the total height.
+fn attachment_layout(p: &Painter, attachments: &[serechat::Attachment], width: f32) -> (Vec<Rect>, f32) {
+    let mut rects = vec![Rect::default(); attachments.len()];
+    let (mut x, mut y, mut row_h) = (0.0, 0.0, 0.0f32);
+    for tiles in [true, false] {
+        for (index, attachment) in attachments.iter().enumerate() {
+            if image::supported(&attachment.mime) != tiles {
+                continue;
+            }
+            let (item_w, item_h) = if tiles { IMAGE_TILE } else { (p.layout(&attachment.name, theme::SMALL, None).width().min(170.0) + 60.0, CHIPS_ROW) };
+            if x > 0.0 && x + item_w > width {
+                (x, y, row_h) = (0.0, y + row_h, 0.0);
+            }
+            rects[index] = Rect::new(x, y, item_w, item_h);
+            x += item_w + 6.0;
+            row_h = row_h.max(item_h + if tiles { 6.0 } else { 0.0 });
+        }
+        // Chips start on a row of their own.
+        if x > 0.0 {
+            (x, y, row_h) = (0.0, y + row_h, 0.0);
+        }
+    }
+    // Tile rows carry a gap below them; the last one doesn't need it.
+    let only_tiles = !attachments.is_empty() && attachments.iter().all(|a| image::supported(&a.mime));
+    (rects, if only_tiles { y - 6.0 } else { y })
 }
 
 impl Chat {
@@ -157,6 +232,7 @@ impl Chat {
         }
         let selection = self.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
         let current = self.current;
+        let reasoning_view = self.reasoning_view;
         let models = &self.models;
         let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == current) else { return };
 
@@ -174,13 +250,24 @@ impl Chat {
             }
             Load::Loaded => {}
         }
-        let streaming = conversation.stream.is_some();
-        let last = conversation.entries.len() - 1;
+        let live_entry = conversation.stream.as_ref().map(|s| s.entry);
+        let started = conversation.stream.as_ref().map(|s| s.started);
+        // Under the messages: a retry in progress, or the Continue button.
+        let retry = conversation.retry.as_ref().map(|r| format!("Retrying ({} of {MAX_RETRIES}): {}", r.attempt, r.error));
+        let resumable = conversation.resumable();
+        let busy = conversation.busy();
+        // What the latest run of tool rounds has done and cost.
+        let run = match conversation.run_stats() {
+            (0, _) => None,
+            (1, cost) => Some(format!("1 tool round  ·  {}", format_cost(cost))),
+            (steps, cost) => Some(format!("{steps} tool rounds  ·  {}", format_cost(cost))),
+        };
+        let footer_h = if retry.is_some() || resumable || run.is_some() { FOOTER_H } else { 0.0 };
 
         // Measure everything (layouts are cached) to know the scroll range.
-        let mut content_h = 24.0;
-        for (index, entry) in conversation.entries.iter_mut().enumerate() {
-            content_h += entry.measure(p, width, streaming && index == last) + MESSAGE_GAP;
+        let mut content_h = 24.0 + footer_h;
+        for entry in &mut conversation.entries {
+            content_h += entry.measure(p, width, live_entry == Some(entry.id), reasoning_view) + MESSAGE_GAP;
         }
         let max_scroll = (content_h - view.h).max(0.0);
 
@@ -195,6 +282,27 @@ impl Chat {
                 self.scroll_target = (self.scroll_target + over.clamp(-40.0, 40.0) * 0.5).clamp(0.0, max_scroll);
                 self.stick_to_bottom = false;
                 ui.animating = true;
+            }
+        }
+        // Scrollbar: drag the thumb, or press the track to jump there.
+        let thumb_h = (view.h * view.h / content_h).max(32.0);
+        let travel = (view.h - thumb_h).max(1.0);
+        let track = Rect::new(view.right() - 12.0, view.y, 12.0, view.h);
+        if max_scroll > 0.0 && ui.pressed && ui.hovered(track) {
+            let thumb_y = view.y + travel * (self.scroll / max_scroll);
+            if !(thumb_y..thumb_y + thumb_h).contains(&ui.mouse.1) {
+                self.scroll = ((ui.mouse.1 - view.y - thumb_h * 0.5) / travel * max_scroll).clamp(0.0, max_scroll);
+            }
+            self.bar_drag = Some(self.scroll);
+        }
+        if let Some(start) = self.bar_drag {
+            if !ui.down {
+                self.bar_drag = None;
+            } else if ui.mouse.1 > f32::MIN {
+                // (`f32::MIN` means the pointer left the window: hold still.)
+                self.scroll =(start + (ui.mouse.1 - ui.press_pos.1) * max_scroll / travel).clamp(0.0, max_scroll);
+                self.scroll_target = self.scroll;
+                self.stick_to_bottom = self.scroll >= max_scroll - 1.0;
             }
         }
         if self.stick_to_bottom {
@@ -215,8 +323,8 @@ impl Chat {
         let mut targets = Vec::new();
         let mut effects = Effects::default();
         for (index, entry) in conversation.entries.iter_mut().enumerate() {
-            let live = streaming && index == last;
-            let height = entry.measure(p, width, live);
+            let live = live_entry == Some(entry.id);
+            let height = entry.measure(p, width, live, reasoning_view);
             let area = Rect::new(x, y, width, height);
             y += height + MESSAGE_GAP;
             if area.bottom() < view.y || area.y > view.bottom() {
@@ -232,7 +340,7 @@ impl Chat {
                 p.bordered(area, fill, theme::RADIUS, 1.0, border);
                 let origin = (area.x + BOX_PAD.0, area.y + BOX_PAD.1);
                 let mut chips_y = origin.1;
-                if let Some(doc) = entry.doc.as_ref().filter(|_| !entry.message.content.is_empty()) {
+                if let Some(doc) = entry.doc.as_mut().filter(|_| !entry.message.content.is_empty()) {
                     if let Some((a, b)) = sel(1, doc) {
                         doc.draw_selection(p, origin, a, b);
                     }
@@ -247,25 +355,41 @@ impl Chat {
             }
 
             let mut top = area.y;
-            if !entry.message.reasoning.is_empty() {
-                let label = p.layout("Reasoning", theme::SMALL, None);
-                let toggle = Rect::new(x - 6.0, top, label.width() + 34.0, 26.0);
-                let hovered = in_view && ui.hovered(toggle);
-                let hover = ui.anim(id(("reasoning", entry.id)), f32::from(u8::from(hovered)));
-                p.rect(toggle, fade(t.hover, hover), theme::RADIUS_SM);
-                let color = mix(t.text_muted, t.text, hover);
-                let (cx, cy) = if entry.show_reasoning { (toggle.x + 8.0, toggle.y + 11.0) } else { (toggle.x + 10.0, toggle.y + 9.5) };
-                chevron(p, cx, cy, entry.show_reasoning, color);
-                p.text(&label, toggle.x + 24.0, toggle.y + (26.0 - label.height()) * 0.5, color);
-                if hovered {
-                    ui.cursor = CursorIcon::Pointer;
-                    if ui.clicked(toggle) {
-                        entry.show_reasoning = !entry.show_reasoning;
-                        ui.animating = true;
+            if entry.message.compaction {
+                // A summary replaced the messages above for the model; it
+                // opens like a reasoning block.
+                let open = !live && entry.reasoning_open == Some(true);
+                let label = if live { "Summarising the conversation to free up context" } else { "Summarised the messages above to free up context" };
+                let row = Toggle { label, expandable: !live, open, pulse: live, key: id(("summary", entry.id)) };
+                if toggle_row(p, ui, (x, top), &row, in_view) {
+                    entry.reasoning_open = Some(!open);
+                    ui.animating = true;
+                }
+                if let Some(doc) = entry.doc.as_mut().filter(|_| open) {
+                    let origin = (x + 14.0, top + REASONING_ROW);
+                    p.rect(Rect::new(x, origin.1, 2.0, doc.height), t.border_strong, 1.0);
+                    if let Some((a, b)) = sel(1, doc) {
+                        doc.draw_selection(p, origin, a, b);
                     }
+                    let event = doc.draw(p, ui, origin, t.text_muted, in_view, None);
+                    effects.link = effects.link.take().or(event.open_link);
+                    targets.push(Target { entry: index, doc: 1, origin, rect: Rect::new(origin.0, origin.1, width - 14.0, doc.height) });
+                }
+                continue;
+            }
+            let thinking = entry.thinking(live);
+            if entry.reasoning_row(live, reasoning_view) {
+                // "Thinking for 4s" while it thinks, "Thought for 12s" after.
+                let open = entry.reasoning_shown(reasoning_view);
+                let ms = if thinking { started.map_or(0, |s| u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX)) } else { entry.message.reasoning_ms };
+                let label = reasoning_label(thinking, ms);
+                let row = Toggle { label: &label, expandable: !entry.message.reasoning.is_empty(), open, pulse: thinking, key: id(("reasoning", entry.id)) };
+                if toggle_row(p, ui, (x, top), &row, in_view) {
+                    entry.reasoning_open = Some(!open);
+                    ui.animating = true;
                 }
                 top += REASONING_ROW;
-                if let Some(doc) = entry.reasoning_doc.as_ref().filter(|_| entry.show_reasoning) {
+                if let Some(doc) = entry.reasoning_doc.as_mut().filter(|_| open) {
                     let origin = (x + 14.0, top);
                     p.rect(Rect::new(x, top, 2.0, doc.height), t.border_strong, 1.0);
                     if let Some((a, b)) = sel(0, doc) {
@@ -278,8 +402,11 @@ impl Chat {
                 }
             }
 
-            if live && entry.message.content.is_empty() && entry.message.tool_calls.is_empty() {
-                // "Thinking" dots.
+            if thinking {
+                if reasoning_view != ReasoningView::Hidden {
+                    continue;
+                }
+                // Bare "thinking" dots when reasoning is hidden.
                 for dot in 0..3 {
                     let phase = (ui.time * 5.0 - dot as f32 * 0.7).sin() * 0.5 + 0.5;
                     let dot_rect = Rect::new(x + dot as f32 * 11.0, top + 9.0 - phase * 3.0, 6.0, 6.0);
@@ -288,7 +415,7 @@ impl Chat {
                 ui.animating = true;
                 continue;
             }
-            if let Some(doc) = &entry.doc {
+            if let Some(doc) = &mut entry.doc {
                 let origin = (x, top);
                 if let Some((a, b)) = sel(1, doc) {
                     doc.draw_selection(p, origin, a, b);
@@ -314,6 +441,14 @@ impl Chat {
                 }
                 top += card_h;
             }
+            if live {
+                for call in &mut entry.streaming_calls {
+                    top += 8.0;
+                    let card_h = call.measure(p, width);
+                    draw_streaming_card(p, ui, call, Rect::new(x, top, width, card_h));
+                    top += card_h;
+                }
+            }
 
             if live {
                 continue;
@@ -333,6 +468,31 @@ impl Chat {
                 }
             }
         }
+        if let Some(status) = &retry {
+            // A slow pulse: the run is waiting, not stuck.
+            let pulse = (ui.time * 2.6).sin() * 0.5 + 0.5;
+            p.rect(Rect::new(x, y + 12.0, 6.0, 6.0), fade(t.accent, 0.4 + 0.6 * pulse), 3.0);
+            let mut text = p.layout(status, theme::SMALL, None);
+            text.truncate(p.fonts, width - 16.0);
+            p.text(&text, x + 16.0, y + 15.0 - text.height() * 0.5, t.text_muted);
+            ui.animating = true;
+        } else if resumable {
+            let enabled = in_view || !ui.hovered(Rect::new(x, y, 96.0, 30.0));
+            if button(p, ui, Rect::new(x, y, 96.0, 30.0), "Continue", ButtonStyle::Primary, enabled) {
+                effects.resume = true;
+            }
+            let hint = match &run {
+                Some(stats) => format!("The run stopped before it finished  ·  {stats}"),
+                None => "The run stopped before it finished.".to_owned(),
+            };
+            let mut hint = p.layout(&hint, theme::SMALL, None);
+            hint.truncate(p.fonts, width - 110.0);
+            p.text(&hint, x + 110.0, y + (30.0 - hint.height()) * 0.5, t.text_faint);
+        } else if let Some(stats) = &run {
+            let text = if live_entry.is_some() || busy { format!("Working  ·  {stats} so far") } else { format!("Done  ·  {stats}") };
+            let text = p.layout(&text, theme::SMALL, None);
+            p.text(&text, x, y + (30.0 - text.height()) * 0.5, t.text_faint);
+        }
         p.set_clip(clip);
 
         // Selection: press to start, drag to extend, double/triple click for
@@ -348,7 +508,7 @@ impl Chat {
             Some((target.entry, target.doc, piece, byte))
         };
         let on_text = targets.iter().any(|t| t.rect.contains(ui.mouse));
-        if ui.pressed && in_view && ui.cursor != CursorIcon::Pointer {
+        if ui.pressed && in_view && ui.cursor != CursorIcon::Pointer && self.bar_drag.is_none() {
             match hit(ui.mouse) {
                 Some(pos) if on_text || ui.mods.shift_key() => {
                     let entry = &conversation.entries[pos.0];
@@ -396,15 +556,33 @@ impl Chat {
         if let Some((entry, tool, decision)) = effects.decision {
             self.decide(entry, tool, decision, actions);
         }
+        if effects.resume {
+            self.resume(current, actions);
+        }
 
-        // Scrollbar.
         if max_scroll > 0.0 {
-            let thumb_h = (view.h * view.h / content_h).max(32.0);
-            let thumb_y = view.y + (view.h - thumb_h) * (self.scroll / max_scroll);
-            let track = Rect::new(view.right() - 12.0, view.y, 12.0, view.h);
-            let hover = ui.anim(id("scrollbar"), f32::from(u8::from(ui.hovered(track))));
+            let thumb_y = view.y + travel * (self.scroll / max_scroll);
+            let active = self.bar_drag.is_some() || ui.hovered(track);
+            if self.bar_drag.is_some() {
+                ui.cursor = CursorIcon::Default;
+            }
+            let hover = ui.anim(id("scrollbar"), f32::from(u8::from(active)));
             p.rect(Rect::new(view.right() - 9.0, thumb_y, 6.0, thumb_h), fade(t.text, 0.1 + 0.1 * hover), 3.0);
         }
+    }
+}
+
+/// The reasoning header: `Thinking` (then `Thinking for 4s`) while a reply
+/// thinks, `Thought for 12s` once it answered, or `Reasoning` when the time
+/// is unknown (replies saved by older versions).
+fn reasoning_label(thinking: bool, ms: u64) -> String {
+    let secs = (ms + 500) / 1000;
+    let time = if secs < 60 { format!("{}s", secs.max(1)) } else { format!("{}m {}s", secs / 60, secs % 60) };
+    match (thinking, ms) {
+        (true, 0..1000) => "Thinking".to_owned(),
+        (true, _) => format!("Thinking for {time}"),
+        (false, 0) => "Reasoning".to_owned(),
+        (false, _) => format!("Thought for {time}"),
     }
 }
 
@@ -416,6 +594,53 @@ struct Effects {
     link: Option<String>,
     open_path: Option<String>,
     decision: Option<(usize, usize, Decision)>,
+    /// The Continue button was clicked.
+    resume: bool,
+}
+
+/// A row that opens and closes a block, like "Thought for 12s".
+struct Toggle<'a> {
+    label: &'a str,
+    /// Has something to open; otherwise a dot replaces the chevron.
+    expandable: bool,
+    open: bool,
+    /// Breathes while waiting for the model.
+    pulse: bool,
+    /// Animation key.
+    key: u64,
+}
+
+/// Draws `row` at `origin`; returns whether it was clicked.
+fn toggle_row(p: &mut Painter, ui: &mut Ui, origin: (f32, f32), row: &Toggle<'_>, interactive: bool) -> bool {
+    let t = p.theme;
+    let label = p.layout(row.label, theme::SMALL, None);
+    let toggle = Rect::new(origin.0 - 6.0, origin.1, label.width() + 34.0, 26.0);
+    let hovered = interactive && row.expandable && ui.hovered(toggle);
+    let hover = ui.anim(row.key, f32::from(u8::from(hovered)));
+    p.rect(toggle, fade(t.hover, hover), theme::RADIUS_SM);
+    let color = if row.pulse {
+        ui.animating = true;
+        mix(t.text_faint, t.text, ((ui.time * 2.6).sin() * 0.5 + 0.5) * 0.75)
+    } else {
+        mix(t.text_muted, t.text, hover)
+    };
+    if row.expandable {
+        let (cx, cy) = if row.open { (toggle.x + 8.0, toggle.y + 11.0) } else { (toggle.x + 10.0, toggle.y + 9.5) };
+        chevron(p, cx, cy, row.open, color);
+    } else {
+        p.rect(Rect::new(toggle.x + 9.0, toggle.y + 10.0, 6.0, 6.0), color, 3.0);
+    }
+    p.text(&label, toggle.x + 24.0, toggle.y + (26.0 - label.height()) * 0.5, color);
+    if hovered {
+        ui.cursor = CursorIcon::Pointer;
+        return ui.clicked(toggle);
+    }
+    false
+}
+
+/// An `update_plan` call whose checklist is always shown.
+fn shows_plan(record: &serechat::ToolRecord) -> bool {
+    record.call.name == "update_plan" && record.status != ToolStatus::Failed
 }
 
 /// The part of `doc` (entry `entry`, document `doc_id`) inside the selection.
@@ -429,31 +654,47 @@ fn selected_range(selection: Option<(SelPos, SelPos)>, entry: usize, doc_id: u8,
     (from != to).then_some((from, to))
 }
 
-/// Draws a prompt's attachment chips; returns a file the user clicked.
+/// Draws a prompt's image tiles and file chips; returns a file the user clicked.
 fn draw_attachment_chips(p: &mut Painter, ui: &mut Ui, attachments: &[serechat::Attachment], origin: (f32, f32), width: f32, interactive: bool) -> Option<String> {
     let t = p.theme;
     let mut clicked = None;
-    let (mut x, mut y) = (0.0, 0.0);
-    for attachment in attachments {
-        let mut name = p.layout(&attachment.name, theme::SMALL, None);
-        name.truncate(p.fonts, 170.0);
-        let chip_w = name.width() + 60.0;
-        if x > 0.0 && x + chip_w > width {
-            x = 0.0;
-            y += CHIPS_ROW;
+    let (rects, _) = attachment_layout(p, attachments, width);
+    for (attachment, rect) in attachments.iter().zip(rects) {
+        let tile = image::supported(&attachment.mime);
+        let rect = if tile {
+            Rect::new(origin.0 + rect.x, origin.1 + rect.y, rect.w, rect.h)
+        } else {
+            Rect::new(origin.0 + rect.x, origin.1 + rect.y + 2.0, rect.w, CHIPS_ROW - 8.0)
+        };
+        let hovered = interactive && ui.hovered(rect);
+        if tile {
+            match p.image(&attachment.path, rect, theme::RADIUS) {
+                Lookup::Ready(_) => {}
+                // A quiet placeholder; loading takes a moment at most.
+                Lookup::Loading => p.rect(rect, t.hover, theme::RADIUS),
+                Lookup::Failed => {
+                    p.rect(rect, t.hover, theme::RADIUS);
+                    let mut name = p.layout(&attachment.name, theme::TINY, None);
+                    name.truncate(p.fonts, rect.w - 16.0);
+                    file_badge(p, &attachment.mime, &attachment.name, Rect::new(rect.x + (rect.w - 34.0) * 0.5, rect.y + rect.h * 0.5 - 22.0, 34.0, 20.0));
+                    p.text(&name, rect.x + (rect.w - name.width()) * 0.5, rect.y + rect.h * 0.5 + 6.0, t.text_muted);
+                }
+            }
+            // Hairline frame, brighter on hover.
+            p.bordered(rect, [0.0; 4], theme::RADIUS, 1.0, if hovered { t.border_focus } else { t.border });
+        } else {
+            let mut name = p.layout(&attachment.name, theme::SMALL, None);
+            name.truncate(p.fonts, 170.0);
+            p.bordered(rect, if hovered { t.hover } else { t.bg }, theme::RADIUS_SM, 1.0, t.border_strong);
+            file_icon(p, attachment, Rect::new(rect.x + 4.0, rect.y + 4.0, 34.0, rect.h - 8.0));
+            p.text(&name, rect.x + 46.0, rect.y + (rect.h - name.height()) * 0.5, t.text);
         }
-        let chip = Rect::new(origin.0 + x, origin.1 + y + 2.0, chip_w, CHIPS_ROW - 8.0);
-        let hovered = interactive && ui.hovered(chip);
-        p.bordered(chip, if hovered { t.hover } else { t.bg }, theme::RADIUS_SM, 1.0, t.border_strong);
-        file_badge(p, &attachment.mime, &attachment.name, Rect::new(chip.x + 4.0, chip.y + 4.0, 34.0, chip.h - 8.0));
-        p.text(&name, chip.x + 46.0, chip.y + (chip.h - name.height()) * 0.5, t.text);
         if hovered {
             ui.cursor = CursorIcon::Pointer;
-            if ui.clicked(chip) {
+            if ui.clicked(rect) {
                 clicked = Some(attachment.path.clone());
             }
         }
-        x += chip_w + 6.0;
     }
     clicked
 }
@@ -473,23 +714,14 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
     let icon = Rect::new(header.x + 10.0, header.y + (TOOL_ROW - 16.0) * 0.5, 16.0, 16.0);
     match status {
         ToolStatus::Pending if approval => p.rect(Rect::new(icon.x + 4.0, icon.y + 4.0, 8.0, 8.0), t.accent, 4.0),
-        ToolStatus::Pending | ToolStatus::Running => {
-            // A small spinner: eight dots fading around a circle.
-            for i in 0..8 {
-                let a = i as f32 / 8.0 * std::f32::consts::TAU;
-                let phase = (1.0 - (ui.time * 1.4 - i as f32 / 8.0).rem_euclid(1.0)).powi(2);
-                let (cx, cy) = (icon.x + 8.0 + a.cos() * 5.5, icon.y + 8.0 + a.sin() * 5.5);
-                p.rect(Rect::new(cx - 1.25, cy - 1.25, 2.5, 2.5), fade(t.text_muted, 0.25 + 0.75 * phase), 1.25);
-            }
-            ui.animating = true;
-        }
+        ToolStatus::Pending | ToolStatus::Running => spinner(p, ui, icon),
         ToolStatus::Done => p.label_centered("✓", Style::semibold(12.5), icon, t.syntax[1]),
         ToolStatus::Failed => p.label_centered("×", Style::semibold(14.0), icon, t.danger),
         ToolStatus::Denied => p.rect(Rect::new(icon.x + 4.0, icon.y + 7.5, 8.0, 1.5), t.text_faint, 0.5),
     }
     let verb = p.layout(view.verb, theme::LABEL, None);
     p.text(&verb, header.x + 34.0, header.y + (TOOL_ROW - verb.height()) * 0.5, t.text);
-    let expandable = status.is_finished() && !record.output.is_empty();
+    let expandable = status.is_finished() && !record.output.is_empty() && !shows_plan(record);
     let right = if approval {
         let waiting = p.layout("Needs approval", theme::TINY, None);
         p.text(&waiting, header.right() - 12.0 - waiting.width(), header.y + (TOOL_ROW - waiting.height()) * 0.5, t.accent);
@@ -545,6 +777,41 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
     None
 }
 
+/// A small spinner in the 16×16 `icon`: eight dots fading around a circle.
+fn spinner(p: &mut Painter, ui: &mut Ui, icon: Rect) {
+    let t = p.theme;
+    for i in 0..8 {
+        let a = i as f32 / 8.0 * std::f32::consts::TAU;
+        let phase = (1.0 - (ui.time * 1.4 - i as f32 / 8.0).rem_euclid(1.0)).powi(2);
+        let (cx, cy) = (icon.x + 8.0 + a.cos() * 5.5, icon.y + 8.0 + a.sin() * 5.5);
+        p.rect(Rect::new(cx - 1.25, cy - 1.25, 2.5, 2.5), fade(t.text_muted, 0.25 + 0.75 * phase), 1.25);
+    }
+    ui.animating = true;
+}
+
+/// A tool call the model is still writing: what it will do, and the end of
+/// its content so far.
+fn draw_streaming_card(p: &mut Painter, ui: &mut Ui, call: &StreamingCall, rect: Rect) {
+    let t = p.theme;
+    let Some((_, view, body)) = &call.shown else { return };
+    p.bordered(rect, t.code_bg, theme::RADIUS, 1.0, t.border);
+    spinner(p, ui, Rect::new(rect.x + 10.0, rect.y + (TOOL_ROW - 16.0) * 0.5, 16.0, 16.0));
+    let verb = p.layout(view.verb, theme::LABEL, None);
+    p.text(&verb, rect.x + 34.0, rect.y + (TOOL_ROW - verb.height()) * 0.5, t.text);
+    let mut target = p.layout(&view.target.replace('\n', " "), TOOL_STYLE, None);
+    target.truncate(p.fonts, (rect.w - 58.0 - verb.width()).max(20.0));
+    p.text(&target, rect.x + 42.0 + verb.width(), rect.y + (TOOL_ROW - target.height()) * 0.5, t.text_muted);
+    if let Some(body) = body {
+        let y = rect.y + TOOL_ROW;
+        p.rect(Rect::new(rect.x, y, rect.w, 1.0), t.border, 0.0);
+        let body_h = body.height().min(TOOL_BODY_MAX);
+        let clip = p.push_clip(Rect::new(rect.x, y + 7.0, rect.w, body_h));
+        // The newest lines stay in view.
+        p.text(body, rect.x + 12.0, y + 7.0 + body_h - body.height(), t.text_muted);
+        p.set_clip(clip);
+    }
+}
+
 /// The welcome state of an empty conversation.
 fn draw_empty(p: &mut Painter, view: Rect, project: Option<&str>) {
     let t = p.theme;
@@ -577,5 +844,19 @@ fn draw_empty(p: &mut Painter, view: Rect, project: Option<&str>) {
         p.text(&text, cx - width * 0.5, y + (26.0 - text.height()) * 0.5, t.text_muted);
         keycap(p, &keys, cx + width * 0.5, y + 3.0);
         y += 30.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reasoning_label;
+
+    #[test]
+    fn reasoning_labels() {
+        assert_eq!(reasoning_label(true, 400), "Thinking");
+        assert_eq!(reasoning_label(true, 4_200), "Thinking for 4s");
+        assert_eq!(reasoning_label(false, 0), "Reasoning");
+        assert_eq!(reasoning_label(false, 300), "Thought for 1s");
+        assert_eq!(reasoning_label(false, 125_000), "Thought for 2m 5s");
     }
 }

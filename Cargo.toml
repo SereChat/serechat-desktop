@@ -19,6 +19,10 @@ wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl"
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std", "opentype-layout"] }
 bytemuck = "1.25.2"
 arboard = { version = "3.6.1", default-features = false }
+# Attachment thumbnails. Hand-written decoders for hostile input are not worth
+# the risk; these two are fuzzed and pure Rust. zune-jpeg's features are SIMD only.
+png = "0.18.1"
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std", "x86", "neon"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

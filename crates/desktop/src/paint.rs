@@ -1,6 +1,7 @@
 //! Immediate-mode drawing API on top of [`Instance`]s.
 
 use crate::gpu::Instance;
+use crate::image::{ImageAtlas, ImageKey, Lookup};
 use crate::text::{Align, Fonts, GlyphAtlas, Style, TextLayout};
 use crate::theme::Palette;
 
@@ -86,12 +87,14 @@ impl Rect {
 /// Primitive kinds understood by the shader.
 const KIND_SHAPE: f32 = 0.0;
 const KIND_GLYPH: f32 = 1.0;
+const KIND_IMAGE: f32 = 2.0;
 
 /// Records draw calls for one frame.
 pub struct Painter<'a> {
     /// Fonts used for layout.
     pub fonts: &'a Fonts,
     atlas: &'a mut GlyphAtlas,
+    images: &'a mut ImageAtlas,
     out: &'a mut Vec<Instance>,
     /// Physical pixels per logical pixel.
     pub scale: f32,
@@ -104,9 +107,39 @@ pub struct Painter<'a> {
 
 impl<'a> Painter<'a> {
     /// Starts a frame covering `viewport`.
-    pub fn new(fonts: &'a Fonts, atlas: &'a mut GlyphAtlas, out: &'a mut Vec<Instance>, scale: f32, viewport: Rect, theme: &Palette) -> Self {
+    pub fn new(
+        fonts: &'a Fonts,
+        (atlas, images): (&'a mut GlyphAtlas, &'a mut ImageAtlas),
+        out: &'a mut Vec<Instance>,
+        scale: f32,
+        viewport: Rect,
+        theme: &Palette,
+    ) -> Self {
         out.clear();
-        Self { fonts, atlas, out, scale, clip: viewport, theme: *theme, atlas_full: false }
+        atlas.next_frame();
+        images.next_frame();
+        Self { fonts, atlas, images, out, scale, clip: viewport, theme: *theme, atlas_full: false }
+    }
+
+    /// Draws the image file at `path` scaled to cover `rect` (cropping the
+    /// overflow) with rounded corners. Until its thumbnail is decoded, or if
+    /// it cannot be, nothing is drawn and the result says why.
+    pub fn image(&mut self, path: &str, rect: Rect, radius: f32) -> Lookup {
+        // Don't decode what is scrolled out of view.
+        if self.clip.intersect(rect).w <= 0.0 || self.clip.intersect(rect).h <= 0.0 {
+            return Lookup::Loading;
+        }
+        let s = self.scale;
+        let (left, top) = ((rect.x * s).round(), (rect.y * s).round());
+        // The size alone decides the key: scrolling must not re-decode.
+        let (width, height) = ((rect.w * s).round(), (rect.h * s).round());
+        let key = ImageKey { path: path.to_owned(), w: width.max(1.0) as u32, h: height.max(1.0) as u32 };
+        let lookup = self.images.lookup(&key);
+        if let Lookup::Ready(uv) = lookup {
+            // Exactly the thumbnail's pixels, so texels map one to one.
+            self.push(Rect::new(left / s, top / s, width / s, height / s), [1.0; 4], [1.0; 4], [radius, 0.0, 0.0, KIND_IMAGE], uv);
+        }
+        lookup
     }
 
     /// Restricts subsequent drawing to `rect` (intersected with the current
@@ -201,7 +234,7 @@ impl<'a> Painter<'a> {
         let clip = self.clip;
         let out = &mut *self.out;
         let fallback = inks.first().copied().unwrap_or([1.0; 4]);
-        let ok = layout.place(self.fonts, self.atlas, origin, align, (clip.y, clip.bottom()), |g| {
+        let ok = layout.place(self.fonts, self.atlas, origin, align, [clip.x, clip.y, clip.right(), clip.bottom()], |g| {
             let ink = inks.get(usize::from(g.ink)).copied().unwrap_or(fallback);
             // Emoji layers keep their own colours but follow the text's fade.
             let color = g.color.map_or(ink, |c| [c[0], c[1], c[2], c[3] * ink[3]]);

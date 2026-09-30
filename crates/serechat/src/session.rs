@@ -44,6 +44,9 @@ pub struct Session {
     pub project: Option<String>,
     /// Every turn, oldest first.
     pub messages: Vec<StoredMessage>,
+    /// Tools the user allowed to run without asking in this session.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
 }
 
 impl Session {
@@ -106,6 +109,10 @@ pub struct StoredMessage {
     /// The model's reasoning, for replies from thinking models.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reasoning: String,
+    /// How long the model reasoned before answering, in milliseconds
+    /// (0 when unknown or it did not reason).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub reasoning_ms: u64,
     /// Model that wrote a reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -124,6 +131,11 @@ pub struct StoredMessage {
     /// Tools a reply asked to run, with their results.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolRecord>,
+    /// A summary that replaces every earlier message when talking to the
+    /// model, written when the conversation outgrew the context window.
+    /// The earlier messages stay in the session for the user.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub compaction: bool,
 }
 
 impl StoredMessage {
@@ -134,12 +146,14 @@ impl StoredMessage {
             role,
             content,
             reasoning: String::new(),
+            reasoning_ms: 0,
             model: None,
             usage: Usage::default(),
             cost: 0.0,
             failed: false,
             attachments: Vec::new(),
             tool_calls: Vec::new(),
+            compaction: false,
         }
     }
 }
@@ -507,7 +521,7 @@ mod tests {
 
     fn session(id: &str, updated: u64, cost: f64) -> Session {
         let mut reply = StoredMessage::new(Role::Assistant, "hello".into());
-        reply.usage = Usage { input_tokens: 10, output_tokens: 5 };
+        reply.usage = Usage::new(10, 5);
         reply.cost = cost;
         Session {
             id: id.into(),

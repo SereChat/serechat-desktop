@@ -3,10 +3,11 @@
 //! Importing copies the file into `~/.serechat/attachments/` so a session
 //! stays complete when the original moves. Images are sent as images, PDFs
 //! as documents, and anything that reads as UTF-8 text is inlined into the
-//! prompt, which every model understands.
+//! prompt, which every model understands. PNG and JPEG images show as
+//! thumbnails (`image.rs`).
 //!
-//! ponytail: no thumbnails; images show as chips until an image decoder is
-//! worth a dependency.
+//! ponytail: GIF and WebP images show as chips; add their decoders if they
+//! turn out to be common attachments.
 
 use std::fs;
 use std::io::Read;

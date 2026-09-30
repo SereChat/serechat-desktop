@@ -6,6 +6,7 @@ use winit::window::CursorIcon;
 use super::{Chat, Menu, model_name};
 use crate::app::Action;
 use crate::attachments::human_size;
+use crate::image::{self, Lookup};
 use crate::paint::{Painter, Rect, fade, mix};
 use crate::text::{Style, TextLayout};
 use crate::theme;
@@ -143,7 +144,7 @@ impl Chat {
         }
         let name = model_name(&self.models, &self.model).to_owned();
         let model = self.toolbar_button(p, ui, attach.right() + 4.0, item_y, &name, Menu::Model);
-        let reasoning = format!("Reasoning: {}", self.reasoning.label());
+        let reasoning = format!("Reasoning: {}", self.reasoning_in_use().label());
         let reasoning = self.toolbar_button(p, ui, model.right() + 4.0, item_y, &reasoning, Menu::Reasoning);
 
         let busy = self.current().busy();
@@ -216,7 +217,7 @@ impl Chat {
                 continue;
             };
             let attachment = &self.pending[index];
-            file_badge(p, &attachment.mime, &attachment.name, Rect::new(chip.x + 5.0, chip.y + 5.0, 34.0, 20.0));
+            file_icon(p, attachment, Rect::new(chip.x + 5.0, chip.y + 5.0, 34.0, 20.0));
             p.text(name, chip.x + 45.0, chip.y + (CHIP_H - name.height()) * 0.5, t.text);
             let size = p.layout(&human_size(attachment.size), theme::TINY, None);
             p.text(&size, chip.x + 51.0 + name.width(), chip.y + (CHIP_H - size.height()) * 0.5, t.text_faint);
@@ -281,6 +282,13 @@ impl Chat {
             }
         }
         rect
+    }
+}
+
+/// An image's thumbnail, or [`file_badge`] while it loads and for other files.
+pub(super) fn file_icon(p: &mut Painter, attachment: &serechat::Attachment, rect: Rect) {
+    if !(image::supported(&attachment.mime) && matches!(p.image(&attachment.path, rect, 3.0), Lookup::Ready(_))) {
+        file_badge(p, &attachment.mime, &attachment.name, rect);
     }
 }
 
