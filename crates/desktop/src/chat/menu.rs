@@ -1,5 +1,6 @@
-//! Drop-down menus: model and reasoning (above the composer toolbar) and
-//! project (below the header's folder chip).
+//! Drop-down menus: model and reasoning (above the composer toolbar),
+//! slash commands (above the composer) and project (below the header's
+//! folder chip).
 
 use winit::window::CursorIcon;
 
@@ -11,9 +12,9 @@ use crate::theme;
 use crate::ui::{Ui, id};
 
 impl Chat {
-    /// Draws the open menu (if any) and applies a choice. `toolbar` holds
-    /// the model and reasoning buttons.
-    pub(super) fn draw_open_menu(&mut self, p: &mut Painter, ui: &mut Ui, toolbar: [Rect; 2], actions: &mut Vec<Action>) {
+    /// Draws the open menu (if any) and applies a choice. `anchors` holds
+    /// the model and reasoning buttons and the composer card.
+    pub(super) fn draw_open_menu(&mut self, p: &mut Painter, ui: &mut Ui, anchors: [Rect; 3], actions: &mut Vec<Action>) {
         let Some(menu) = self.menu else {
             self.menu_rect = None;
             return;
@@ -29,7 +30,7 @@ impl Chat {
                         selected: m.id == self.model,
                     })
                     .collect::<Vec<_>>();
-                (toolbar[0], 360.0, false, ("Model", "Input / output per 1M tokens"), items)
+                (anchors[0], 360.0, false, ("Model", "Input / output per 1M tokens"), items)
             }
             Menu::Reasoning => {
                 let in_use = self.reasoning_in_use();
@@ -37,7 +38,15 @@ impl Chat {
                     .into_iter()
                     .map(|r| MenuItem { label: r.label().to_owned(), detail: r.detail().to_owned(), selected: r == in_use })
                     .collect();
-                (toolbar[1], 280.0, false, ("Reasoning effort", ""), items)
+                (anchors[1], 280.0, false, ("Reasoning effort", ""), items)
+            }
+            Menu::Commands => {
+                let items = self
+                    .commands()
+                    .into_iter()
+                    .map(|c| MenuItem { label: format!("/{}", c.name()), detail: c.detail().to_owned(), selected: false })
+                    .collect();
+                (anchors[2], 320.0, false, ("Commands", "Tab to complete"), items)
             }
             Menu::Project => {
                 let current = self.current().project.clone();
@@ -67,6 +76,11 @@ impl Chat {
                         actions.push(Action::SetReasoning(self.reasoning));
                     }
                 }
+                Menu::Commands => {
+                    if let Some(command) = self.commands().get(index) {
+                        self.run_command(*command, actions);
+                    }
+                }
                 Menu::Project if index == 0 => self.set_project(None, actions),
                 Menu::Project if index > self.projects.len() => actions.push(Action::OpenProject(None)),
                 Menu::Project => {
@@ -84,7 +98,7 @@ impl Chat {
         }
         let inside = self.menu_rect.is_some_and(|r| r.contains(ui.press_pos)) || anchor.contains(ui.press_pos);
         if ui.released && !inside {
-            self.menu = None;
+            self.close_menu();
         }
     }
 
@@ -140,7 +154,9 @@ impl Chat {
                 continue;
             }
             let hovered = ui.hovered(row) && list.contains(ui.mouse);
-            let hover = ui.anim(id(("menu", header.0, i)), f32::from(u8::from(hovered)));
+            // The command Enter would run is highlighted.
+            let picked = self.menu == Some(Menu::Commands) && i == self.command_pick;
+            let hover = ui.anim(id(("menu", header.0, i)), f32::from(u8::from(hovered || picked)));
             p.rect(row, fade(t.hover, hover), theme::RADIUS_SM);
 
             let centre = |layout: &TextLayout| row.y + (row.h - layout.height()) * 0.5;

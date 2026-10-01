@@ -48,6 +48,7 @@ cargo clippy --workspace --all-targets
   Settings lists the skills the open chat can use, and any problems reading them.
 - **Reasoning**: the effort picker offers the levels the selected model supports.
 - **Spotlight** (Ctrl/Cmd+K): one search over commands, projects, sessions, models, themes
+- **Slash commands** in the composer, completed as you type (Tab completes, Enter runs, Esc dismisses): `/clear` deletes the open chat and starts an empty one in the same folder
   and the full text of every saved message.
 - **Emoji and CJK**: colour emoji (Twemoji), and Chinese, Japanese and Korean text through the
   operating system's fonts, with input-method (IME) support for typing them.

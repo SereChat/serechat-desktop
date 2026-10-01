@@ -38,6 +38,7 @@ use crate::tools;
 
 pub use agent::{SendJob, ToolJob, input_items};
 use agent::{ActiveStream, Retry};
+use composer::Command;
 
 /// Model used until the user picks one.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5.5";
@@ -181,6 +182,8 @@ enum Menu {
     Model,
     Reasoning,
     Project,
+    /// Slash commands completing the composer text; open while any match.
+    Commands,
 }
 
 /// One message in a conversation, with its cached layouts.
@@ -424,6 +427,11 @@ pub struct Chat {
     /// Where the open menu was drawn last frame; blocks hover beneath it.
     menu_rect: Option<Rect>,
     menu_scroll: f32,
+    /// The slash command Enter runs, among those matching.
+    command_pick: usize,
+    /// Composer text the command menu was closed for; it stays closed
+    /// until the text changes.
+    command_dismissed: Option<String>,
     /// The header's folder chip, anchoring the project menu.
     project_button: Rect,
     scroll: f32,
@@ -478,6 +486,8 @@ impl Chat {
             menu: None,
             menu_rect: None,
             menu_scroll: 0.0,
+            command_pick: 0,
+            command_dismissed: None,
             project_button: Rect::default(),
             scroll: 0.0,
             scroll_target: 0.0,
@@ -626,6 +636,60 @@ impl Chat {
         if self.current == id {
             self.new_conversation();
         }
+    }
+
+    /// Slash commands the composer text completes to, unless the user
+    /// closed their menu for this text.
+    fn commands(&self) -> Vec<Command> {
+        let text = self.composer.text();
+        if self.page != Page::Chat || self.command_dismissed.as_deref() == Some(text) {
+            return Vec::new();
+        }
+        Command::matching(text)
+    }
+
+    /// Opens the command menu while commands match and closes it otherwise.
+    fn sync_command_menu(&mut self) {
+        let open = !self.commands().is_empty();
+        match self.menu {
+            None if open => {
+                self.menu = Some(Menu::Commands);
+                self.command_pick = 0;
+                self.menu_scroll = 0.0;
+            }
+            Some(Menu::Commands) if !open => self.menu = None,
+            _ => {}
+        }
+    }
+
+    /// Closes the open menu; the command menu stays closed for this text.
+    fn close_menu(&mut self) {
+        if self.menu == Some(Menu::Commands) {
+            self.command_dismissed = Some(self.composer.text().to_owned());
+        }
+        self.menu = None;
+    }
+
+    /// Runs a slash command, taking it out of the composer.
+    fn run_command(&mut self, command: Command, actions: &mut Vec<Action>) {
+        self.composer.take();
+        self.command_dismissed = None;
+        self.menu = None;
+        match command {
+            Command::Clear => self.clear(actions),
+        }
+    }
+
+    /// Deletes the open chat (stopping anything it runs) and opens an empty
+    /// one in the same folder.
+    fn clear(&mut self, actions: &mut Vec<Action>) {
+        let conversation = self.current();
+        if conversation.is_fresh() {
+            return;
+        }
+        let (id, project) = (conversation.id, conversation.project.clone());
+        self.delete_conversation(id, actions);
+        self.current().project = project;
     }
 
     /// Stores the messages of a session read on a worker thread.
@@ -902,8 +966,9 @@ impl Chat {
             return;
         }
         let is = |c: &str, ch: &str| c.eq_ignore_ascii_case(ch);
+        let commands = self.commands();
         match &event.logical_key {
-            Key::Named(NamedKey::Escape) if self.menu.is_some() => self.menu = None,
+            Key::Named(NamedKey::Escape) if self.menu.is_some() => self.close_menu(),
             Key::Named(NamedKey::Escape) if self.page == Page::Settings => self.page = Page::Chat,
             Key::Character(c) if primary && is(c, "k") => self.open_spotlight(),
             Key::Character(c) if primary && is(c, ",") => self.toggle_settings(actions),
@@ -915,6 +980,20 @@ impl Chat {
                 if let Some(text) = self.selected_text() {
                     copy(cb, &text);
                 }
+            }
+            // Enter runs the picked slash command, Tab completes it.
+            Key::Named(key @ (NamedKey::Enter | NamedKey::Tab)) if !commands.is_empty() && !mods.shift_key() => {
+                let command = commands[self.command_pick.min(commands.len() - 1)];
+                if *key == NamedKey::Enter {
+                    self.run_command(command, actions);
+                } else {
+                    self.composer.take();
+                    self.composer.insert(&format!("/{}", command.name()));
+                }
+            }
+            Key::Named(key @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) if !commands.is_empty() => {
+                let step = if *key == NamedKey::ArrowUp { commands.len() - 1 } else { 1 };
+                self.command_pick = (self.command_pick.min(commands.len() - 1) + step) % commands.len();
             }
             Key::Named(NamedKey::Enter) if mods.shift_key() => self.composer.insert("\n"),
             Key::Named(NamedKey::Enter) => self.send(actions),
@@ -950,13 +1029,14 @@ impl Chat {
 
         // Overlays are drawn last, on top. Spotlight blocks everything
         // beneath it; an open menu blocks its own area (rect from last frame).
+        self.sync_command_menu();
         let modal = self.spotlight.is_some();
         ui.blocker = if modal { Some(view) } else if self.menu.is_some() { self.menu_rect } else { None };
         self.draw_sidebar(p, ui, sidebar, actions);
         let toolbar = if self.page == Page::Settings {
             let totals = self.totals();
             self.settings.draw(p, ui, main, scheme, self.reasoning_view, totals, actions);
-            [Rect::default(); 2]
+            [Rect::default(); 3]
         } else {
             self.draw_header(p, ui, main);
             let (composer_top, toolbar) = self.draw_composer(p, ui, main, actions);
@@ -1579,6 +1659,54 @@ mod tests {
         let items = input_items(&reply.history).unwrap();
         assert_eq!(items.len(), 2);
         assert!(matches!(&items[1], InputItem::Message { parts, .. } if matches!(&parts[0], Part::Text(t) if t == "second")));
+    }
+
+    #[test]
+    fn replies_keep_streaming_in_the_background() {
+        let mut chat = project_chat();
+        let first = start(&mut chat, "one");
+        chat.new_conversation();
+        let second = start(&mut chat, "two");
+        assert_ne!(first.conversation, second.conversation);
+        assert_eq!(chat.conversations.iter().filter(|c| c.busy()).count(), 2, "both run at once");
+
+        // Events for the chat in the background land in it, not the open one.
+        chat.stream_event(first.conversation, first.stream, StreamEvent::Text("a".into()));
+        chat.stream_event(second.conversation, second.stream, StreamEvent::Text("b".into()));
+        finish(&mut chat, &first, Completion::default());
+        finish(&mut chat, &second, Completion::default());
+        let reply = |id| chat.conversations.iter().find(|c| c.id == id).and_then(|c| c.entries.last()).map(|e| e.message.content.clone());
+        assert_eq!(reply(first.conversation).as_deref(), Some("a"));
+        assert_eq!(reply(second.conversation).as_deref(), Some("b"));
+        assert!(!chat.is_busy());
+    }
+
+    #[test]
+    fn clear_starts_over_in_the_same_folder() {
+        let mut chat = project_chat();
+        let job = start(&mut chat, "hi");
+        let project = chat.current().project.clone();
+        chat.composer.insert("/cl");
+        let mut actions = Vec::new();
+        let enter = |chat: &mut Chat, actions: &mut Vec<Action>| {
+            let command = chat.commands()[chat.command_pick];
+            chat.run_command(command, actions);
+        };
+        enter(&mut chat, &mut actions);
+        assert!(job.cancel.load(Ordering::Relaxed), "the running reply is stopped");
+        assert!(matches!(&actions[..], [Action::DeleteSession(_), Action::StopProcesses(_)]));
+        assert!(chat.current().is_fresh() && chat.current().project == project);
+        assert!(chat.composer.text().is_empty());
+
+        // Closing the menu keeps it closed until the text changes.
+        chat.composer.insert("/");
+        chat.sync_command_menu();
+        assert!(chat.menu == Some(Menu::Commands));
+        chat.close_menu();
+        chat.sync_command_menu();
+        assert!(chat.menu.is_none() && chat.commands().is_empty());
+        chat.composer.insert("c");
+        assert_eq!(chat.commands(), [Command::Clear]);
     }
 
     #[test]

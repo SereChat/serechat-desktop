@@ -1,5 +1,6 @@
 //! The composer: attachment chips, the text field (with input-method
-//! preedit), and the toolbar with attach, model, reasoning and send.
+//! preedit), the toolbar with attach, model, reasoning and send, and the
+//! slash commands it completes.
 
 use winit::window::CursorIcon;
 
@@ -19,14 +20,49 @@ const CHIP_H: f32 = 30.0;
 /// Seconds a notice stays up.
 const NOTICE_SECS: f32 = 7.0;
 
+/// A command typed as `/name` in the composer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Command {
+    /// Deletes the open chat and starts over in the same folder.
+    Clear,
+}
+
+impl Command {
+    const ALL: [Self; 1] = [Self::Clear];
+
+    /// What follows the slash.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+        }
+    }
+
+    /// What it does, shown next to it.
+    pub(super) fn detail(self) -> &'static str {
+        match self {
+            Self::Clear => "Clear this chat's messages",
+        }
+    }
+
+    /// Commands completing `text`: a slash and part of a name, nothing else.
+    pub(super) fn matching(text: &str) -> Vec<Self> {
+        let Some(typed) = text.strip_prefix('/') else { return Vec::new() };
+        if typed.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        Self::ALL.into_iter().filter(|c| c.name().starts_with(typed)).collect()
+    }
+}
+
 impl Chat {
     /// Draws the composer. Returns its top edge (including any notice) and
-    /// the toolbar's model and reasoning buttons (menu anchors).
-    pub(super) fn draw_composer(&mut self, p: &mut Painter, ui: &mut Ui, main: Rect, actions: &mut Vec<Action>) -> (f32, [Rect; 2]) {
+    /// the menu anchors: the toolbar's model and reasoning buttons, and the card.
+    pub(super) fn draw_composer(&mut self, p: &mut Painter, ui: &mut Ui, main: Rect, actions: &mut Vec<Action>) -> (f32, [Rect; 3]) {
         let t = p.theme;
         let (x, width) = Self::column(main);
         let pad = 12.0;
-        let toolbar_h = 40.0;
+        let top_pad = 16.0;
+        let toolbar_h = 46.0;
         let text_w = width - 2.0 * pad;
 
         // With an input method composing, show its text at the caret.
@@ -46,9 +82,9 @@ impl Chat {
         // Attachment chips wrap above the text.
         let chips = self.chip_layout(p, text_w);
         let chips_h = chips.last().map_or(0.0, |(r, _)| r.bottom() + 8.0);
-        let card_h = pad + chips_h + visible_h + toolbar_h;
+        let card_h = top_pad + chips_h + visible_h + toolbar_h;
         let card = Rect::new(x, main.bottom() - 20.0 - card_h, width, card_h);
-        let text_area = Rect::new(card.x + pad, card.y + pad + chips_h, text_w, visible_h);
+        let text_area = Rect::new(card.x + pad, card.y + top_pad + chips_h, text_w, visible_h);
 
         // Keep the caret inside the visible part of a tall draft.
         let caret_byte = preedit.as_ref().map_or(cursor, |r| {
@@ -91,7 +127,7 @@ impl Chat {
         p.shadow(Rect::new(card.x, card.y + 4.0, card.w, card.h), t.shadow, theme::RADIUS, 14.0);
         p.bordered(card, t.surface, theme::RADIUS, 1.0, mix(t.border_strong, t.border_focus, focus));
 
-        if let Some(index) = self.draw_chips(p, ui, &chips, (card.x + pad, card.y + pad)) {
+        if let Some(index) = self.draw_chips(p, ui, &chips, (card.x + pad, card.y + top_pad)) {
             self.pending.remove(index);
         }
 
@@ -110,7 +146,7 @@ impl Chat {
             }
         }
         if shown.is_empty() {
-            let placeholder = if self.pending.is_empty() { "Message SereChat…" } else { "Add a message, or send the files as they are…" };
+            let placeholder = if self.pending.is_empty() { "Message SereChat, or / for commands…" } else { "Add a message, or send the files as they are…" };
             p.label(placeholder, theme::BODY, origin.0, origin.1, t.text_faint);
         } else {
             p.text(&layout, origin.0, origin.1, t.text);
@@ -131,7 +167,7 @@ impl Chat {
         p.set_clip(clip);
 
         // Toolbar: attach, model and reasoning on the left; send/stop on the right.
-        let item_y = card.bottom() - 8.0 - 26.0;
+        let item_y = card.bottom() - 10.0 - 26.0;
         let attach = Rect::new(card.x + 6.0, item_y, 26.0, 26.0);
         let attach_hover = ui.anim(id("attach"), f32::from(u8::from(ui.hovered(attach))));
         p.rect(attach, fade(t.hover, attach_hover), theme::RADIUS_SM);
@@ -174,7 +210,7 @@ impl Chat {
         }
 
         self.composer_layout = if preedit.is_none() { Some((layout, origin)) } else { None };
-        (notice_top.min(card.y), [model, reasoning])
+        (notice_top.min(card.y), [model, reasoning, card])
     }
 
     /// Positions of the attachment chips (plus loading placeholders),
@@ -305,4 +341,21 @@ pub(super) fn file_badge(p: &mut Painter, mime: &str, name: &str, rect: Rect) {
     };
     p.rect(rect, fade(color, 0.16), 3.0);
     p.label_centered(&label, Style::semibold(9.5), rect, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+
+    #[test]
+    fn commands_complete_a_bare_slash_word() {
+        assert_eq!(Command::matching("/"), [Command::Clear]);
+        assert_eq!(Command::matching("/cl"), [Command::Clear]);
+        assert_eq!(Command::matching("/clear"), [Command::Clear]);
+        assert!(Command::matching("/clearer").is_empty());
+        assert!(Command::matching("/clear it").is_empty(), "text after a command makes it a message");
+        assert!(Command::matching("/etc/hosts\n").is_empty());
+        assert!(Command::matching("clear").is_empty());
+        assert!(Command::matching("").is_empty());
+    }
 }
