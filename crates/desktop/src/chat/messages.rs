@@ -31,7 +31,7 @@ const META_H: f32 = 30.0;
 const REASONING_ROW: f32 = 30.0;
 /// Height of a tool card's header.
 const TOOL_ROW: f32 = 34.0;
-/// Tallest a tool card's body gets before it is clipped.
+/// Tallest a tool card's body gets before it scrolls.
 const TOOL_BODY_MAX: f32 = 260.0;
 /// Tallest an open tool card's screenshot gets.
 const SHOT_MAX: f32 = 320.0;
@@ -247,9 +247,9 @@ impl Entry {
             ToolStatus::Done | ToolStatus::Failed | ToolStatus::Denied if self.open_tools.contains(&index) => record.output.clone(),
             _ => return None,
         };
-        // Long bodies are clipped anyway; don't lay out more than fits.
-        let mut lines: Vec<&str> = text.lines().take(120).collect();
-        if text.lines().count() > 120 {
+        // ponytail: bodies scroll but stop at 1000 lines; page through the output if longer logs matter.
+        let mut lines: Vec<&str> = text.lines().take(1000).collect();
+        if text.lines().count() > 1000 {
             lines.push("…");
         }
         Some(lines.join("\n"))
@@ -313,10 +313,11 @@ impl Entry {
         let mut height = TOOL_ROW + screenshot.map_or(0.0, |(_, h)| h + 12.0);
         if let Some(body) = body {
             let key = (body.len(), status, (width - 24.0).to_bits());
-            if slot.as_ref().is_none_or(|(k, _)| *k != key) {
-                *slot = Some((key, TextLayout::new(p.fonts, &body, TOOL_STYLE, Some(width - 24.0), p.scale)));
+            if slot.as_ref().is_none_or(|(k, ..)| *k != key) {
+                let scroll = slot.as_ref().map_or(0.0, |(.., s)| *s);
+                *slot = Some((key, TextLayout::new(p.fonts, &body, TOOL_STYLE, Some(width - 24.0), p.scale), scroll));
             }
-            height += slot.as_ref().map_or(0.0, |(_, l)| l.height().min(TOOL_BODY_MAX)) + 14.0;
+            height += slot.as_ref().map_or(0.0, |(_, l, _)| l.height().min(TOOL_BODY_MAX)) + 14.0;
         } else {
             *slot = None;
         }
@@ -432,10 +433,6 @@ impl Chat {
             find.update(conversation, reasoning_view, first);
         }
 
-        if ui.hovered(view) && ui.scroll != 0.0 {
-            self.scroll_target = (self.scroll_target + ui.scroll).clamp(0.0, max_scroll);
-            self.stick_to_bottom = self.scroll_target >= max_scroll - 1.0;
-        }
         // Dragging a selection past the edges scrolls.
         if self.dragging && ui.down {
             let over = if ui.mouse.1 < view.y { ui.mouse.1 - view.y } else if ui.mouse.1 > view.bottom() { ui.mouse.1 - view.bottom() } else { 0.0 };
@@ -691,6 +688,12 @@ impl Chat {
             p.text(&text, x, y + (30.0 - text.height()) * 0.5, t.text_faint);
         }
         p.set_clip(clip);
+        // The wheel, unless a tool card's body took it while drawing.
+        if ui.hovered(view) && ui.scroll != 0.0 {
+            self.scroll_target = (self.scroll_target + ui.scroll).clamp(0.0, max_scroll);
+            self.stick_to_bottom = self.scroll_target >= max_scroll - 1.0;
+            ui.animating = true;
+        }
 
         // Centre the find match being looked at, now that its place is known.
         if let (Some(m), Some(find)) = (&reveal, &mut self.find) {
@@ -977,13 +980,26 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
             ui.animating = true;
         }
         y = body.bottom();
-    } else if let Some((_, layout)) = entry.tool_bodies.get(index).and_then(Option::as_ref) {
+    } else if let Some((_, layout, scroll)) = entry.tool_bodies.get_mut(index).and_then(Option::as_mut) {
         p.rect(Rect::new(rect.x, y, rect.w, 1.0), t.border, 0.0);
         let body_h = layout.height().min(TOOL_BODY_MAX);
+        // A tall body takes the wheel; at either end the chat scrolls instead.
+        let max = layout.height() - body_h;
+        let can_move = (ui.scroll > 0.0 && *scroll < max) || (ui.scroll < 0.0 && *scroll > 0.0);
+        if interactive && can_move && ui.hovered(Rect::new(rect.x, y, rect.w, body_h + 14.0)) {
+            *scroll += ui.scroll;
+            ui.scroll = 0.0;
+        }
+        *scroll = scroll.clamp(0.0, max);
         let clip = p.push_clip(Rect::new(rect.x, y + 7.0, rect.w, body_h));
         let color = if status == ToolStatus::Failed { t.danger } else { t.text_muted };
-        p.text(layout, rect.x + 12.0, y + 7.0, color);
+        p.text(layout, rect.x + 12.0, y + 7.0 - scroll.round(), color);
         p.set_clip(clip);
+        if max > 0.0 {
+            let thumb_h = (body_h * body_h / layout.height()).max(24.0);
+            let thumb_y = y + 7.0 + (body_h - thumb_h) * (*scroll / max);
+            p.rect(Rect::new(rect.right() - 7.0, thumb_y, 4.0, thumb_h), fade(t.text, 0.15), 2.0);
+        }
         y += body_h + 14.0;
     }
     if let (Some((w, h)), Some(image)) = (entry.shot_size(index, rect.w), &record.image) {

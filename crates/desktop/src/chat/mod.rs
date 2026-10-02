@@ -280,8 +280,9 @@ impl Entry {
     }
 }
 
-/// A tool card body layout with the (text length, status, width) it shows.
-type ToolBody = Option<((usize, ToolStatus, u32), TextLayout)>;
+/// A tool card body layout with the (text length, status, width) it shows,
+/// and how far it is scrolled when taller than the card.
+type ToolBody = Option<((usize, ToolStatus, u32), TextLayout, f32)>;
 
 /// Whether a conversation's messages are in memory.
 #[derive(Clone, Debug, PartialEq)]
