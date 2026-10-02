@@ -174,6 +174,19 @@ pub fn fetch_generated(client: &Client, kind: MediaKind, job: &str, prompt: &str
     Ok(Some(Attachment { name, mime, size, path: named.to_string_lossy().into_owned(), dimensions }))
 }
 
+/// Saves a JPEG screenshot a tool took into `store`, so the session keeps it.
+///
+/// # Errors
+/// The file could not be written.
+pub fn save_screenshot(jpeg: &[u8], store: &Path) -> Result<Attachment, String> {
+    let fail = |e: std::io::Error| format!("The screenshot could not be saved: {e}");
+    fs::create_dir_all(store).map_err(fail)?;
+    let path = store.join(format!("{}-screenshot.jpg", new_session_id()));
+    fs::write(&path, jpeg).map_err(fail)?;
+    let dimensions = crate::image::dimensions(&path);
+    Ok(Attachment { name: "screenshot.jpg".into(), mime: "image/jpeg".into(), size: jpeg.len() as u64, path: path.to_string_lossy().into_owned(), dimensions })
+}
+
 /// A file name (no extension) from the first words of `prompt`, or `fallback`.
 fn slug(prompt: &str, fallback: &str) -> String {
     let words: Vec<String> = prompt

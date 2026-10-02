@@ -16,12 +16,15 @@
 //! Every change is saved, so a run interrupted by a crash, a restart or the
 //! user shows a Continue button (see [`Conversation::resumable`]).
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use serechat::{Completion, Error, InputItem, Part, Role, StoredMessage, StreamEvent, ToolCall, ToolRecord, ToolStatus, Usage, unix_now};
+use serechat::{
+    Attachment, Completion, Error, InputItem, Part, Role, StoredMessage, StreamEvent, ToolCall, ToolRecord, ToolStatus, Usage, data_url, unix_now,
+};
 
 use super::composer::Command;
 use super::{Chat, Conversation, Decision, Entry, Load, Reasoning, StreamingCall};
@@ -58,6 +61,9 @@ const INIT_PROMPT: &str = "Write an AGENTS.md file at the root of this project f
     project first instead of guessing: what it is, how to build, test and run it, how the code is laid out, the conventions to follow, \
     and anything surprising. Keep it short and specific to this project. If an AGENTS.md already exists, improve it rather than \
     starting over.";
+/// Screenshots a request carries, newest first. Each costs the model about
+/// a thousand tokens, and old ones rarely matter.
+const MAX_SCREENSHOTS: usize = 3;
 /// Output of a call from a reply that hit the output limit.
 const TRUNCATED_CALL: &str = "Not run: your reply reached the output limit before this call was complete, so its arguments may be \
     cut off. Split the work into smaller steps, e.g. write a large file in parts with edit_file.";
@@ -144,6 +150,16 @@ pub struct ToolJob {
 /// An attachment could not be read.
 pub fn input_items(history: &[StoredMessage]) -> Result<Vec<InputItem>, String> {
     let start = history.iter().rposition(is_summary).unwrap_or(0);
+    // Only the latest screenshots are sent; older ones stay as their text.
+    let recent: Vec<&str> = history[start..]
+        .iter()
+        .rev()
+        .filter(|m| !m.failed)
+        .flat_map(|m| m.tool_calls.iter().rev())
+        .filter(|r| r.status.is_finished() && r.image.is_some())
+        .take(MAX_SCREENSHOTS)
+        .map(|r| r.call.call_id.as_str())
+        .collect();
     let mut items = Vec::with_capacity(history.len() - start);
     for message in history[start..].iter().filter(|m| !m.failed) {
         match message.role {
@@ -166,10 +182,31 @@ pub fn input_items(history: &[StoredMessage]) -> Result<Vec<InputItem>, String> 
                     items.push(InputItem::ToolCall(record.call.clone()));
                     items.push(InputItem::ToolOutput { call_id: record.call.call_id.clone(), output: record.output.clone() });
                 }
+                // Tool outputs are text only, so screenshots follow as a user turn.
+                let shots: Vec<&ToolRecord> = message.tool_calls.iter().filter(|r| recent.contains(&r.call.call_id.as_str())).collect();
+                if !shots.is_empty() {
+                    items.push(InputItem::Message { role: Role::User, parts: screenshot_parts(&shots) });
+                }
             }
         }
     }
     Ok(items)
+}
+
+/// The images of tool calls `records`, each introduced by its call. A
+/// screenshot whose file is gone becomes a note rather than failing the
+/// request.
+fn screenshot_parts(records: &[&ToolRecord]) -> Vec<Part> {
+    let mut parts = Vec::with_capacity(records.len() * 2);
+    for record in records {
+        let Some(image) = &record.image else { continue };
+        parts.push(Part::Text(format!("The screenshot from your {} call {}:", record.call.name, record.call.call_id)));
+        parts.push(match fs::read(&image.path) {
+            Ok(bytes) => Part::Image(data_url(&image.mime, &bytes)),
+            Err(_) => Part::Text("(The screenshot's file is missing.)".to_owned()),
+        });
+    }
+    parts
 }
 
 /// A finished summary, which the model's view of the conversation starts from.
@@ -185,8 +222,8 @@ pub(super) fn instructions(project: Option<&str>) -> String {
         Some(root) => format!(
             "You are SereChat, an AI assistant and coding agent in a desktop app on {os}. You are working in the project folder `{root}`; \
              tool paths are relative to it. Look at the files with your tools before answering questions about the project, and use \
-             them to make changes when asked. Writing files, editing, running commands and fetching URLs need the user's approval, so \
-             say briefly what you are about to do.\n\n\
+             them to make changes when asked. Writing files, editing, running commands, fetching URLs and acting in the browser need \
+             the user's approval, so say briefly what you are about to do.\n\n\
              For work that takes several steps, keep a plan with update_plan and carry on until the task is done instead of stopping \
              to ask, unless you need a decision only the user can make. Check your changes (build, tests) when the project allows it. \
              Keep each tool call reasonably small: edit files in place rather than rewriting large ones. Answer in Markdown and keep \
@@ -378,7 +415,7 @@ impl Chat {
                 message.cost = self.models.iter().find(|m| m.id == stream.model).map_or(0.0, |m| m.cost(usage)) + std::mem::take(carried_cost);
                 message.model = Some(stream.model.clone());
                 message.usage = usage;
-                message.tool_calls = tool_calls.into_iter().map(|call| ToolRecord { call, status: ToolStatus::Pending, output: String::new() }).collect();
+                message.tool_calls = tool_calls.into_iter().map(|call| ToolRecord { call, status: ToolStatus::Pending, output: String::new(), image: None }).collect();
                 entry.streaming_calls.clear();
                 stream.incomplete = incomplete;
             }
@@ -597,8 +634,9 @@ impl Chat {
         self.request_reply(id, actions);
     }
 
-    /// Stores a finished tool call's result and moves the agent on.
-    pub fn tool_done(&mut self, conversation: u64, call_id: &str, result: Result<String, String>, actions: &mut Vec<Action>) {
+    /// Stores a finished tool call's result (and the image it returned, if
+    /// any) and moves the agent on.
+    pub fn tool_done(&mut self, conversation: u64, call_id: &str, result: Result<String, String>, image: Option<Attachment>, actions: &mut Vec<Action>) {
         let Some(target) = self.find(conversation) else { return };
         let Some(record) = target
             .entries
@@ -613,6 +651,7 @@ impl Chat {
             Ok(output) => (ToolStatus::Done, output),
             Err(error) => (ToolStatus::Failed, error),
         };
+        record.image = image;
         let call = record.call.clone();
         let project = target.project.clone();
         actions.push(Action::SaveSession(target.to_session()));
@@ -760,5 +799,36 @@ mod tests {
         let items = input_items(&history).unwrap();
         assert_eq!(items.len(), 2, "old messages and the failed summary are left out");
         assert!(matches!(&items[0], InputItem::Message { role: Role::User, parts } if matches!(&parts[0], Part::Text(t) if t.ends_with("did A"))));
+    }
+
+    #[test]
+    fn only_the_latest_screenshots_are_sent() {
+        let file = std::env::temp_dir().join(format!("serechat-shot-{}.jpg", std::process::id()));
+        fs::write(&file, [0xFF, 0xD8]).unwrap();
+        let shot = |id: &str, path: &std::path::Path| ToolRecord {
+            call: ToolCall { call_id: id.into(), name: "browser_screenshot".into(), arguments: "{}".into() },
+            status: ToolStatus::Done,
+            output: "Took a screenshot.".into(),
+            image: Some(Attachment { name: "screenshot.jpg".into(), mime: "image/jpeg".into(), size: 2, path: path.to_string_lossy().into_owned(), dimensions: None }),
+        };
+        let mut first = StoredMessage::new(Role::Assistant, String::new());
+        first.tool_calls = vec![shot("a", &file), shot("b", &file)];
+        let mut second = StoredMessage::new(Role::Assistant, String::new());
+        second.tool_calls = vec![shot("c", &file), shot("d", &file.with_extension("gone"))];
+        let items = input_items(&[StoredMessage::new(Role::User, "look".into()), first, second]).unwrap();
+        let images: Vec<&[Part]> = items
+            .iter()
+            .filter_map(|item| match item {
+                InputItem::Message { role: Role::User, parts } if parts.len() > 1 => Some(parts.as_slice()),
+                _ => None,
+            })
+            .collect();
+        // `a` is too old; `b` follows its own reply's outputs; `d`'s file is gone.
+        assert_eq!(images.len(), 2);
+        assert!(matches!(images[0], [Part::Text(t), Part::Image(url)] if t.contains("call b") && url.starts_with("data:image/jpeg;base64,")));
+        assert!(matches!(images[1], [_, Part::Image(_), Part::Text(t), Part::Text(missing)] if t.contains("call d") && missing.contains("missing")));
+        let position = |want: &InputItem| items.iter().position(|i| i == want);
+        assert!(position(&InputItem::ToolOutput { call_id: "b".into(), output: "Took a screenshot.".into() }) < items.iter().position(|i| matches!(i, InputItem::Message { role: Role::User, parts } if parts.len() == 2)));
+        fs::remove_file(&file).unwrap();
     }
 }

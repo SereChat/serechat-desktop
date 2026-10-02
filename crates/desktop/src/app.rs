@@ -80,6 +80,8 @@ pub enum WorkerEvent {
         call_id: String,
         /// Output, or the error for the model.
         result: Result<String, String>,
+        /// The image it returned (a screenshot), saved as an attachment.
+        image: Option<Attachment>,
     },
     /// Files were copied in as attachments (or failed to).
     Imported(Vec<Result<Attachment, String>>),
@@ -185,7 +187,8 @@ pub enum Action {
     SaveSession(Session),
     /// Delete a session file by id.
     DeleteSession(String),
-    /// Stop the background processes a conversation started.
+    /// Stop the background processes a conversation started and close its
+    /// browser tab.
     StopProcesses(u64),
     /// Look for the skills of a project (`None`: the user's only).
     ScanSkills {
@@ -552,8 +555,8 @@ impl App {
                     return;
                 }
             }
-            (WorkerEvent::ToolDone { conversation, call_id, result }, Screen::Chat(chat)) => {
-                chat.tool_done(conversation, &call_id, result, &mut actions);
+            (WorkerEvent::ToolDone { conversation, call_id, result, image }, Screen::Chat(chat)) => {
+                chat.tool_done(conversation, &call_id, result, image, &mut actions);
             }
             (WorkerEvent::MediaModels(kind, Ok(models)), Screen::Chat(chat)) => chat.set_media_models(kind, models),
             (WorkerEvent::MediaModels(kind, Err(e)), _) => eprintln!("serechat: could not load {} models: {e}", kind.noun()),
@@ -630,20 +633,32 @@ impl App {
                 };
                 WorkerEvent::StreamEnded { conversation, stream, result }
             }),
-            Action::RunTool(job) => self.spawn(move |client, proxy| {
-                // A file change is diffed against the file as it was just before.
-                let change = job.root.as_deref().filter(|_| tools::changes_file(&job.call.name)).and_then(|root| tools::file_change(root, &job.call));
-                let result = match &job.root {
-                    _ if job.call.name == "use_skill" => skills::run(&job.skills, &job.call.arguments),
-                    Some(root) => tools::run(root, job.conversation, client, &job.call, &job.cancel),
-                    None => Err("Tools are only available in a project.".to_owned()),
-                };
-                if let (Ok(_), Some((before, after, whole))) = (&result, change) {
-                    let diff = Arc::new(diff::diff(&before, &after, whole));
-                    let _ = proxy.send_event(WorkerEvent::DiffReady { conversation: job.conversation, call_id: job.call.call_id.clone(), diff });
-                }
-                WorkerEvent::ToolDone { conversation: job.conversation, call_id: job.call.call_id, result }
-            }),
+            Action::RunTool(job) => {
+                let dir = self.reader().map_or_else(|| std::env::temp_dir().join("serechat-attachments"), |store| store.attachments_dir());
+                self.spawn(move |client, proxy| {
+                    // A file change is diffed against the file as it was just before.
+                    let change = job.root.as_deref().filter(|_| tools::changes_file(&job.call.name)).and_then(|root| tools::file_change(root, &job.call));
+                    let result = match &job.root {
+                        _ if job.call.name == "use_skill" => skills::run(&job.skills, &job.call.arguments).map(tools::Output::text),
+                        Some(root) => tools::run(root, job.conversation, client, &job.call, &job.cancel),
+                        None => Err("Tools are only available in a project.".to_owned()),
+                    };
+                    if let (Ok(_), Some((before, after, whole))) = (&result, change) {
+                        let diff = Arc::new(diff::diff(&before, &after, whole));
+                        let _ = proxy.send_event(WorkerEvent::DiffReady { conversation: job.conversation, call_id: job.call.call_id.clone(), diff });
+                    }
+                    // A screenshot is kept with the session's attachments.
+                    let (result, image) = match result {
+                        Ok(tools::Output { text, image: Some(jpeg) }) => match attachments::save_screenshot(&jpeg, &dir) {
+                            Ok(image) => (Ok(text), Some(image)),
+                            Err(e) => (Err(e), None),
+                        },
+                        Ok(output) => (Ok(output.text), None),
+                        Err(e) => (Err(e), None),
+                    };
+                    WorkerEvent::ToolDone { conversation: job.conversation, call_id: job.call.call_id, result, image }
+                });
+            }
             Action::PreviewChange { conversation, root, call } => self.spawn(move |_, _| {
                 let (before, after, whole) = tools::file_change(&root, &call).unwrap_or_default();
                 WorkerEvent::DiffReady { conversation, call_id: call.call_id, diff: Arc::new(diff::diff(&before, &after, whole)) }
@@ -707,7 +722,10 @@ impl App {
                 };
                 WorkerEvent::Skills { project, generation: Some(generation), catalog: Arc::new(catalog) }
             }),
-            Action::StopProcesses(owner) => std::mem::drop(std::thread::Builder::new().spawn(move || crate::process::stop_owner(owner))),
+            Action::StopProcesses(owner) => std::mem::drop(std::thread::Builder::new().spawn(move || {
+                crate::process::stop_owner(owner);
+                crate::browser::close(owner);
+            })),
             Action::Search { query, generation } => {
                 if let Some(store) = self.reader() {
                     self.spawn(move |_, _| WorkerEvent::SearchResults { generation, hits: store.search(&query, 30).unwrap_or_default() });

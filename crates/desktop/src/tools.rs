@@ -3,7 +3,9 @@
 //! Reading tools (list, read, search, find) run on their own. Anything that
 //! changes files, runs a program or reaches the network waits for the user's
 //! approval in the chat. Every path is resolved inside the project root,
-//! symlinks included, so the model cannot touch files outside it.
+//! symlinks included, so the model cannot touch files outside it. The
+//! browser tools (`browser.rs`) ask before opening a page, clicking or
+//! typing; reading the page and screenshots run on their own.
 //!
 //! Tools block; the app runs them on worker threads.
 
@@ -18,7 +20,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use serechat::{Client, ToolCall};
 
-use crate::process;
+use crate::{browser, process};
 
 /// Longest tool output returned to the model, in bytes.
 const MAX_OUTPUT: usize = 32 * 1024;
@@ -146,6 +148,51 @@ pub fn all() -> &'static [Tool] {
                 json!({ "type": "object", "properties": { "url": string("An http:// or https:// URL.") }, "required": ["url"] }),
                 true,
             ),
+            tool(
+                "browser_open",
+                "Open a URL in your own browser tab and return a snapshot of the page: its visible text, with links, buttons and \
+                 fields numbered like [3] for browser_click and browser_type. Use the browser for pages that need JavaScript or \
+                 interaction; fetch_url is cheaper for plain reading. The browser uses a fresh profile: the user is not logged in \
+                 anywhere. The user must approve.",
+                json!({ "type": "object", "properties": { "url": string("An http:// or https:// URL.") }, "required": ["url"] }),
+                true,
+            ),
+            tool(
+                "browser_snapshot",
+                "Return a fresh snapshot of your browser tab's page, with its elements numbered anew. Numbers from older \
+                 snapshots stop working once the page changes.",
+                json!({ "type": "object", "properties": {} }),
+                false,
+            ),
+            tool(
+                "browser_click",
+                "Click a numbered element from the latest browser snapshot, then return the updated snapshot. The user must approve.",
+                json!({ "type": "object", "properties": {
+                    "ref": integer("The element's number in the snapshot."),
+                    "element": string("What you are clicking, in a few words, for the user, e.g. 'Sign in button'.") },
+                    "required": ["ref", "element"] }),
+                true,
+            ),
+            tool(
+                "browser_type",
+                "Type text into a numbered field from the latest browser snapshot, replacing its content, or pick the option of a \
+                 numbered dropdown whose label is the text. Returns the updated snapshot. The user must approve.",
+                json!({ "type": "object", "properties": {
+                    "ref": integer("The field's number in the snapshot."),
+                    "element": string("Which field, in a few words, for the user, e.g. 'Search box'."),
+                    "text": string("The text to type, or the option to pick."),
+                    "submit": { "type": "boolean", "description": "Press Enter afterwards, e.g. to search (default false)." },
+                    "append": { "type": "boolean", "description": "Keep the field's content and add to it (default false)." } },
+                    "required": ["ref", "element", "text"] }),
+                true,
+            ),
+            tool(
+                "browser_screenshot",
+                "Take a screenshot of the visible part of your browser tab and see it. Use it when the layout, images or colours \
+                 matter; snapshots are cheaper for reading and finding elements.",
+                json!({ "type": "object", "properties": {} }),
+                false,
+            ),
         ]
     })
 }
@@ -206,6 +253,11 @@ fn view_args(name: &str, a: &Value, raw: &str) -> CallView {
         "read_process" => ("Check", format!("process {}", a.get("id").map_or_else(String::new, Value::to_string)), None),
         "stop_process" => ("Stop", format!("process {}", a.get("id").map_or_else(String::new, Value::to_string)), None),
         "fetch_url" => ("Fetch", s("url"), None),
+        "browser_open" => ("Open", s("url"), None),
+        "browser_snapshot" => ("Look", "browser page".to_owned(), None),
+        "browser_click" => ("Click", s("element"), None),
+        "browser_type" => ("Type", s("element"), Some(s("text"))),
+        "browser_screenshot" => ("Screenshot", "browser page".to_owned(), None),
         "use_skill" => match arg(a, "file") {
             Some(file) => ("Skill", format!("{} · {file}", s("name")), None),
             None => ("Skill", s("name"), None),
@@ -313,19 +365,42 @@ fn skip_json_value(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool
     false
 }
 
+/// What a tool returns.
+pub struct Output {
+    /// The result for the model.
+    pub text: String,
+    /// A JPEG the model sees after `text` (a browser screenshot).
+    pub image: Option<Vec<u8>>,
+}
+
+impl Output {
+    /// A text-only result.
+    #[must_use]
+    pub fn text(text: String) -> Self {
+        Self { text, image: None }
+    }
+}
+
 /// Runs `call` inside `root` for conversation `owner` (whose background
-/// processes it may see). `cancel` aborts long-running commands.
+/// processes and browser tab it may use). `cancel` aborts long-running
+/// commands.
 ///
 /// # Errors
 /// A message for the model: bad arguments, a path outside the project, or
 /// the operation's own failure.
-pub fn run(root: &Path, owner: u64, client: &Client, call: &ToolCall, cancel: &AtomicBool) -> Result<String, String> {
+pub fn run(root: &Path, owner: u64, client: &Client, call: &ToolCall, cancel: &AtomicBool) -> Result<Output, String> {
     let a = args(call);
     if !a.is_object() {
         return Err("Arguments must be a JSON object.".into());
     }
     let required = |key: &str| arg(&a, key).ok_or_else(|| format!("Missing the '{key}' argument."));
     let number = |key: &str| a.get(key).and_then(Value::as_u64);
+    let flag = |key: &str| a.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let element = || number("ref").ok_or_else(|| "Missing the 'ref' argument: the element's number in the snapshot.".to_owned());
+    if call.name == "browser_screenshot" {
+        let (text, jpeg) = browser::screenshot(owner, cancel)?;
+        return Ok(Output { text, image: Some(jpeg) });
+    }
     let output = match call.name.as_str() {
         "list_directory" => list_directory(root, &resolve(root, arg(&a, "path").unwrap_or("."))?, number("depth").unwrap_or(1).clamp(1, 4) as usize),
         "read_file" => read_file(&resolve(root, required("path")?)?, number("offset").unwrap_or(1), number("limit").unwrap_or(2000)),
@@ -362,9 +437,13 @@ pub fn run(root: &Path, owner: u64, client: &Client, call: &ToolCall, cancel: &A
         "read_process" => process::read(owner, process_id(&a)?, Duration::from_secs(number("wait_seconds").unwrap_or(0).min(process::MAX_WAIT_SECS)), cancel),
         "stop_process" => process::stop(owner, process_id(&a)?),
         "update_plan" => plan_steps(&a).map(|steps| format!("Plan updated: {} steps.", steps.len())),
+        "browser_open" => browser::open(owner, required("url")?, cancel),
+        "browser_snapshot" => browser::snapshot(owner, cancel),
+        "browser_click" => browser::click(owner, element()?, cancel),
+        "browser_type" => browser::type_text(owner, element()?, required("text")?, !flag("append"), flag("submit"), cancel),
         other => Err(format!("There is no tool named '{other}'.")),
     }?;
-    Ok(truncate_middle(output, MAX_OUTPUT))
+    Ok(Output::text(truncate_middle(output, MAX_OUTPUT)))
 }
 
 /// Whether `name` changes a file's content, so its card shows a diff.
@@ -769,7 +848,7 @@ mod tests {
     }
 
     fn exec(root: &Path, name: &str, arguments: &Value) -> Result<String, String> {
-        run(root, 0, &Client::new(None), &call(name, arguments), &AtomicBool::new(false))
+        run(root, 0, &Client::new(None), &call(name, arguments), &AtomicBool::new(false)).map(|output| output.text)
     }
 
     #[test]
@@ -827,7 +906,7 @@ mod tests {
         assert!(out.starts_with("exit code: 0") && out.contains("hi"), "{out}");
         let cancelled = AtomicBool::new(true);
         let slow = if cfg!(target_os = "windows") { "Start-Sleep 30" } else { "sleep 30" };
-        let out = run(&root, 0, &Client::new(None), &call("run_command", &json!({ "command": slow })), &cancelled).unwrap();
+        let out = run(&root, 0, &Client::new(None), &call("run_command", &json!({ "command": slow })), &cancelled).unwrap().text;
         assert!(out.starts_with("stopped by the user"), "{out}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -841,6 +920,13 @@ mod tests {
         assert!(cut.contains("omitted") && cut.is_char_boundary(cut.len()));
         assert!(needs_approval("run_command") && !needs_approval("read_file") && needs_approval("unknown"));
         assert!(needs_approval("start_process") && !needs_approval("read_process") && !needs_approval("use_skill"));
+        // The browser asks before it acts, not before it looks.
+        assert!(needs_approval("browser_open") && needs_approval("browser_click") && needs_approval("browser_type"));
+        assert!(!needs_approval("browser_snapshot") && !needs_approval("browser_screenshot"));
+        let click = call("browser_click", &json!({ "ref": 4, "element": "Sign in button" }));
+        assert_eq!((view(&click).verb, view(&click).target.as_str()), ("Click", "Sign in button"));
+        let root = std::env::temp_dir();
+        assert!(exec(&root, "browser_click", &json!({ "element": "x" })).unwrap_err().contains("'ref'"));
     }
 
     #[test]

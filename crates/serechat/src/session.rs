@@ -232,6 +232,10 @@ pub struct ToolRecord {
     /// Result or error text.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output: String,
+    /// An image the tool returned (a browser screenshot), kept with the
+    /// session's attachments and shown to the model after `output`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<Attachment>,
 }
 
 /// A message matching a content search.
@@ -469,7 +473,8 @@ impl SessionStore {
         if let Ok(session) = self.load(id) {
             let attachments = self.attachments_dir();
             for message in &session.messages {
-                for attachment in &message.attachments {
+                let images = message.tool_calls.iter().filter_map(|r| r.image.as_ref());
+                for attachment in message.attachments.iter().chain(images) {
                     // Only ever delete the app's own copies.
                     let path = Path::new(&attachment.path);
                     if path.starts_with(&attachments) {
@@ -635,6 +640,7 @@ mod tests {
             call: crate::responses::ToolCall { call_id: "c1".into(), name: "read_file".into(), arguments: "{}".into() },
             status: ToolStatus::Done,
             output: "ok".into(),
+            image: None,
         });
         let json = serde_json::to_string(&reply).unwrap();
         assert!(json.contains(r#""call_id":"c1""#) && json.contains(r#""status":"done""#));

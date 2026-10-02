@@ -42,6 +42,13 @@ cargo clippy --workspace --all-targets
 - **Background processes**: the agent can start a dev server or watcher (with your approval),
   read its output later and stop it. Stopping ends the whole process tree; everything still
   running stops when its chat is deleted or the app exits.
+- **Browser**: in a project, the agent can drive a browser to open pages, click and
+  type. It uses your installed Chrome, Edge, Brave or Chromium in a window of its own,
+  with a fresh throwaway profile, so none of your logins are involved. Each chat gets a
+  tab. Pages reach the model as text outlines with numbered links, buttons and fields.
+  Opening a page, clicking and typing need your approval; reading the page and taking
+  screenshots don't. Screenshots show in the tool card, and only the latest three go
+  with each request. The browser quits when the app exits.
 - **Project instructions and skills**: a project's `AGENTS.md` goes with every request.
   [Agent Skills](https://agentskills.io) live in `.agents/skills/<name>/SKILL.md`: yours in
   your home folder work in every chat, even without a project; a project's work in its
@@ -94,6 +101,8 @@ cargo clippy --workspace --all-targets
   loop (tool rounds, retries, context compaction, Continue).
 - `spotlight.rs`, `settings.rs`, `login.rs`: the other surfaces.
 - `process.rs`: background processes the agent starts, reads and stops.
+- `browser.rs`, `browser.js`, `websocket.rs`: the agent's browser, driven over the
+  DevTools protocol through a minimal WebSocket client; `browser.js` outlines a page.
 - `skills.rs`: Agent Skills scanning and loading, and the project's `AGENTS.md`;
   `chat/skills.rs` keeps the scanned catalogs and decides when to scan again.
 - `tools.rs`, `attachments.rs`, `platform.rs`: agent tools, file attachments (and downloads

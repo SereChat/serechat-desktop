@@ -1558,7 +1558,7 @@ mod tests {
         let mut reply = StoredMessage::new(Role::Assistant, "Let me look.".into());
         reply.tool_calls = calls
             .iter()
-            .map(|(id, name)| ToolRecord { call: ToolCall { call_id: (*id).into(), name: (*name).into(), arguments: "{}".into() }, status: ToolStatus::Pending, output: String::new() })
+            .map(|(id, name)| ToolRecord { call: ToolCall { call_id: (*id).into(), name: (*name).into(), arguments: "{}".into() }, status: ToolStatus::Pending, output: String::new(), image: None })
             .collect();
         reply
     }
@@ -1624,7 +1624,7 @@ mod tests {
         assert_eq!(runs, ["read_file"], "reads run at once, writes wait");
 
         let mut actions = Vec::new();
-        chat.tool_done(job.conversation, "r", Ok("contents".into()), &mut actions);
+        chat.tool_done(job.conversation, "r", Ok("contents".into()), None, &mut actions);
         assert!(!actions.iter().any(|a| matches!(a, Action::Send(_))), "still waiting for approval");
 
         let entry = chat.current().entries.len() - 1;
@@ -1791,10 +1791,10 @@ mod tests {
         let completion = Completion { usage: Usage::new(120_000, 1_000), tool_calls: vec![plan, skill, skill_file], ..Completion::default() };
         let actions = finish(&mut chat, &job, completion);
         assert_eq!(actions.iter().filter(|a| matches!(a, Action::RunTool(_))).count(), 3, "none of them needs approval");
-        chat.tool_done(job.conversation, "p", Ok("Plan updated: 2 steps.".into()), &mut Vec::new());
-        chat.tool_done(job.conversation, "f", Ok("The guide.".into()), &mut Vec::new());
+        chat.tool_done(job.conversation, "p", Ok("Plan updated: 2 steps.".into()), None, &mut Vec::new());
+        chat.tool_done(job.conversation, "f", Ok("The guide.".into()), None, &mut Vec::new());
         let mut actions = Vec::new();
-        chat.tool_done(job.conversation, "s", Ok("<skill_content name=\"review\">Check everything.</skill_content>".into()), &mut actions);
+        chat.tool_done(job.conversation, "s", Ok("<skill_content name=\"review\">Check everything.</skill_content>".into()), None, &mut actions);
 
         let summary = next_send(actions).expect("a summary request");
         assert_eq!(summary.tool_choice, Some("none"));
@@ -1948,7 +1948,7 @@ mod tests {
         let actions = finish(&mut chat, &job, Completion { tool_calls: vec![call("r", "read_file", "{}")], ..Completion::default() });
         assert!(next_send(actions).is_none());
         let mut actions = Vec::new();
-        chat.tool_done(job.conversation, "r", Ok("x".into()), &mut actions);
+        chat.tool_done(job.conversation, "r", Ok("x".into()), None, &mut actions);
         assert!(next_send(actions).is_none(), "paused");
         assert!(chat.current().resumable());
         let mut actions = Vec::new();

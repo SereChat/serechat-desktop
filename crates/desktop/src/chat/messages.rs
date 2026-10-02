@@ -33,6 +33,8 @@ const REASONING_ROW: f32 = 30.0;
 const TOOL_ROW: f32 = 34.0;
 /// Tallest a tool card's body gets before it is clipped.
 const TOOL_BODY_MAX: f32 = 260.0;
+/// Tallest an open tool card's screenshot gets.
+const SHOT_MAX: f32 = 320.0;
 /// Height of the approval buttons row.
 const APPROVAL_ROW: f32 = 44.0;
 /// Height of the retry status or Continue button under the messages.
@@ -281,6 +283,15 @@ impl Entry {
         self.diffs.get_mut(id)
     }
 
+    /// Size of tool card `index`'s screenshot, shown under its output while
+    /// the card is open, in a card `width` wide.
+    fn shot_size(&self, index: usize, width: f32) -> Option<(f32, f32)> {
+        let image = self.message.tool_calls[index].image.as_ref().filter(|_| self.open_tools.contains(&index))?;
+        let (w, h) = image.dimensions.map_or((16.0, 10.0), |(w, h)| (w as f32, h as f32));
+        let height = ((width - 24.0).max(1.0) * h / w).min(SHOT_MAX);
+        Some((height * w / h, height))
+    }
+
     /// Height of tool card `index`, refreshing its body layout.
     fn tool_height(&mut self, p: &Painter, index: usize, width: f32) -> f32 {
         let shows_diff = self.shows_diff(index);
@@ -297,8 +308,9 @@ impl Entry {
             return height;
         }
         let body = self.tool_body(index);
+        let screenshot = self.shot_size(index, width);
         let slot = &mut self.tool_bodies[index];
-        let mut height = TOOL_ROW;
+        let mut height = TOOL_ROW + screenshot.map_or(0.0, |(_, h)| h + 12.0);
         if let Some(body) = body {
             let key = (body.len(), status, (width - 24.0).to_bits());
             if slot.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -928,6 +940,14 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
         p.text(layout, rect.x + 12.0, y + 7.0, color);
         p.set_clip(clip);
         y += body_h + 14.0;
+    }
+    if let (Some((w, h)), Some(image)) = (entry.shot_size(index, rect.w), &record.image) {
+        let shot = Rect::new(rect.x + 12.0, y, w, h);
+        if !matches!(p.image(&image.path, shot, theme::RADIUS_SM), Lookup::Ready(_)) {
+            p.rect(shot, t.hover, theme::RADIUS_SM);
+        }
+        p.bordered(shot, [0.0; 4], theme::RADIUS_SM, 1.0, t.border);
+        y += h + 12.0;
     }
     if approval {
         let row = Rect::new(rect.x + 12.0, y + 6.0, rect.w - 24.0, 30.0);

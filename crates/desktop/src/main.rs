@@ -11,6 +11,7 @@
 mod app;
 mod atlas;
 mod attachments;
+mod browser;
 mod chat;
 mod diff;
 mod doc;
@@ -32,6 +33,7 @@ mod text;
 mod theme;
 mod tools;
 mod ui;
+mod websocket;
 
 use std::process::ExitCode;
 
@@ -99,8 +101,9 @@ fn main() -> ExitCode {
     };
     let mut handler = Handler { app: None, proxy: event_loop.create_proxy(), error: None };
     let result = event_loop.run_app(&mut handler);
-    // Dev servers and watchers the agent started must not outlive the app.
+    // Dev servers, watchers and the browser the agent started must not outlive the app.
     process::stop_all();
+    browser::shutdown();
     if let Err(e) = result {
         eprintln!("serechat: event loop failed: {e}");
         return ExitCode::FAILURE;
