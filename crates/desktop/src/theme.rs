@@ -39,6 +39,10 @@ pub struct Palette {
     pub on_accent: Color,
     /// Text selection highlight.
     pub selection: Color,
+    /// Matches of a find in the chat.
+    pub find: Color,
+    /// The find match being looked at.
+    pub find_current: Color,
     /// Errors and destructive actions.
     pub danger: Color,
     /// Lines a change adds (diffs).
@@ -75,6 +79,8 @@ impl Palette {
             accent: m(self.accent, other.accent),
             on_accent: m(self.on_accent, other.on_accent),
             selection: m(self.selection, other.selection),
+            find: m(self.find, other.find),
+            find_current: m(self.find_current, other.find_current),
             danger: m(self.danger, other.danger),
             added: m(self.added, other.added),
             removed: m(self.removed, other.removed),
@@ -102,6 +108,8 @@ pub const DARK: Palette = Palette {
     accent: hex(0xEDEDEF),
     on_accent: hex(0x161618),
     selection: hexa(0xFFFFFF, 0.16),
+    find: hexa(0xE5C07B, 0.22),
+    find_current: hexa(0xE5C07B, 0.55),
     danger: hex(0xEB6F6F),
     added: hex(0x3FB950),
     removed: hex(0xF85149),
@@ -128,6 +136,8 @@ pub const BLUE: Palette = Palette {
     accent: hex(0x74ADE8),
     on_accent: hex(0x1B1F25),
     selection: hexa(0x74ADE8, 0.24),
+    find: hexa(0xE5C07B, 0.22),
+    find_current: hexa(0xE5C07B, 0.55),
     danger: hex(0xD07277),
     added: hex(0xA1C181),
     removed: hex(0xD07277),
@@ -154,6 +164,8 @@ pub const LIGHT: Palette = Palette {
     accent: hex(0x18181B),
     on_accent: hex(0xFFFFFF),
     selection: hexa(0x2563EB, 0.18),
+    find: hexa(0xF5B700, 0.22),
+    find_current: hexa(0xF59E0B, 0.5),
     danger: hex(0xD93636),
     added: hex(0x1A7F37),
     removed: hex(0xCF222E),

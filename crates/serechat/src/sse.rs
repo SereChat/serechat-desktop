@@ -13,6 +13,7 @@ pub struct Event {
 ///
 /// SereChat names each event in the `event` field and leaves `type` out of
 /// the JSON payload, so both fields are kept. `id` and `retry` are ignored.
+/// MCP servers stream with the same format.
 #[derive(Debug, Default)]
 pub struct Decoder {
     event: Event,

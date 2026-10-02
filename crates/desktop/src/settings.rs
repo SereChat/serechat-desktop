@@ -1,12 +1,23 @@
-//! Settings page: appearance, chat, usage, data and account.
+//! Settings page: appearance and the browser, skills, MCP servers, usage, and the account
+//! with updates.
 
-use crate::app::Action;
+use std::collections::HashSet;
+
+use arboard::Clipboard;
+use winit::event::KeyEvent;
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::window::CursorIcon;
+
+use crate::app::{Action, McpAction};
+use crate::browser::{self, Installed};
 use crate::chat::{ReasoningView, format_cost, group_digits};
-use crate::skills::Catalog;
+use crate::mcp::{ServerView, Status as McpStatus};
 use crate::paint::{Painter, Rect, fade, mix};
+use crate::skills::Catalog;
 use crate::text::{Align, Style};
 use crate::theme::{self, Palette, Scheme};
-use crate::ui::{ButtonStyle, Ui, button, id, keycap};
+use crate::ui::{ButtonStyle, FieldStyle, TextField, Ui, button, edit_key, id, keycap, switch, text_field};
+use crate::update::Status as UpdateStatus;
 
 /// Widest the settings column gets.
 const CONTENT_WIDTH: f32 = 680.0;
@@ -14,6 +25,8 @@ const CONTENT_WIDTH: f32 = 680.0;
 const SECTION_GAP: f32 = 40.0;
 /// Height of a row inside a settings group.
 const ROW_H: f32 = 68.0;
+/// Height of a tool's row in an opened MCP server card.
+const TOOL_ROW: f32 = 24.0;
 
 /// Usage summed over every saved session.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -30,26 +43,33 @@ pub struct Totals {
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Tab {
     #[default]
-    Appearance,
+    General,
     Skills,
+    Mcp,
     Usage,
     Account,
 }
 
 impl Tab {
-    const ALL: [Self; 4] = [Self::Appearance, Self::Skills, Self::Usage, Self::Account];
+    const ALL: [Self; 5] = [Self::General, Self::Skills, Self::Mcp, Self::Usage, Self::Account];
 
     fn label(self) -> &'static str {
         match self {
-            Self::Appearance => "Appearance",
+            Self::General => "General",
             Self::Skills => "Skills",
+            Self::Mcp => "MCP",
             Self::Usage => "Usage",
             Self::Account => "Account",
         }
     }
 }
 
-/// Open tab and scroll state of the settings page, and the skills it lists.
+/// The add-server form's fields, in tab order.
+const NAME: usize = 0;
+const TARGET: usize = 1;
+const EXTRA: usize = 2;
+
+/// Open tab and scroll state of the settings page, and what it lists.
 #[derive(Default)]
 pub struct SettingsView {
     tab: Tab,
@@ -58,12 +78,110 @@ pub struct SettingsView {
     content_h: f32,
     /// The skills found; `None` while looking.
     skills: Option<Catalog>,
+    /// MCP servers and their state.
+    mcp: Vec<ServerView>,
+    /// The latest MCP message (an import's result, a config error): text
+    /// and whether it is an error.
+    mcp_note: Option<(String, bool)>,
+    /// MCP servers whose tool list is open.
+    open_servers: HashSet<String>,
+    /// MCP server whose Remove button was clicked once.
+    confirm_remove: Option<String>,
+    /// The add-server form, while open: its fields and error.
+    form: Option<Form>,
+    /// What the updater is doing.
+    update: Option<UpdateStatus>,
+    /// Whether updates install themselves.
+    auto_update: bool,
+    /// The browsers the agent can drive; `None` while looking.
+    browsers: Option<Vec<Installed>>,
+    /// Key of the browser picked; `None` for Auto.
+    browser: Option<String>,
+    /// The focused field's caret, for the input method's window.
+    caret: Option<Rect>,
+}
+
+/// The add-server form.
+#[derive(Default)]
+struct Form {
+    fields: [TextField; 3],
+    focus: Option<usize>,
+    error: Option<String>,
 }
 
 impl SettingsView {
     /// Lists the skills the open chat can use (`None` while looking).
     pub fn set_skills(&mut self, report: Option<Catalog>) {
         self.skills = report;
+    }
+
+    /// Shows the MCP servers' current state.
+    pub fn set_mcp(&mut self, servers: Vec<ServerView>) {
+        self.open_servers.retain(|name| servers.iter().any(|s| &s.name == name));
+        self.mcp = servers;
+    }
+
+    /// Shows a message on the MCP tab (`error` in the danger colour).
+    pub fn set_mcp_note(&mut self, note: Option<(String, bool)>) {
+        self.mcp_note = note;
+    }
+
+    /// Shows what the updater is doing.
+    pub fn set_update(&mut self, status: UpdateStatus, auto: bool) {
+        self.update = Some(status);
+        self.auto_update = auto;
+    }
+
+    /// Shows the browsers found, and the one picked (`None`: Auto).
+    pub fn set_browsers(&mut self, found: Vec<Installed>, choice: Option<String>) {
+        self.browsers = Some(found);
+        self.browser = choice;
+    }
+
+    /// Where the focused field's caret is.
+    #[must_use]
+    pub fn caret(&self) -> Option<Rect> {
+        self.caret.filter(|_| self.form.as_ref().is_some_and(|f| f.focus.is_some()))
+    }
+
+    /// Text committed by an input method, for the focused field.
+    pub fn insert(&mut self, text: &str) {
+        if let Some(form) = &mut self.form
+            && let Some(focus) = form.focus
+        {
+            form.fields[focus].editor.insert(text);
+        }
+    }
+
+    /// Keyboard input while a field has focus. Returns whether it was used.
+    pub fn key(&mut self, event: &KeyEvent, mods: ModifiersState, cb: &mut Option<Clipboard>, actions: &mut Vec<Action>) -> bool {
+        let Some(form) = &mut self.form else { return false };
+        let Some(focus) = form.focus else { return false };
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.form = None,
+            Key::Named(NamedKey::Tab) => form.focus = Some(if mods.shift_key() { (focus + 2) % 3 } else { (focus + 1) % 3 }),
+            Key::Named(NamedKey::Enter) if focus == EXTRA && !mods.control_key() && !mods.super_key() => form.fields[EXTRA].editor.insert("\n"),
+            Key::Named(NamedKey::Enter) => self.submit(actions),
+            _ => return edit_key(&mut form.fields[focus].editor, event, mods, cb),
+        }
+        true
+    }
+
+    /// Adds the server the form describes, or says what is wrong.
+    fn submit(&mut self, actions: &mut Vec<Action>) {
+        let Some(form) = &mut self.form else { return };
+        let [name, target, extra] = &form.fields;
+        match crate::mcp::config::from_form(name.editor.text(), target.editor.text(), extra.editor.text()) {
+            Ok(server) if self.mcp.iter().any(|s| s.name == server.name) => {
+                form.error = Some(format!("There is already a server named {}.", server.name));
+                form.focus = Some(NAME);
+            }
+            Ok(server) => {
+                actions.push(Action::Mcp(McpAction::Add(Box::new(server))));
+                self.form = None;
+            }
+            Err(e) => form.error = Some(e),
+        }
     }
 
     /// Draws the page into `area` (the whole main area, header included).
@@ -107,9 +225,10 @@ impl SettingsView {
         let mut y = top;
         // Theme cards and usage stats share a three-column grid.
         let card_w = ((width - 24.0) / 3.0).floor();
+        self.caret = None;
 
         match self.tab {
-            Tab::Appearance => {
+            Tab::General => {
                 y = section(p, x, y, "Colour scheme", "It applies instantly.");
                 let preview_h = (card_w * 0.58).round();
                 let card_h = preview_h + 52.0;
@@ -123,15 +242,17 @@ impl SettingsView {
 
                 y = section(p, x, y, "Chat", "How replies from thinking models look.");
                 let row = group(p, x, y, width);
-                setting_row(p, row, "Model reasoning", "Show what the model considered before answering.");
+                setting_row(p, row, "Model reasoning", "Show what the model considered before answering.", 264.0);
                 let labels = ReasoningView::ALL.map(ReasoningView::label);
                 let selected = ReasoningView::ALL.iter().position(|v| *v == reasoning).unwrap_or(0);
                 if let Some(choice) = segmented(p, ui, control(row, 264.0), &labels, selected) {
                     actions.push(Action::SetReasoningView(ReasoningView::ALL[choice]));
                 }
-                y += ROW_H;
+                y += ROW_H + SECTION_GAP;
+                y = self.draw_browsers(p, ui, x, y, width, actions);
             }
             Tab::Skills => y = self.draw_skills(p, x, y, width),
+            Tab::Mcp => y = self.draw_mcp(p, ui, x, y, width, actions),
             Tab::Usage => {
                 y = section(p, x, y, "Usage", "Totals across every session saved on this device.");
                 let stats = [
@@ -148,9 +269,12 @@ impl SettingsView {
                 y += 84.0;
             }
             Tab::Account => {
+                y = self.draw_updates(p, ui, x, y, width, actions);
+                y += SECTION_GAP;
+
                 y = section(p, x, y, "Data", "Your sessions never leave this device except to reach the model.");
                 let row = group(p, x, y, width);
-                setting_row(p, row, "Saved sessions", "Stored as JSON files in ~/.serechat/sessions");
+                setting_row(p, row, "Saved sessions", "Stored as JSON files in ~/.serechat/sessions", 116.0);
                 if button(p, ui, control(row, 116.0), "Open folder", ButtonStyle::Secondary, true) {
                     actions.push(Action::OpenDataDir);
                 }
@@ -158,7 +282,7 @@ impl SettingsView {
 
                 y = section(p, x, y, "Account", "Manage how this device is signed in to SereChat.");
                 let row = group(p, x, y, width);
-                setting_row(p, row, "SereChat account", "Signed in on this device. Signing out keeps your sessions.");
+                setting_row(p, row, "SereChat account", "Signed in on this device. Signing out keeps your sessions.", 96.0);
                 if button(p, ui, control(row, 96.0), "Sign out", ButtonStyle::Danger, true) {
                     actions.push(Action::SignOut);
                 }
@@ -177,6 +301,54 @@ impl SettingsView {
 }
 
 impl SettingsView {
+    /// The browser picker: Auto, then each browser found. Returns where it ends.
+    fn draw_browsers(&mut self, p: &mut Painter, ui: &mut Ui, x: f32, y: f32, width: f32, actions: &mut Vec<Action>) -> f32 {
+        let t = p.theme;
+        let y = section(p, x, y, "Browser", "The agent browses in a window of its own, with a fresh profile, never yours.");
+        let Some(found) = &self.browsers else {
+            let row = group(p, x, y, width);
+            setting_row(p, row, "Looking for browsers…", "Checking where Chrome-family browsers are installed.", 0.0);
+            return y + ROW_H;
+        };
+        // (key, title, description)
+        let auto = match found.first() {
+            Some(first) => format!("Uses {}, the first found of Chrome, Brave, Helium, Edge and Chromium.", first.name),
+            None => "No supported browser found. Install Chrome, Brave, Helium, Edge or Chromium.".to_owned(),
+        };
+        let mut rows: Vec<(Option<String>, String, String)> = vec![(None, "Auto".to_owned(), auto)];
+        rows.extend(found.iter().map(|b| (Some(b.key.to_owned()), b.name.to_owned(), b.path.display().to_string())));
+        if let Some(key) = &self.browser
+            && !found.iter().any(|b| b.key == key)
+        {
+            rows.push((Some(key.clone()), browser::name(key).unwrap_or(key).to_owned(), "Not found on this computer, so Auto is used.".to_owned()));
+        }
+        let list = Rect::new(x, y, width, ROW_H * rows.len() as f32);
+        p.bordered(list, t.surface, theme::RADIUS, 1.0, t.border);
+        for (i, (key, title, text)) in rows.into_iter().enumerate() {
+            let row = Rect::new(x, y + i as f32 * ROW_H, width, ROW_H);
+            if i > 0 {
+                p.rect(Rect::new(row.x + 1.0, row.y, row.w - 2.0, 1.0), t.border, 0.0);
+            }
+            let selected = key == self.browser;
+            let hovered = !selected && ui.hovered(row);
+            let hover = ui.anim(id(("browser-row", i)), f32::from(u8::from(hovered)));
+            p.rect(Rect::new(row.x + 4.0, row.y + 4.0, row.w - 8.0, row.h - 8.0), fade(t.hover, hover), theme::RADIUS_SM);
+            radio(p, Rect::new(row.x + 16.0, row.y + (row.h - 14.0) * 0.5, 14.0, 14.0), selected);
+            p.label(&title, theme::LABEL, row.x + 42.0, row.y + 15.0, t.text);
+            let mut text = p.layout(&text, theme::SMALL, None);
+            text.truncate(p.fonts, row.w - 58.0);
+            p.text(&text, row.x + 42.0, row.y + 36.0, t.text_muted);
+            if hovered {
+                ui.cursor = CursorIcon::Pointer;
+                if ui.clicked(row) {
+                    self.browser.clone_from(&key);
+                    actions.push(Action::SetBrowser(key));
+                }
+            }
+        }
+        list.bottom()
+    }
+
     /// The skills the agent can load in the open chat, and the problems
     /// found reading them. Returns where the section ends.
     fn draw_skills(&self, p: &mut Painter, x: f32, y: f32, width: f32) -> f32 {
@@ -184,7 +356,7 @@ impl SettingsView {
         let mut y = section(p, x, y, "Skills", "Yours from ~/.agents/skills, plus a project's own from its .agents/skills.");
         let Some(report) = &self.skills else {
             let row = group(p, x, y, width);
-            setting_row(p, row, "Looking for skills…", "Reading .agents/skills folders.");
+            setting_row(p, row, "Looking for skills…", "Reading .agents/skills folders.", 0.0);
             return y + ROW_H;
         };
         // (title, description, badge)
@@ -217,6 +389,288 @@ impl SettingsView {
         }
         y
     }
+
+    /// The MCP tab: the servers, adding and importing them. Returns where it ends.
+    fn draw_mcp(&mut self, p: &mut Painter, ui: &mut Ui, x: f32, y: f32, width: f32, actions: &mut Vec<Action>) -> f32 {
+        let t = p.theme;
+        let mut y = section(p, x, y, "MCP servers", "Tools from Model Context Protocol servers, offered in every chat. Read-only tools run at once; the rest ask first.");
+        let add = Rect::new(x, y, 112.0, 30.0);
+        if button(p, ui, add, "Add server", ButtonStyle::Primary, self.form.is_none()) {
+            self.form = Some(Form { focus: Some(NAME), ..Form::default() });
+        }
+        let import = Rect::new(add.right() + 8.0, y, 176.0, 30.0);
+        if button(p, ui, import, "Import from clipboard", ButtonStyle::Secondary, true) {
+            actions.push(Action::Mcp(McpAction::Import));
+        }
+        let file = Rect::new(import.right() + 8.0, y, 120.0, 30.0);
+        if button(p, ui, file, "Edit mcp.json", ButtonStyle::Ghost, true) {
+            actions.push(Action::Mcp(McpAction::OpenFile));
+        }
+        y += 30.0 + 14.0;
+        if let Some((note, error)) = &self.mcp_note {
+            let text = p.layout(note, theme::SMALL, Some(width));
+            p.text(&text, x, y, if *error { t.danger } else { t.text_muted });
+            y += text.height() + 14.0;
+        }
+        if self.form.is_some() {
+            y = self.draw_form(p, ui, x, y, width, actions) + 14.0;
+        }
+        if self.mcp.is_empty() && self.form.is_none() {
+            let card = Rect::new(x, y, width, 76.0);
+            p.bordered(card, t.surface, theme::RADIUS, 1.0, t.border);
+            p.label("No servers yet", theme::LABEL, card.x + 16.0, card.y + 16.0, t.text);
+            let mut hint = p.layout("Add one, or copy a server's settings (its \"mcpServers\" JSON) from its README and import them.", theme::SMALL, None);
+            hint.truncate(p.fonts, card.w - 32.0);
+            p.text(&hint, card.x + 16.0, card.y + 40.0, t.text_muted);
+            return y + card.h;
+        }
+        let servers = self.mcp.clone();
+        let mut confirm_hovered = false;
+        for server in &servers {
+            let (bottom, hovered) = self.draw_server(p, ui, server, Rect::new(x, y, width, 0.0), actions);
+            confirm_hovered |= hovered && self.confirm_remove.as_deref() == Some(&server.name);
+            y = bottom + 10.0;
+        }
+        // Moving off the card cancels a pending removal.
+        if !confirm_hovered {
+            self.confirm_remove = None;
+        }
+        y
+    }
+
+    /// The add-server form. Returns where it ends.
+    fn draw_form(&mut self, p: &mut Painter, ui: &mut Ui, x: f32, y: f32, width: f32, actions: &mut Vec<Action>) -> f32 {
+        let t = p.theme;
+        let Some(form) = &mut self.form else { return y };
+        let web = form.fields[TARGET].editor.text().trim().starts_with("http");
+        let label_w = 150.0;
+        let field_x = x + 16.0 + label_w;
+        let field_w = width - 32.0 - label_w;
+        let rows: [(&str, &str, &str, f32); 3] = [
+            ("Name", "Its tools are named after it", "github", 32.0),
+            ("Command or URL", "What starts it, or where it is", "npx -y @modelcontextprotocol/server-memory   or   https://…/mcp", 32.0),
+            if web {
+                ("Headers", "Optional, one per line", "Authorization: Bearer ${GITHUB_TOKEN}", 76.0)
+            } else {
+                ("Environment", "Optional, one per line", "API_KEY=…", 76.0)
+            },
+        ];
+        let card_h = 16.0 + rows.iter().map(|r| r.3 + 12.0).sum::<f32>() + 30.0 + 16.0 + if form.error.is_some() { 24.0 } else { 0.0 };
+        let card = Rect::new(x, y, width, card_h);
+        p.bordered(card, t.surface, theme::RADIUS, 1.0, t.border_strong);
+        let mut row_y = y + 16.0;
+        let mut pressed_field = None;
+        for (index, (label, hint, placeholder, h)) in rows.iter().enumerate() {
+            p.label(label, theme::LABEL, x + 16.0, row_y + 2.0, t.text);
+            p.label(hint, theme::TINY, x + 16.0, row_y + 20.0, t.text_faint);
+            let rect = Rect::new(field_x, row_y, field_w, *h);
+            let style = FieldStyle { placeholder, multiline: index == EXTRA, mono: index != NAME };
+            let (pressed, caret) = text_field(p, ui, rect, &mut form.fields[index], form.focus == Some(index), &style);
+            if pressed {
+                pressed_field = Some(index);
+            }
+            if caret.is_some() {
+                self.caret = caret;
+            }
+            row_y += h + 12.0;
+        }
+        if let Some(error) = &form.error {
+            p.label(error, theme::SMALL, field_x, row_y, t.danger);
+            row_y += 24.0;
+        }
+        let add = Rect::new(field_x, row_y, 72.0, 30.0);
+        let cancel = Rect::new(add.right() + 8.0, row_y, 76.0, 30.0);
+        let hint = p.layout("Enter to add · Tab for the next field", theme::TINY, None);
+        p.text(&hint, cancel.right() + 16.0, row_y + (30.0 - hint.height()) * 0.5, t.text_faint);
+        let submit = button(p, ui, add, "Add", ButtonStyle::Primary, true);
+        let cancelled = button(p, ui, cancel, "Cancel", ButtonStyle::Ghost, true);
+        if ui.pressed {
+            form.focus = pressed_field.or(if ui.hovered(card) { form.focus } else { None });
+        }
+        if cancelled {
+            self.form = None;
+        } else if submit {
+            self.submit(actions);
+        }
+        y + card_h
+    }
+
+    /// One server's card, starting at `area`'s top. Returns its bottom and
+    /// whether the mouse is over it.
+    fn draw_server(&mut self, p: &mut Painter, ui: &mut Ui, server: &ServerView, area: Rect, actions: &mut Vec<Action>) -> (f32, bool) {
+        let t = p.theme;
+        let (x, width) = (area.x, area.w);
+        let open = self.open_servers.contains(&server.name);
+        let (status, error) = match &server.status {
+            McpStatus::Off => ("Off".to_owned(), false),
+            McpStatus::Connecting => ("Connecting…".to_owned(), false),
+            McpStatus::Ready if server.tools.is_empty() => ("Connected · no tools".to_owned(), false),
+            McpStatus::Ready => {
+                let count = server.tools.len();
+                let shown = if open { "hide" } else { "show" };
+                // Some servers need it for every call, others only for more.
+                let sign_in = if server.takes_sign_in && !server.signed_in { " · sign-in available" } else { "" };
+                (format!("{count} tool{}{sign_in} · {shown}", if count == 1 { "" } else { "s" }), false)
+            }
+            McpStatus::NeedsSignIn(None) => ("Sign in to use this server.".to_owned(), false),
+            McpStatus::NeedsSignIn(Some(e)) | McpStatus::Failed(e) => (e.clone(), true),
+            McpStatus::SigningIn => ("Finish signing in in your browser…".to_owned(), false),
+        };
+        // Controls, right to left: the switch, Remove, then the state's own button.
+        let header_y = area.y + 14.0;
+        let mut right = x + width - 16.0;
+        let toggle = Rect::new(right - 34.0, header_y + 1.0, 34.0, 20.0);
+        right = toggle.x - 12.0;
+        let confirming = self.confirm_remove.as_deref() == Some(&server.name);
+        let remove = Rect::new(right - if confirming { 84.0 } else { 76.0 }, header_y - 4.0, if confirming { 84.0 } else { 76.0 }, 28.0);
+        right = remove.x - 8.0;
+        let state_button = match (&server.status, server.web) {
+            (McpStatus::SigningIn, _) => Some(("Cancel", ButtonStyle::Secondary, McpAction::CancelSignIn(server.name.clone()))),
+            (McpStatus::NeedsSignIn(_), true) => Some(("Sign in", ButtonStyle::Primary, McpAction::SignIn(server.name.clone()))),
+            (McpStatus::Ready, true) if server.takes_sign_in && !server.signed_in => Some(("Sign in", ButtonStyle::Primary, McpAction::SignIn(server.name.clone()))),
+            (McpStatus::Failed(_), _) => Some(("Retry", ButtonStyle::Secondary, McpAction::Reconnect(server.name.clone()))),
+            (_, true) if server.signed_in && server.enabled => Some(("Sign out", ButtonStyle::Ghost, McpAction::SignOut(server.name.clone()))),
+            _ => None,
+        };
+        let state_rect = state_button.as_ref().map(|(label, ..)| {
+            let w = p.layout(label, theme::LABEL, None).width() + 28.0;
+            Rect::new(right - w, header_y - 4.0, w, 28.0)
+        });
+        if let Some(rect) = state_rect {
+            right = rect.x - 8.0;
+        }
+
+        // Text: name and version, the command or URL, the status.
+        let text_w = right - x - 32.0;
+        let status_layout = p.layout(&status, theme::SMALL, error.then_some(width - 48.0));
+        let mut height = 14.0 + 20.0 + 4.0 + 18.0 + 6.0 + status_layout.height() + 14.0;
+        let tool_rows = if open { server.tools.len() + server.warnings.len() } else { 0 };
+        if open {
+            height += 8.0 + tool_rows as f32 * TOOL_ROW + 8.0;
+        }
+        let card = Rect::new(x, area.y, width, height);
+        let hovered = ui.hovered(card);
+        p.bordered(card, t.surface, theme::RADIUS, 1.0, if hovered { t.border_strong } else { t.border });
+        let dot = match &server.status {
+            McpStatus::Ready => t.added,
+            McpStatus::Failed(_) => t.danger,
+            McpStatus::NeedsSignIn(_) | McpStatus::SigningIn => t.accent,
+            McpStatus::Connecting => fade(t.text_muted, 0.4 + 0.6 * ((ui.time * 4.0).sin() * 0.5 + 0.5)),
+            McpStatus::Off => t.border_strong,
+        };
+        if server.status == McpStatus::Connecting || server.status == McpStatus::SigningIn {
+            ui.animating = true;
+        }
+        p.rect(Rect::new(x + 16.0, header_y + 6.0, 8.0, 8.0), dot, 4.0);
+        let mut name = p.layout(&server.name, theme::LABEL, None);
+        name.truncate(p.fonts, text_w - 80.0);
+        p.text(&name, x + 32.0, header_y + (20.0 - name.height()) * 0.5, t.text);
+        if !server.version.is_empty() && server.status == McpStatus::Ready {
+            let version = p.layout(&format!("MCP {}", server.version), theme::TINY, None);
+            p.text(&version, x + 40.0 + name.width(), header_y + (20.0 - version.height()) * 0.5, t.text_faint);
+        }
+        let mut target = p.layout(&server.target, Style::mono(12.0), None);
+        target.truncate(p.fonts, width - 48.0);
+        p.text(&target, x + 32.0, header_y + 24.0, t.text_muted);
+        let status_y = header_y + 24.0 + 18.0 + 6.0;
+        p.text(&status_layout, x + 32.0, status_y, if error { t.danger } else { t.text_faint });
+
+        // The tools, when opened.
+        if open {
+            let list_y = status_y + status_layout.height() + 14.0;
+            p.rect(Rect::new(x + 1.0, list_y, width - 2.0, 1.0), t.border, 0.0);
+            let mut row_y = list_y + 8.0;
+            for (tool, description) in &server.tools {
+                let mut name = p.layout(tool, Style::mono(12.0), None);
+                name.truncate(p.fonts, width * 0.4);
+                p.text(&name, x + 32.0, row_y + (TOOL_ROW - name.height()) * 0.5, t.text);
+                let mut text = p.layout(description, theme::SMALL, None);
+                text.truncate(p.fonts, (width - 64.0 - name.width() - 16.0).max(0.0));
+                p.text(&text, x + 48.0 + name.width(), row_y + (TOOL_ROW - text.height()) * 0.5, t.text_faint);
+                row_y += TOOL_ROW;
+            }
+            for warning in &server.warnings {
+                let mut text = p.layout(warning, theme::SMALL, None);
+                text.truncate(p.fonts, width - 64.0);
+                p.text(&text, x + 32.0, row_y + (TOOL_ROW - text.height()) * 0.5, t.danger);
+                row_y += TOOL_ROW;
+            }
+        }
+
+        // Controls.
+        let mut on_control = false;
+        if switch(p, ui, toggle, server.enabled, id(("mcp-switch", &server.name))) {
+            actions.push(Action::Mcp(McpAction::Enable(server.name.clone(), !server.enabled)));
+        }
+        on_control |= ui.hovered(toggle);
+        let (label, style) = if confirming { ("Confirm", ButtonStyle::Danger) } else { ("Remove", ButtonStyle::Ghost) };
+        if button(p, ui, remove, label, style, true) {
+            if confirming {
+                self.confirm_remove = None;
+                actions.push(Action::Mcp(McpAction::Remove(server.name.clone())));
+            } else {
+                self.confirm_remove = Some(server.name.clone());
+            }
+        }
+        on_control |= ui.hovered(remove);
+        if let (Some((label, style, action)), Some(rect)) = (state_button, state_rect) {
+            if button(p, ui, rect, label, style, true) {
+                actions.push(Action::Mcp(action));
+            }
+            on_control |= ui.hovered(rect);
+        }
+        // The card itself opens and closes the tool list.
+        let expandable = !server.tools.is_empty() || !server.warnings.is_empty();
+        if hovered && !on_control && expandable {
+            ui.cursor = CursorIcon::Pointer;
+            if ui.clicked(card) && !self.open_servers.remove(&server.name) {
+                self.open_servers.insert(server.name.clone());
+            }
+        }
+        (card.bottom(), hovered)
+    }
+
+    /// The updates section. Returns where it ends.
+    fn draw_updates(&self, p: &mut Painter, ui: &mut Ui, x: f32, y: f32, width: f32, actions: &mut Vec<Action>) -> f32 {
+        let mut y = section(p, x, y, "Updates", "New versions come from the project's GitHub releases.");
+        let status = self.update.clone().unwrap_or(UpdateStatus::Idle);
+        let text = match &status {
+            UpdateStatus::Disabled(why) => why.clone(),
+            UpdateStatus::Idle => "Checks for updates shortly after starting.".to_owned(),
+            UpdateStatus::Checking => "Checking for updates…".to_owned(),
+            UpdateStatus::UpToDate => "You have the latest version.".to_owned(),
+            UpdateStatus::Available { version, note: None, .. } => format!("Version {version} is available."),
+            UpdateStatus::Available { version, note: Some(note), .. } => format!("Version {version} is available. {note}"),
+            UpdateStatus::Installing(version) => format!("Downloading version {version}…"),
+            UpdateStatus::Ready(version) => format!("Version {version} is installed. Restart to use it."),
+            UpdateStatus::Failed(e) => e.clone(),
+        };
+        let (label, style, enabled, action) = match &status {
+            UpdateStatus::Disabled(_) => ("Check now", ButtonStyle::Secondary, false, None),
+            UpdateStatus::Checking => ("Checking…", ButtonStyle::Secondary, false, None),
+            UpdateStatus::Installing(_) => ("Installing…", ButtonStyle::Secondary, false, None),
+            UpdateStatus::Available { note: None, .. } => ("Install", ButtonStyle::Primary, true, Some(Action::InstallUpdate)),
+            UpdateStatus::Available { url, .. } => ("Download", ButtonStyle::Secondary, true, Some(Action::OpenLink(url.clone()))),
+            UpdateStatus::Ready(_) => ("Restart", ButtonStyle::Primary, true, Some(Action::RestartToUpdate)),
+            UpdateStatus::Idle | UpdateStatus::UpToDate | UpdateStatus::Failed(_) => ("Check now", ButtonStyle::Secondary, true, Some(Action::CheckForUpdates)),
+        };
+        let row = group(p, x, y, width);
+        setting_row(p, row, concat!("SereChat Desktop ", env!("CARGO_PKG_VERSION")), &text, 116.0);
+        if button(p, ui, control(row, 116.0), label, style, enabled)
+            && let Some(action) = action
+        {
+            actions.push(action);
+        }
+        y += ROW_H + 10.0;
+        let row = group(p, x, y, width);
+        setting_row(p, row, "Install updates automatically", "Download new versions in the background; they start with the next launch.", 44.0);
+        let toggle = Rect::new(row.right() - 16.0 - 34.0, row.y + (row.h - 20.0) * 0.5, 34.0, 20.0);
+        if switch(p, ui, toggle, self.auto_update, id("auto-update")) {
+            actions.push(Action::SetAutoUpdate(!self.auto_update));
+        }
+        y += ROW_H;
+        y
+    }
 }
 
 /// The tab strip in the header, starting at `x`; the open tab is underlined
@@ -236,7 +690,7 @@ fn tabs(p: &mut Painter, ui: &mut Ui, mut x: f32, bar: Rect, open: Tab) -> Optio
             p.rect(Rect::new(cell.x + 8.0, cell.bottom() - 2.0, cell.w - 16.0, 2.0), t.accent, 1.0);
         }
         if hovered {
-            ui.cursor = winit::window::CursorIcon::Pointer;
+            ui.cursor = CursorIcon::Pointer;
             if ui.clicked(cell) {
                 clicked = Some(tab);
             }
@@ -262,11 +716,14 @@ fn group(p: &mut Painter, x: f32, y: f32, width: f32) -> Rect {
     rect
 }
 
-/// Title and description on the left of a settings row.
-fn setting_row(p: &mut Painter, row: Rect, title: &str, description: &str) {
+/// Title and description on the left of a settings row, leaving `reserved`
+/// pixels on the right for its control.
+fn setting_row(p: &mut Painter, row: Rect, title: &str, description: &str, reserved: f32) {
     let t = p.theme;
     p.label(title, theme::LABEL, row.x + 16.0, row.y + 15.0, t.text);
-    p.label(description, theme::SMALL, row.x + 16.0, row.y + 36.0, t.text_muted);
+    let mut text = p.layout(description, theme::SMALL, None);
+    text.truncate(p.fonts, row.w - 48.0 - reserved);
+    p.text(&text, row.x + 16.0, row.y + 36.0, t.text_muted);
 }
 
 /// A control of `width` right-aligned in `row`.
@@ -294,7 +751,7 @@ fn segmented(p: &mut Painter, ui: &mut Ui, rect: Rect, labels: &[&str], selected
         let color = if i == selected { t.text } else { mix(t.text_muted, t.text, hover) };
         p.label_centered(label, theme::LABEL, cell, color);
         if hovered {
-            ui.cursor = winit::window::CursorIcon::Pointer;
+            ui.cursor = CursorIcon::Pointer;
             if ui.clicked(cell) {
                 clicked = Some(i);
             }
@@ -314,18 +771,23 @@ fn theme_card(p: &mut Painter, ui: &mut Ui, card: Rect, preview_h: f32, scheme: 
 
     // Radio button and name.
     let label_y = card.y + preview_h + 16.0;
-    let radio = Rect::new(card.x + 12.0, label_y + 7.0, 14.0, 14.0);
-    p.bordered(radio, [0.0; 4], 7.0, 1.5, if selected { t.accent } else { t.border_strong });
-    if selected {
-        p.rect(Rect::new(radio.x + 4.0, radio.y + 4.0, 6.0, 6.0), t.accent, 3.0);
-    }
+    radio(p, Rect::new(card.x + 12.0, label_y + 7.0, 14.0, 14.0), selected);
     let name = p.layout(scheme.label(), theme::LABEL, None);
     p.text(&name, card.x + 34.0, label_y + (28.0 - name.height()) * 0.5, t.text);
 
     if hovered {
-        ui.cursor = winit::window::CursorIcon::Pointer;
+        ui.cursor = CursorIcon::Pointer;
     }
     ui.clicked(card)
+}
+
+/// A 14px radio button, filled in the accent when `selected`.
+fn radio(p: &mut Painter, rect: Rect, selected: bool) {
+    let t = p.theme;
+    p.bordered(rect, [0.0; 4], 7.0, 1.5, if selected { t.accent } else { t.border_strong });
+    if selected {
+        p.rect(Rect::new(rect.x + 4.0, rect.y + 4.0, 6.0, 6.0), t.accent, 3.0);
+    }
 }
 
 /// A miniature of the app drawn in `c`'s colours.

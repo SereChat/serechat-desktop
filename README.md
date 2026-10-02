@@ -42,8 +42,8 @@ cargo clippy --workspace --all-targets
 - **Background processes**: the agent can start a dev server or watcher (with your approval),
   read its output later and stop it. Stopping ends the whole process tree; everything still
   running stops when its chat is deleted or the app exits.
-- **Browser**: in a project, the agent can drive a browser to open pages, click and
-  type. It uses your installed Chrome, Edge, Brave or Chromium in a window of its own,
+- **Browser**: in every chat, project or not, the agent can drive a browser to open pages,
+  click and type (fetching a URL works everywhere too; files and commands need a project). It uses your installed Chrome, Brave, Helium, Edge or Chromium (Auto, or the one picked in Settings) in a window of its own,
   with a fresh throwaway profile, so none of your logins are involved. Each chat gets a
   tab. Pages reach the model as text outlines with numbered links, buttons and fields.
   Opening a page, clicking and typing need your approval; reading the page and taking
@@ -57,7 +57,23 @@ cargo clippy --workspace --all-targets
   Skills are found at startup and when a folder is picked, and looked at again when the
   window regains focus or the agent changes files, so edits apply without a restart.
   Settings lists the skills the open chat can use, and any problems reading them.
+- **MCP servers**: tools from [Model Context Protocol](https://modelcontextprotocol.io) servers
+  work in every chat, project or not, as `mcp__<server>__<tool>`. Add servers in Settings → MCP
+  (a command such as `npx -y @modelcontextprotocol/server-memory`, or a URL), import the
+  `mcpServers` JSON from a server's README straight from the clipboard, or edit
+  `~/.serechat/mcp.json`, which takes the same shape as Claude's, Cursor's or VS Code's. The
+  app speaks the current stateless protocol (2026-07-28) and the handshake-based ones before it,
+  over stdio, Streamable HTTP and the old HTTP+SSE transport. Servers on the web that need an
+  account sign in through the browser (OAuth 2.1 with PKCE, discovery and dynamic client
+  registration); tokens refresh by themselves. Tools a server marks read-only run at once; the
+  rest ask first, like the agent's own. Images they return reach the model.
 - **Reasoning**: the effort picker offers the levels the selected model supports.
+- **Find in chat** (Ctrl/Cmd+F): highlights every match in the open chat; Enter and Shift+Enter
+  (or F3) step through them.
+- **Updates**: the app checks GitHub releases at startup and every six hours, downloads the
+  new version in the background (its size and SHA-256 checked), and runs it from the next start,
+  or at once with "Restart to update". Settings can turn installing off. Development builds and
+  copies in a build folder never update themselves.
 - **Spotlight** (Ctrl/Cmd+K): one search over commands, projects, sessions, models, themes
   and the full text of every saved message.
 - **Slash commands** in the composer, completed as you type (Tab completes, Enter runs, Esc
@@ -71,8 +87,8 @@ cargo clippy --workspace --all-targets
   generation still running when the app closes is picked up when its chat is opened again.
 - **Emoji and CJK**: colour emoji (Twemoji), and Chinese, Japanese and Korean text through the
   operating system's fonts, with input-method (IME) support for typing them.
-- **Settings**, in tabs: Appearance (Dark, One Dark and Light schemes, reasoning display), Skills,
-  Usage totals, and Account (data folder, sign out).
+- **Settings**, in tabs: General (Dark, One Dark and Light schemes, reasoning display, the agent's browser), Skills,
+  MCP servers, Usage totals, and Account (updates, data folder, sign out).
 
 ## Layout
 
@@ -98,7 +114,12 @@ cargo clippy --workspace --all-targets
   selection, links and incremental rebuilds while a reply streams. `highlight.rs` colours code.
 - `paint.rs`, `ui.rs`, `editor.rs`: drawing API, widgets and input state, text editing.
 - `chat/`: the main screen (sidebar, composer, messages, menus); `chat/agent.rs` is the agent
-  loop (tool rounds, retries, context compaction, Continue).
+  loop (tool rounds, retries, context compaction, Continue); `chat/find.rs` the find bar.
+- `mcp/`: MCP servers. `transport.rs` speaks JSON-RPC over stdio, Streamable HTTP and HTTP+SSE
+  in both protocol eras, `oauth.rs` signs in, `config.rs` reads `mcp.json`, and `mod.rs` keeps
+  the connections and offers their tools.
+- `update.rs`: checks GitHub releases and swaps in new versions; `sha256.rs` for PKCE and
+  checking downloads.
 - `spotlight.rs`, `settings.rs`, `login.rs`: the other surfaces.
 - `process.rs`: background processes the agent starts, reads and stops.
 - `browser.rs`, `browser.js`, `websocket.rs`: the agent's browser, driven over the
@@ -135,6 +156,12 @@ approval page, and the user types the 6-digit code into the app. Everything live
 - `attachments/`: the app's copies of attached files, and generated files (deleted with their
   session).
 - `projects.json`: project folders.
+- `mcp.json`: MCP servers, in the `mcpServers` shape other clients use. Strings may name
+  environment variables as `${NAME}` or `${NAME:-default}`, so secrets can stay out of the file.
+  A server can carry `"oauth": { "clientId": …, "clientSecret": …, "scope": …, "callbackPort": … }`
+  for providers that need a pre-registered OAuth client. Edits made elsewhere apply when the
+  window regains focus.
+- `mcp-auth.json`: MCP sign-in tokens, and the OAuth clients registered per authorization server.
 
 On Unix these files have mode `0600`, and they are written atomically. Signing out (or a `401`
 from the API) removes the token but keeps sessions.
@@ -146,6 +173,12 @@ from the API) removes the token but keeps sessions.
 - Native file and folder pickers run the platform's helper (PowerShell, `osascript`,
   `zenity`/`kdialog`), so they take a moment to appear.
 - Release builds are unsigned (the macOS `.app` is ad-hoc signed only) and there are no installers.
+  A copy installed where it can't write (system-wide) only says an update is available.
+- MCP: resources and prompts are not offered, only tools; a modern server's change
+  notifications (`subscriptions/listen`) are not subscribed to, so its tool list refreshes on
+  reconnect. Servers that need sampling, elicitation or roots get "not supported". OAuth uses
+  dynamic client registration; Client ID Metadata Documents need an HTTPS page describing this
+  app, which `serechat.com` would have to host.
 
 ## Fonts
 

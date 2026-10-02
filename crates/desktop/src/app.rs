@@ -27,10 +27,12 @@ use crate::diff::{self, Diff};
 use crate::gpu::{GpuError, Instance, Renderer};
 use crate::image::{self, ImageAtlas, ImageKey};
 use crate::login::Login;
+use crate::mcp::{self, ServerConfig};
 use crate::paint::{Painter, Rect};
 use crate::text::{Fonts, GlyphAtlas};
 use crate::theme::{Palette, Scheme};
-use crate::ui::{Ui, copy};
+use crate::ui::{Ui, copy, paste};
+use crate::update::{self, Updater};
 use crate::{attachments, platform, skills, tools};
 
 /// Length of the cross-fade when the colour scheme changes.
@@ -136,6 +138,38 @@ pub enum WorkerEvent {
         /// What it found.
         catalog: Arc<skills::Catalog>,
     },
+    /// An MCP server connected, failed, or changed its tools.
+    Mcp,
+    /// MCP sign-in tokens changed; the new `mcp-auth.json`.
+    McpAuth(String),
+    /// `mcp.json` was read again (it may have been edited by hand).
+    McpConfig(Result<Vec<ServerConfig>, String>),
+    /// The updater's status changed.
+    Update(update::Status),
+    /// The browsers the agent can drive were looked up.
+    Browsers(Vec<crate::browser::Installed>),
+}
+
+/// A change to the MCP servers, asked for in settings.
+pub enum McpAction {
+    /// Add a server.
+    Add(Box<ServerConfig>),
+    /// Add the servers on the clipboard.
+    Import,
+    /// Remove a server by name.
+    Remove(String),
+    /// Turn a server on or off.
+    Enable(String, bool),
+    /// Sign in to a server in the browser.
+    SignIn(String),
+    /// Stop waiting for a sign-in.
+    CancelSignIn(String),
+    /// Forget a server's tokens.
+    SignOut(String),
+    /// Connect to a server again.
+    Reconnect(String),
+    /// Open `mcp.json` in the default editor.
+    OpenFile,
 }
 
 /// Something a screen wants done that needs app-level resources.
@@ -226,6 +260,18 @@ pub enum Action {
     Attention,
     /// Forget the token and return to sign-in.
     SignOut,
+    /// Change the MCP servers.
+    Mcp(McpAction),
+    /// Check for an update now.
+    CheckForUpdates,
+    /// Install the available update now.
+    InstallUpdate,
+    /// Quit and start the installed update.
+    RestartToUpdate,
+    /// Turn automatic updates on or off.
+    SetAutoUpdate(bool),
+    /// Persist the browser the agent drives (`None`: Auto).
+    SetBrowser(Option<String>),
 }
 
 /// Failure to start the app.
@@ -294,6 +340,16 @@ pub struct App {
     cursor: CursorIcon,
     /// Input-method candidate area last sent to the window.
     ime_area: Option<Rect>,
+    /// The MCP servers as configured in `mcp.json`.
+    mcp_servers: Vec<ServerConfig>,
+    /// The latest MCP message for settings: text and whether it is an error.
+    mcp_note: Option<(String, bool)>,
+    /// Checks for and installs updates.
+    updater: Updater,
+    /// What the updater last said.
+    update_status: update::Status,
+    /// Quit and start the updated copy.
+    restart: bool,
 }
 
 impl App {
@@ -336,6 +392,29 @@ impl App {
             .ok()
             .map(|store| store.dir().to_owned());
         let projects = Projects::load().inspect_err(|e| eprintln!("serechat: cannot read projects: {e}")).ok();
+        let (mcp_servers, mcp_note) = match read_mcp_config() {
+            Ok(servers) => (servers, None),
+            Err(e) => (Vec::new(), Some((e, true))),
+        };
+        if let Some(text) = mcp::config::auth_path().ok().and_then(|path| std::fs::read_to_string(path).ok()) {
+            mcp::load_auth(&text);
+        }
+        let listener = std::sync::Mutex::new(proxy.clone());
+        mcp::set_listener(move |event| {
+            let event = match event {
+                mcp::Event::Changed => WorkerEvent::Mcp,
+                mcp::Event::AuthChanged(text) => WorkerEvent::McpAuth(text),
+            };
+            // Fails only if the event loop is gone, i.e. the app is exiting.
+            let _ = listener.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send_event(event);
+        });
+        mcp::configure(&mcp_servers);
+        crate::browser::set_choice(config.browser.clone());
+        let auto_update = config.auto_update.as_deref() != Some("off");
+        let update_proxy = proxy.clone();
+        let updater = Updater::start(Client::new(None), auto_update, move |status| {
+            let _ = update_proxy.send_event(WorkerEvent::Update(status));
+        });
         let now = Instant::now();
         let mut app = Self {
             window,
@@ -361,6 +440,11 @@ impl App {
             shown: false,
             cursor: CursorIcon::Default,
             ime_area: None,
+            mcp_servers,
+            mcp_note,
+            updater,
+            update_status: update::Status::Idle,
+            restart: false,
         };
         app.ui.focused = true;
         if app.config.token.is_some() {
@@ -387,11 +471,14 @@ impl App {
         // Skills are known before the first message: the user's and the open project's.
         let mut actions = Vec::new();
         chat.refresh_skills(true, &mut actions);
+        chat.set_mcp(mcp::views(), self.mcp_note.clone());
+        chat.set_update(self.update_status.clone(), self.auto_update());
         self.screen = Screen::Chat(Box::new(chat));
         self.spawn(|client, _| WorkerEvent::Models(client.models()));
         for kind in MediaKind::ALL {
             self.spawn(move |client, _| WorkerEvent::MediaModels(kind, client.media_models(kind)));
         }
+        self.spawn(|_, _| WorkerEvent::Browsers(crate::browser::installed()));
         self.apply(actions);
     }
 
@@ -457,9 +544,14 @@ impl App {
             WindowEvent::Resized(size) => self.renderer.resize(size.width, size.height),
             WindowEvent::Focused(focused) => {
                 self.ui.focused = focused;
-                // Skills or AGENTS.md may have been edited in another app.
+                // Skills, AGENTS.md or mcp.json may have been edited, or a
+                // browser installed, in another app.
                 if let (true, Screen::Chat(chat)) = (focused, &mut self.screen) {
                     chat.refresh_skills(false, &mut actions);
+                    self.spawn(|_, _| WorkerEvent::Browsers(crate::browser::installed()));
+                }
+                if focused {
+                    self.writer.send(Job::ReloadMcp(self.proxy.clone()));
                 }
             }
             WindowEvent::ModifiersChanged(mods) => self.ui.mods = mods.state(),
@@ -528,6 +620,34 @@ impl App {
         let mut actions = Vec::new();
         match (event, &mut self.screen) {
             (WorkerEvent::Thumbnail(key, pixels), _) => self.images.insert(key, pixels),
+            (WorkerEvent::Mcp, Screen::Chat(chat)) => chat.set_mcp(mcp::views(), self.mcp_note.clone()),
+            (WorkerEvent::McpAuth(text), _) => {
+                if let Ok(path) = mcp::config::auth_path() {
+                    self.writer.send(Job::WritePrivate(path, text));
+                }
+                return;
+            }
+            (WorkerEvent::McpConfig(result), _) => {
+                match result {
+                    Ok(servers) if servers == self.mcp_servers && self.mcp_note.as_ref().is_none_or(|(_, error)| !error) => return,
+                    Ok(servers) => {
+                        self.mcp_servers = servers;
+                        self.mcp_note = None;
+                        mcp::configure(&self.mcp_servers);
+                    }
+                    Err(e) => self.mcp_note = Some((e, true)),
+                }
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.set_mcp(mcp::views(), self.mcp_note.clone());
+                }
+            }
+            (WorkerEvent::Update(status), _) => {
+                self.update_status = status;
+                let auto = self.auto_update();
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.set_update(self.update_status.clone(), auto);
+                }
+            }
             (WorkerEvent::AuthRequested(result), Screen::Login(login)) => {
                 if let Some(request_id) = login.requested(result) {
                     self.open_auth_page(&request_id);
@@ -568,6 +688,7 @@ impl App {
             (WorkerEvent::FolderPicked(Some(path)), Screen::Chat(_)) => actions.push(Action::OpenProject(Some(path))),
             (WorkerEvent::SearchResults { generation, hits }, Screen::Chat(chat)) => chat.search_results(generation, hits),
             (WorkerEvent::Skills { project, generation, catalog }, Screen::Chat(chat)) => chat.skills_scanned(project, generation, catalog),
+            (WorkerEvent::Browsers(found), Screen::Chat(chat)) => chat.set_browsers(found, self.config.browser.clone()),
             // Results for a screen that is no longer shown.
             _ => return,
         }
@@ -608,16 +729,18 @@ impl App {
                         };
                         let (list, _) = skills::merge(project.as_deref(), Some(&user));
                         let agents_md = project.as_ref().and_then(|c| c.agents_md.as_deref());
-                        let instructions = format!("{}{}", job.instructions, skills::prompt(agents_md, &list));
+                        let instructions = format!("{}{}{}", job.instructions, skills::prompt(agents_md, &list), mcp::instructions());
                         let skill_tool = skills::tool(&list);
+                        let mcp_tools = mcp::tools();
                         let mut specs: Vec<ToolSpec<'_>> = Vec::new();
-                        if job.tools {
-                            specs.extend(tools::all().iter().map(|t| ToolSpec { name: t.name, description: &t.description, parameters: &t.parameters }));
-                        }
-                        // Skills work in every chat, with or without a project.
+                        // Without a project, only the tools that need none.
+                        let offered = tools::all().iter().filter(|t| job.tools || tools::works_without_project(t.name));
+                        specs.extend(offered.map(|t| ToolSpec { name: t.name, description: &t.description, parameters: &t.parameters }));
+                        // Skills and MCP tools work in every chat, with or without a project.
                         if let Some((description, parameters)) = &skill_tool {
                             specs.push(ToolSpec { name: "use_skill", description, parameters });
                         }
+                        specs.extend(mcp_tools.iter().map(|t| ToolSpec { name: &t.name, description: &t.description, parameters: &t.parameters }));
                         let request = ResponseRequest {
                             model: &job.model,
                             instructions: Some(&instructions),
@@ -638,18 +761,18 @@ impl App {
                 self.spawn(move |client, proxy| {
                     // A file change is diffed against the file as it was just before.
                     let change = job.root.as_deref().filter(|_| tools::changes_file(&job.call.name)).and_then(|root| tools::file_change(root, &job.call));
-                    let result = match &job.root {
-                        _ if job.call.name == "use_skill" => skills::run(&job.skills, &job.call.arguments).map(tools::Output::text),
-                        Some(root) => tools::run(root, job.conversation, client, &job.call, &job.cancel),
-                        None => Err("Tools are only available in a project.".to_owned()),
+                    let result = match job.call.name.as_str() {
+                        "use_skill" => skills::run(&job.skills, &job.call.arguments).map(tools::Output::text),
+                        name if mcp::is_mcp(name) => mcp::call(name, &job.call.arguments, &job.cancel),
+                        _ => tools::run(job.root.as_deref(), job.conversation, client, &job.call, &job.cancel),
                     };
                     if let (Ok(_), Some((before, after, whole))) = (&result, change) {
                         let diff = Arc::new(diff::diff(&before, &after, whole));
                         let _ = proxy.send_event(WorkerEvent::DiffReady { conversation: job.conversation, call_id: job.call.call_id.clone(), diff });
                     }
-                    // A screenshot is kept with the session's attachments.
+                    // An image is kept with the session's attachments.
                     let (result, image) = match result {
-                        Ok(tools::Output { text, image: Some(jpeg) }) => match attachments::save_screenshot(&jpeg, &dir) {
+                        Ok(tools::Output { text, image: Some((mime, bytes)) }) => match attachments::save_tool_image(&mime, &bytes, &dir) {
                             Ok(image) => (Ok(text), Some(image)),
                             Err(e) => (Err(e), None),
                         },
@@ -788,6 +911,110 @@ impl App {
             Action::Attention if !self.ui.focused => self.window.request_user_attention(Some(UserAttentionType::Informational)),
             Action::Attention => {}
             Action::SignOut => self.sign_out(None),
+            Action::Mcp(action) => self.mcp_action(action),
+            Action::CheckForUpdates => self.updater.check(),
+            Action::InstallUpdate => self.updater.install(),
+            Action::RestartToUpdate => self.restart = true,
+            Action::SetAutoUpdate(on) => {
+                self.config.auto_update = (!on).then(|| "off".to_owned());
+                self.save_config();
+                self.updater.set_auto(on);
+                if on && matches!(self.update_status, update::Status::Available { note: None, .. }) {
+                    self.updater.install();
+                }
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.set_update(self.update_status.clone(), on);
+                }
+            }
+            Action::SetBrowser(key) => {
+                crate::browser::set_choice(key.clone());
+                self.config.browser = key;
+                self.save_config();
+            }
+        }
+    }
+
+    /// Whether updates install themselves.
+    fn auto_update(&self) -> bool {
+        self.config.auto_update.as_deref() != Some("off")
+    }
+
+    /// Whether the user asked to restart into an installed update.
+    #[must_use]
+    pub fn restart_requested(&self) -> bool {
+        self.restart
+    }
+
+    /// Applies a change to the MCP servers from settings.
+    fn mcp_action(&mut self, action: McpAction) {
+        let mut changed = true;
+        self.mcp_note = None;
+        match action {
+            McpAction::Add(server) => {
+                self.mcp_servers.retain(|s| s.name != server.name);
+                self.mcp_servers.push(*server);
+            }
+            McpAction::Import => match paste(&mut self.clipboard).ok_or_else(|| "The clipboard holds no text.".to_owned()).and_then(|text| mcp::config::import(&text)) {
+                Ok(servers) => {
+                    let names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+                    for server in servers {
+                        self.mcp_servers.retain(|s| s.name != server.name);
+                        self.mcp_servers.push(server);
+                    }
+                    let noun = if names.len() == 1 { "server" } else { "servers" };
+                    self.mcp_note = Some((format!("Imported {} {noun}: {}.", names.len(), names.join(", ")), false));
+                }
+                Err(e) => {
+                    self.mcp_note = Some((e, true));
+                    changed = false;
+                }
+            },
+            McpAction::Remove(name) => self.mcp_servers.retain(|s| s.name != name),
+            McpAction::Enable(name, on) => {
+                if let Some(server) = self.mcp_servers.iter_mut().find(|s| s.name == name) {
+                    server.enabled = on;
+                }
+            }
+            McpAction::SignIn(name) => {
+                changed = false;
+                // Waits for the browser, so on a thread of its own; its
+                // progress shows through the server's status.
+                std::mem::drop(std::thread::Builder::new().name("serechat-mcp-sign-in".into()).spawn(move || {
+                    let _ = mcp::sign_in(&name);
+                }));
+            }
+            McpAction::CancelSignIn(name) => {
+                changed = false;
+                mcp::cancel_sign_in(&name);
+            }
+            McpAction::SignOut(name) => {
+                changed = false;
+                mcp::sign_out(&name);
+            }
+            McpAction::Reconnect(name) => {
+                changed = false;
+                mcp::reconnect(&name);
+            }
+            McpAction::OpenFile => {
+                changed = false;
+                if let Ok(path) = mcp::config::config_path() {
+                    // A missing file is created first, so there is something to open.
+                    if !path.exists() {
+                        self.writer.send(Job::WritePrivate(path.clone(), mcp::config::serialize(&self.mcp_servers)));
+                    }
+                    self.writer.send(Job::Open(path));
+                }
+            }
+        }
+        if changed {
+            self.mcp_servers.sort_by(|a, b| a.name.cmp(&b.name));
+            if let Ok(path) = mcp::config::config_path() {
+                self.writer.send(Job::WritePrivate(path, mcp::config::serialize(&self.mcp_servers)));
+            }
+            mcp::configure(&self.mcp_servers);
+        }
+        if let Screen::Chat(chat) = &mut self.screen {
+            chat.set_mcp(mcp::views(), self.mcp_note.clone());
         }
     }
 
@@ -929,6 +1156,12 @@ enum Job {
     SaveProjects(Projects),
     /// List the saved sessions and send them back.
     ListSessions(mpsc::Sender<Vec<SessionSummary>>),
+    /// Write a file readable only by the user (`mcp.json`, `mcp-auth.json`).
+    WritePrivate(PathBuf, String),
+    /// Open a file in its default app, once the writes before it are done.
+    Open(PathBuf),
+    /// Read `mcp.json` (after the writes before it) and post it back.
+    ReloadMcp(EventLoopProxy<WorkerEvent>),
 }
 
 impl Job {
@@ -940,6 +1173,12 @@ impl Job {
             (Self::SaveSession(_) | Self::DeleteSession(_), None) => Ok(()),
             (Self::SaveConfig(config), _) => config.save().map_err(|e| ("save the config", e)),
             (Self::SaveProjects(projects), _) => projects.save().map_err(|e| ("save the projects", e)),
+            (Self::WritePrivate(path, text), _) => serechat::write_private(&path, text.as_bytes()).map_err(|e| ("save MCP settings", e)),
+            (Self::Open(path), _) => platform::open_folder(&path).map_err(|e| ("open the file", Error::Io(e))),
+            (Self::ReloadMcp(proxy), _) => {
+                let _ = proxy.send_event(WorkerEvent::McpConfig(read_mcp_config()));
+                Ok(())
+            }
             (Self::ListSessions(reply), store) => {
                 let sessions = match store.map(SessionStore::list) {
                     Some(Ok((sessions, errors))) => {
@@ -1024,6 +1263,16 @@ impl Drop for Writer {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// The servers in `~/.serechat/mcp.json` (none if it does not exist).
+fn read_mcp_config() -> Result<Vec<ServerConfig>, String> {
+    let path = mcp::config::config_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => mcp::config::parse(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("mcp.json could not be read: {e}")),
     }
 }
 

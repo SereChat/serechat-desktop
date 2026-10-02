@@ -1,5 +1,5 @@
-//! The agent's browser: an installed Chrome, Edge, Brave or Chromium that
-//! the app starts with a fresh, throwaway profile (no saved logins, cookies
+//! The agent's browser: an installed Chrome-family browser (the one picked
+//! in Settings, or the first of [`KINDS`] found) that the app starts with a fresh, throwaway profile (no saved logins, cookies
 //! or history of the user's) and drives over its remote debugging protocol.
 //!
 //! One browser serves the whole app; each conversation gets a tab of its
@@ -41,6 +41,72 @@ const START_TIMEOUT: Duration = Duration::from_secs(20);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 
 static BROWSER: Mutex<Option<Browser>> = Mutex::new(None);
+/// Key of the browser picked in Settings; `None` for Auto.
+static CHOICE: Mutex<Option<String>> = Mutex::new(None);
+
+/// A supported browser and where it installs on each platform.
+struct Kind {
+    /// Stored in the config.
+    key: &'static str,
+    /// Shown in Settings.
+    name: &'static str,
+    /// Paths under `ProgramFiles`, `ProgramFiles(x86)` and `LOCALAPPDATA`.
+    windows: &'static str,
+    /// Path under `/Applications` and `~/Applications`.
+    macos: &'static str,
+    /// Commands on `PATH`.
+    linux: &'static [&'static str],
+}
+
+/// The supported browsers, in the order Auto prefers them.
+const KINDS: [Kind; 5] = [
+    Kind {
+        key: "chrome",
+        name: "Google Chrome",
+        windows: r"Google\Chrome\Application\chrome.exe",
+        macos: "Google Chrome.app/Contents/MacOS/Google Chrome",
+        linux: &["google-chrome", "google-chrome-stable"],
+    },
+    Kind {
+        key: "brave",
+        name: "Brave",
+        windows: r"BraveSoftware\Brave-Browser\Application\brave.exe",
+        macos: "Brave Browser.app/Contents/MacOS/Brave Browser",
+        linux: &["brave-browser", "brave"],
+    },
+    Kind {
+        key: "helium",
+        name: "Helium",
+        windows: r"imput\Helium\Application\chrome.exe",
+        macos: "Helium.app/Contents/MacOS/Helium",
+        linux: &["helium", "helium-browser"],
+    },
+    Kind {
+        key: "edge",
+        name: "Microsoft Edge",
+        windows: r"Microsoft\Edge\Application\msedge.exe",
+        macos: "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        linux: &["microsoft-edge", "microsoft-edge-stable"],
+    },
+    Kind {
+        key: "chromium",
+        name: "Chromium",
+        windows: r"Chromium\Application\chrome.exe",
+        macos: "Chromium.app/Contents/MacOS/Chromium",
+        linux: &["chromium", "chromium-browser"],
+    },
+];
+
+/// A supported browser found on this computer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Installed {
+    /// Stored in the config to pick it.
+    pub key: &'static str,
+    /// Its name, for Settings.
+    pub name: &'static str,
+    /// Its executable.
+    pub path: PathBuf,
+}
 
 fn browser() -> MutexGuard<'static, Option<Browser>> {
     BROWSER.lock().unwrap_or_else(PoisonError::into_inner)
@@ -60,6 +126,8 @@ struct Tab {
 /// The running browser. Dropping it quits the browser and deletes its profile.
 struct Browser {
     child: Child,
+    /// The executable it was started from.
+    program: PathBuf,
     /// Throwaway profile folder.
     profile: PathBuf,
     /// Debugging port on 127.0.0.1 and the browser's WebSocket path.
@@ -88,10 +156,7 @@ impl Drop for Browser {
 
 impl Browser {
     /// Starts an installed browser and waits until it takes debugging connections.
-    fn launch(cancel: &AtomicBool) -> Result<Self, String> {
-        let program = candidates().into_iter().find(|path| path.is_file()).ok_or(
-            "No supported browser was found. Install Google Chrome, Microsoft Edge, Brave or Chromium to let the agent browse.",
-        )?;
+    fn launch(program: PathBuf, cancel: &AtomicBool) -> Result<Self, String> {
         let profile = std::env::temp_dir().join(format!("serechat-browser-{}", std::process::id()));
         // Left by a browser this run started before.
         let _ = fs::remove_dir_all(&profile);
@@ -109,7 +174,7 @@ impl Browser {
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let child = command.spawn().map_err(|e| format!("{} could not start: {e}", program.display()))?;
         // From here on, dropping it cleans up.
-        let mut browser = Self { child, profile, port: 0, path: String::new(), socket: None, next_id: 0, tabs: Vec::new(), spare: None };
+        let mut browser = Self { child, program, profile, port: 0, path: String::new(), socket: None, next_id: 0, tabs: Vec::new(), spare: None };
         let started = Instant::now();
         loop {
             if let Some((port, path)) = fs::read_to_string(browser.profile.join("DevToolsActivePort")).ok().as_deref().and_then(parse_active_port) {
@@ -120,10 +185,10 @@ impl Browser {
                 return Err(STOPPED.into());
             }
             if !matches!(browser.child.try_wait(), Ok(None)) {
-                return Err(format!("{} closed as soon as it started.", program.display()));
+                return Err(format!("{} closed as soon as it started.", browser.program.display()));
             }
             if started.elapsed() > START_TIMEOUT {
-                return Err(format!("{} did not start in time.", program.display()));
+                return Err(format!("{} did not start in time.", browser.program.display()));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -313,14 +378,17 @@ fn pause(duration: Duration, cancel: &AtomicBool) -> Result<(), String> {
 /// Runs `act` on conversation `owner`'s tab, starting the browser and
 /// opening the tab first if needed.
 fn with_page<T>(owner: u64, cancel: &AtomicBool, act: impl FnOnce(&mut Page<'_>) -> Result<T, String>) -> Result<T, String> {
+    let program = chosen(installed(), choice().as_deref())
+        .ok_or("No supported browser was found. Install Google Chrome, Brave, Helium, Microsoft Edge or Chromium to let the agent browse.")?
+        .path;
     let mut guard = browser();
-    // The user closed the browser: start a new one.
-    if guard.as_mut().is_some_and(|browser| !browser.alive()) {
+    // The user closed the browser, or picked another in Settings: start anew.
+    if guard.as_mut().is_some_and(|browser| !browser.alive() || browser.program != program) {
         *guard = None;
     }
     let browser = match guard.take() {
         Some(browser) => guard.insert(browser),
-        None => guard.insert(Browser::launch(cancel)?),
+        None => guard.insert(Browser::launch(program, cancel)?),
     };
     let session = browser.attach(owner, cancel)?;
     act(&mut Page { browser, session, cancel })
@@ -458,39 +526,58 @@ pub fn shutdown() {
     drop(browser().take());
 }
 
-/// Where Chrome-family browsers are installed, most common first.
-fn candidates() -> Vec<PathBuf> {
-    let under = |roots: &[PathBuf], apps: &[&str]| -> Vec<PathBuf> { apps.iter().flat_map(|app| roots.iter().map(move |root| root.join(app))).collect() };
-    if cfg!(target_os = "windows") {
-        let roots: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"].into_iter().filter_map(std::env::var_os).map(PathBuf::from).collect();
-        under(
-            &roots,
-            &[
-                r"Google\Chrome\Application\chrome.exe",
-                r"Microsoft\Edge\Application\msedge.exe",
-                r"BraveSoftware\Brave-Browser\Application\brave.exe",
-                r"Chromium\Application\chrome.exe",
-            ],
-        )
+/// Picks the browser to use, from Settings (`key`; `None` for Auto).
+pub fn set_choice(key: Option<String>) {
+    *CHOICE.lock().unwrap_or_else(PoisonError::into_inner) = key;
+}
+
+fn choice() -> Option<String> {
+    CHOICE.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// The name of the browser stored as `key`, if it is a supported one.
+#[must_use]
+pub fn name(key: &str) -> Option<&'static str> {
+    KINDS.iter().find(|kind| kind.key == key).map(|kind| kind.name)
+}
+
+/// The browser to start: the one picked, or the first found for Auto or
+/// when the one picked is not installed.
+fn chosen(found: Vec<Installed>, key: Option<&str>) -> Option<Installed> {
+    let picked = found.iter().position(|browser| Some(browser.key) == key).unwrap_or(0);
+    found.into_iter().nth(picked)
+}
+
+/// The supported browsers installed, in the order Auto prefers them. Reads
+/// the disk, so never on the UI thread.
+#[must_use]
+pub fn installed() -> Vec<Installed> {
+    let roots: Vec<PathBuf> = if cfg!(target_os = "windows") {
+        ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"].into_iter().filter_map(std::env::var_os).map(PathBuf::from).collect()
     } else if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Applications"));
-        let roots: Vec<PathBuf> = [Some(PathBuf::from("/Applications")), home].into_iter().flatten().collect();
-        under(
-            &roots,
-            &[
-                "Google Chrome.app/Contents/MacOS/Google Chrome",
-                "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-                "Brave Browser.app/Contents/MacOS/Brave Browser",
-                "Chromium.app/Contents/MacOS/Chromium",
-            ],
-        )
+        [Some(PathBuf::from("/Applications")), home].into_iter().flatten().collect()
     } else {
         let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|path| std::env::split_paths(&path).collect()).unwrap_or_default();
         // Snap's Chromium can't read a profile in /tmp, so it comes last.
         dirs.retain(|dir| !dir.starts_with("/snap"));
         dirs.push(PathBuf::from("/snap/bin"));
-        under(&dirs, &["google-chrome", "google-chrome-stable", "microsoft-edge", "microsoft-edge-stable", "brave-browser", "chromium", "chromium-browser"])
-    }
+        dirs
+    };
+    KINDS
+        .iter()
+        .filter_map(|kind| {
+            let apps: &[&str] = if cfg!(target_os = "windows") {
+                std::slice::from_ref(&kind.windows)
+            } else if cfg!(target_os = "macos") {
+                std::slice::from_ref(&kind.macos)
+            } else {
+                kind.linux
+            };
+            let path = apps.iter().flat_map(|app| roots.iter().map(move |root| root.join(app))).find(|path| path.is_file())?;
+            Some(Installed { key: kind.key, name: kind.name, path })
+        })
+        .collect()
 }
 
 /// The port and WebSocket path from a `DevToolsActivePort` file, once it
@@ -503,7 +590,7 @@ fn parse_active_port(text: &str) -> Option<(u16, String)> {
 }
 
 /// Decodes standard base64 (padding optional); `None` on any other character.
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
     let (mut bits, mut count) = (0u32, 0u32);
     for &c in text.trim_end_matches('=').as_bytes() {
@@ -529,6 +616,17 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picks_choice_or_first() {
+        let found = || ["brave", "edge"].map(|key| Installed { key, name: "", path: PathBuf::from(key) }).to_vec();
+        assert_eq!(chosen(found(), Some("edge")).map(|b| b.key), Some("edge"));
+        assert_eq!(chosen(found(), None).map(|b| b.key), Some("brave"));
+        assert_eq!(chosen(found(), Some("chrome")).map(|b| b.key), Some("brave"), "not installed: Auto");
+        assert_eq!(chosen(Vec::new(), Some("edge")), None);
+        assert!(KINDS.iter().position(|k| k.key == "helium") < KINDS.iter().position(|k| k.key == "edge"));
+        assert!(KINDS.iter().position(|k| k.key == "brave") < KINDS.iter().position(|k| k.key == "edge"));
+    }
 
     #[test]
     fn devtools_port_file() {

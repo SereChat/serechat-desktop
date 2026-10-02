@@ -1,4 +1,5 @@
 //! The agent's tools, confined to the session's project folder.
+//! `fetch_url` and the browser tools also work in chats without one.
 //!
 //! Reading tools (list, read, search, find) run on their own. Anything that
 //! changes files, runs a program or reaches the network waits for the user's
@@ -23,7 +24,7 @@ use serechat::{Client, ToolCall};
 use crate::{browser, process};
 
 /// Longest tool output returned to the model, in bytes.
-const MAX_OUTPUT: usize = 32 * 1024;
+pub(crate) const MAX_OUTPUT: usize = 32 * 1024;
 /// Directories never listed or searched.
 const IGNORED: &[&str] = &[".git", "node_modules", "target", ".venv", "venv", "__pycache__", ".next", ".cache", ".idea", ".vs", ".gradle"];
 /// Most files a walk visits, so a huge tree cannot stall a tool.
@@ -199,10 +200,26 @@ pub fn all() -> &'static [Tool] {
 
 /// Whether `name` needs approval (unknown tools always do). `use_skill`,
 /// offered only when there are skills, just reads inside skill folders.
+/// MCP tools ask unless their server marks them read-only.
 #[must_use]
 pub fn needs_approval(name: &str) -> bool {
+    if crate::mcp::is_mcp(name) {
+        return crate::mcp::needs_approval(name);
+    }
     name != "use_skill" && all().iter().find(|t| t.name == name).is_none_or(|t| t.approval)
 }
+
+/// Whether `name` runs in chats without a project folder: skills, MCP tools,
+/// `fetch_url` and the browser do; the tools that touch files or run
+/// programs work inside a project only.
+#[must_use]
+pub fn works_without_project(name: &str) -> bool {
+    matches!(name, "use_skill" | "fetch_url" | "browser_open" | "browser_snapshot" | "browser_click" | "browser_type" | "browser_screenshot")
+        || crate::mcp::is_mcp(name)
+}
+
+/// The result of a project-only tool called in a chat without a project.
+pub const NEEDS_PROJECT: &str = "This tool is only available in a project. Ask the user to open a project folder.";
 
 /// How a call reads in the chat: a verb, its target, and an optional preview.
 pub struct CallView {
@@ -266,6 +283,16 @@ fn view_args(name: &str, a: &Value, raw: &str) -> CallView {
             let steps = plan_steps(a).unwrap_or_default();
             let done = steps.iter().filter(|(_, status)| *status == "done").count();
             ("Plan", format!("{done} of {} done", steps.len()), plan_lines(a))
+        }
+        other if crate::mcp::is_mcp(other) => {
+            let (server, tool) = crate::mcp::label(other);
+            // Arguments as readable JSON for the approval preview.
+            let preview = match a {
+                Value::Object(map) if map.is_empty() => None,
+                Value::Object(_) => serde_json::to_string_pretty(a).ok(),
+                _ => Some(raw.to_owned()).filter(|r| !r.trim().is_empty()),
+            };
+            ("Use", format!("{server} · {tool}"), preview)
         }
         other => ("Call", other.to_owned(), Some(raw.to_owned())),
     };
@@ -366,11 +393,13 @@ fn skip_json_value(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool
 }
 
 /// What a tool returns.
+#[derive(Debug)]
 pub struct Output {
     /// The result for the model.
     pub text: String,
-    /// A JPEG the model sees after `text` (a browser screenshot).
-    pub image: Option<Vec<u8>>,
+    /// An image the model sees after `text` (a browser screenshot, an MCP
+    /// tool's picture), with its MIME type.
+    pub image: Option<(String, Vec<u8>)>,
 }
 
 impl Output {
@@ -383,12 +412,18 @@ impl Output {
 
 /// Runs `call` inside `root` for conversation `owner` (whose background
 /// processes and browser tab it may use). `cancel` aborts long-running
-/// commands.
+/// commands. Without a `root`, only [`works_without_project`] tools run.
 ///
 /// # Errors
-/// A message for the model: bad arguments, a path outside the project, or
-/// the operation's own failure.
-pub fn run(root: &Path, owner: u64, client: &Client, call: &ToolCall, cancel: &AtomicBool) -> Result<Output, String> {
+/// A message for the model: bad arguments, a path outside the project, no
+/// project for a tool that needs one, or the operation's own failure.
+pub fn run(root: Option<&Path>, owner: u64, client: &Client, call: &ToolCall, cancel: &AtomicBool) -> Result<Output, String> {
+    let root = match root {
+        Some(root) => root,
+        // Those tools never read `root`.
+        None if works_without_project(&call.name) => Path::new(""),
+        None => return Err(NEEDS_PROJECT.to_owned()),
+    };
     let a = args(call);
     if !a.is_object() {
         return Err("Arguments must be a JSON object.".into());
@@ -399,7 +434,7 @@ pub fn run(root: &Path, owner: u64, client: &Client, call: &ToolCall, cancel: &A
     let element = || number("ref").ok_or_else(|| "Missing the 'ref' argument: the element's number in the snapshot.".to_owned());
     if call.name == "browser_screenshot" {
         let (text, jpeg) = browser::screenshot(owner, cancel)?;
-        return Ok(Output { text, image: Some(jpeg) });
+        return Ok(Output { text, image: Some(("image/jpeg".to_owned(), jpeg)) });
     }
     let output = match call.name.as_str() {
         "list_directory" => list_directory(root, &resolve(root, arg(&a, "path").unwrap_or("."))?, number("depth").unwrap_or(1).clamp(1, 4) as usize),
@@ -813,7 +848,7 @@ fn html_to_text(html: &str) -> String {
 }
 
 /// Keeps the start and end of an over-long output.
-fn truncate_middle(text: String, max: usize) -> String {
+pub(crate) fn truncate_middle(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
     }
@@ -848,7 +883,7 @@ mod tests {
     }
 
     fn exec(root: &Path, name: &str, arguments: &Value) -> Result<String, String> {
-        run(root, 0, &Client::new(None), &call(name, arguments), &AtomicBool::new(false)).map(|output| output.text)
+        run(Some(root), 0, &Client::new(None), &call(name, arguments), &AtomicBool::new(false)).map(|output| output.text)
     }
 
     #[test]
@@ -906,7 +941,7 @@ mod tests {
         assert!(out.starts_with("exit code: 0") && out.contains("hi"), "{out}");
         let cancelled = AtomicBool::new(true);
         let slow = if cfg!(target_os = "windows") { "Start-Sleep 30" } else { "sleep 30" };
-        let out = run(&root, 0, &Client::new(None), &call("run_command", &json!({ "command": slow })), &cancelled).unwrap().text;
+        let out = run(Some(&root), 0, &Client::new(None), &call("run_command", &json!({ "command": slow })), &cancelled).unwrap().text;
         assert!(out.starts_with("stopped by the user"), "{out}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -927,6 +962,12 @@ mod tests {
         assert_eq!((view(&click).verb, view(&click).target.as_str()), ("Click", "Sign in button"));
         let root = std::env::temp_dir();
         assert!(exec(&root, "browser_click", &json!({ "element": "x" })).unwrap_err().contains("'ref'"));
+        // Without a project, the web tools run and the rest refuse.
+        let bare = |name, arguments: &Value| run(None, 0, &Client::new(None), &call(name, arguments), &AtomicBool::new(false)).map(|o| o.text);
+        assert!(bare("browser_click", &json!({ "element": "x" })).unwrap_err().contains("'ref'"));
+        assert!(bare("fetch_url", &json!({})).unwrap_err().contains("'url'"));
+        assert_eq!(bare("write_file", &json!({ "path": "a", "content": "" })).unwrap_err(), NEEDS_PROJECT);
+        assert!(works_without_project("fetch_url") && works_without_project("browser_open") && !works_without_project("run_command"));
     }
 
     #[test]

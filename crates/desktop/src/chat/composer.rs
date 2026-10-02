@@ -162,7 +162,9 @@ impl Chat {
 
         let notice_top = self.draw_notice(p, ui, x, width, card.y);
 
-        let focus = ui.anim(id("composer-focus"), f32::from(u8::from(ui.focused && self.spotlight.is_none())));
+        // Typing goes elsewhere while Spotlight or the find bar has it.
+        let typing_here = self.spotlight.is_none() && !self.find.as_ref().is_some_and(|f| f.focused);
+        let focus = ui.anim(id("composer-focus"), f32::from(u8::from(ui.focused && typing_here)));
         p.shadow(Rect::new(card.x, card.y + 4.0, card.w, card.h), t.shadow, theme::RADIUS, 14.0);
         p.bordered(card, t.surface, theme::RADIUS, 1.0, mix(t.border_strong, t.border_focus, focus));
 
@@ -200,7 +202,7 @@ impl Chat {
                 }
             }
         }
-        if ui.caret_visible() && (selection.is_empty() || preedit.is_some()) && self.spotlight.is_none() {
+        if ui.caret_visible() && (selection.is_empty() || preedit.is_some()) && typing_here {
             p.rect(Rect::new(origin.0 + caret_x - 1.0, origin.1 + caret_y + 3.0, 2.0, line_h - 6.0), t.accent, 0.0);
         }
         p.set_clip(clip);

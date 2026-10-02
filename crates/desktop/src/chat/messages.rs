@@ -417,12 +417,20 @@ impl Chat {
         };
         let footer_h = if retry.is_some() || resumable || run.is_some() { FOOTER_H } else { 0.0 };
 
-        // Measure everything (layouts are cached) to know the scroll range.
-        let mut content_h = 24.0 + footer_h;
+        // Measure everything (layouts are cached) to know the scroll range,
+        // and where each entry starts.
+        let mut tops = Vec::with_capacity(conversation.entries.len());
+        let mut top = 0.0;
         for entry in &mut conversation.entries {
-            content_h += entry.measure(p, width, live_entry == Some(entry.id), reasoning_view) + MESSAGE_GAP;
+            tops.push(top);
+            top += entry.measure(p, width, live_entry == Some(entry.id), reasoning_view) + MESSAGE_GAP;
         }
+        let content_h = 24.0 + footer_h + top;
         let max_scroll = (content_h - view.h).max(0.0);
+        if let Some(find) = &mut self.find {
+            let first = tops.iter().position(|t| t + 24.0 >= self.scroll).unwrap_or(0);
+            find.update(conversation, reasoning_view, first);
+        }
 
         if ui.hovered(view) && ui.scroll != 0.0 {
             self.scroll_target = (self.scroll_target + ui.scroll).clamp(0.0, max_scroll);
@@ -457,6 +465,17 @@ impl Chat {
                 self.scroll_target = self.scroll;
                 self.stick_to_bottom = self.scroll >= max_scroll - 1.0;
             }
+        }
+        // Jump near the find match being looked at; once drawn, it is
+        // centred exactly (below).
+        let reveal = self.find.as_ref().filter(|f| f.reveal).and_then(|f| f.current().cloned());
+        if let Some(m) = &reveal {
+            let entry = &conversation.entries[m.entry];
+            let doc = if m.doc == 0 { entry.reasoning_doc.as_ref() } else { entry.doc.as_ref() };
+            let inside = doc.and_then(|d| d.position((m.piece, m.range.start))).map_or(0.0, |(y, _)| y);
+            self.scroll = (tops[m.entry] + inside + 24.0 - view.h * 0.35).clamp(0.0, max_scroll);
+            self.scroll_target = self.scroll;
+            self.stick_to_bottom = false;
         }
         if self.stick_to_bottom {
             self.scroll_target = max_scroll;
@@ -494,6 +513,9 @@ impl Chat {
                 let origin = (area.x + BOX_PAD.0, area.y + BOX_PAD.1);
                 let mut chips_y = origin.1;
                 if let Some(doc) = entry.doc.as_mut().filter(|_| !entry.message.content.is_empty()) {
+                    if let Some(find) = &self.find {
+                        find.highlight(p, index, 1, doc, origin);
+                    }
                     if let Some((a, b)) = sel(1, doc) {
                         doc.draw_selection(p, origin, a, b);
                     }
@@ -534,6 +556,9 @@ impl Chat {
                 if let Some(doc) = entry.doc.as_mut().filter(|_| open) {
                     let origin = (x + 14.0, top + REASONING_ROW);
                     p.rect(Rect::new(x, origin.1, 2.0, doc.height), t.border_strong, 1.0);
+                    if let Some(find) = &self.find {
+                        find.highlight(p, index, 1, doc, origin);
+                    }
                     if let Some((a, b)) = sel(1, doc) {
                         doc.draw_selection(p, origin, a, b);
                     }
@@ -558,6 +583,9 @@ impl Chat {
                 if let Some(doc) = entry.reasoning_doc.as_mut().filter(|_| open) {
                     let origin = (x + 14.0, top);
                     p.rect(Rect::new(x, top, 2.0, doc.height), t.border_strong, 1.0);
+                    if let Some(find) = &self.find {
+                        find.highlight(p, index, 0, doc, origin);
+                    }
                     if let Some((a, b)) = sel(0, doc) {
                         doc.draw_selection(p, origin, a, b);
                     }
@@ -583,6 +611,9 @@ impl Chat {
             }
             if let Some(doc) = &mut entry.doc {
                 let origin = (x, top);
+                if let Some(find) = &self.find {
+                    find.highlight(p, index, 1, doc, origin);
+                }
                 if let Some((a, b)) = sel(1, doc) {
                     doc.draw_selection(p, origin, a, b);
                 }
@@ -660,6 +691,20 @@ impl Chat {
             p.text(&text, x, y + (30.0 - text.height()) * 0.5, t.text_faint);
         }
         p.set_clip(clip);
+
+        // Centre the find match being looked at, now that its place is known.
+        if let (Some(m), Some(find)) = (&reveal, &mut self.find) {
+            let entry = &conversation.entries[m.entry];
+            let doc = if m.doc == 0 { entry.reasoning_doc.as_ref() } else { entry.doc.as_ref() };
+            let target = targets.iter().find(|t| t.entry == m.entry && t.doc == m.doc);
+            if let (Some(target), Some((y, line_h))) = (target, doc.and_then(|d| d.position((m.piece, m.range.start)))) {
+                let wanted = (self.scroll + target.origin.1 + y + line_h * 0.5 - (view.y + view.h * 0.4)).clamp(0.0, max_scroll);
+                self.scroll = wanted;
+                self.scroll_target = wanted;
+                ui.animating = true;
+            }
+            find.reveal = false;
+        }
 
         // Selection: press to start, drag to extend, double/triple click for
         // a word/paragraph. Shift+click extends an existing selection.

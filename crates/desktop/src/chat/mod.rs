@@ -8,6 +8,7 @@
 
 mod agent;
 mod composer;
+mod find;
 mod menu;
 mod messages;
 mod sidebar;
@@ -489,7 +490,7 @@ pub struct Chat {
     /// Dragging a message selection.
     dragging: bool,
     sidebar_scroll: f32,
-    /// Conversation whose delete button was clicked once, awaiting confirmation.
+    /// A working conversation the user asked to delete, awaiting confirmation.
     confirm_delete: Option<u64>,
     /// What was just copied (entry, code block or whole message) and when.
     copied: Option<(u64, Option<usize>, f32)>,
@@ -498,6 +499,10 @@ pub struct Chat {
     spotlight: Option<Spotlight>,
     /// Skill catalogs, by location.
     skills: skills::SkillCache,
+    /// The find bar, while open.
+    find: Option<find::Find>,
+    /// A version installed by the updater, waiting for a restart.
+    update_ready: Option<String>,
 }
 
 impl Chat {
@@ -548,6 +553,8 @@ impl Chat {
             drop_hover: None,
             spotlight: None,
             skills: skills::SkillCache::default(),
+            find: None,
+            update_ready: None,
         };
         for summary in sessions {
             let id = chat.next_id();
@@ -1113,13 +1120,46 @@ impl Chat {
         (!out.is_empty()).then_some(out)
     }
 
+    /// Shows the MCP servers' state, and a message about them, in settings.
+    pub fn set_mcp(&mut self, servers: Vec<crate::mcp::ServerView>, note: Option<(String, bool)>) {
+        self.settings.set_mcp(servers);
+        self.settings.set_mcp_note(note);
+    }
+
+    /// Shows the browsers found for settings, and the one picked (`None`: Auto).
+    pub fn set_browsers(&mut self, found: Vec<crate::browser::Installed>, choice: Option<String>) {
+        self.settings.set_browsers(found, choice);
+    }
+
+    /// Shows the updater's status in settings, and a restart button in the
+    /// sidebar once an update is installed.
+    pub fn set_update(&mut self, status: crate::update::Status, auto: bool) {
+        self.update_ready = match &status {
+            crate::update::Status::Ready(version) => Some(version.clone()),
+            _ => None,
+        };
+        self.settings.set_update(status, auto);
+    }
+
+    /// Opens the find bar, or selects its text if it is open.
+    fn open_find(&mut self) {
+        let find = self.find.get_or_insert_with(find::Find::default);
+        find.focused = true;
+        find.field.editor.select_all();
+        find.reveal = true;
+    }
+
     /// Text committed by an input method (IME).
     pub fn ime_commit(&mut self, text: &str) {
         self.preedit = None;
         match &mut self.spotlight {
             Some(spotlight) => spotlight.insert(text),
-            None if self.page == Page::Chat => self.composer.insert(text),
-            None => {}
+            None if self.page == Page::Settings => self.settings.insert(text),
+            None => match &mut self.find {
+                Some(find) if find.focused => find.field.editor.insert(text),
+                _ if self.page == Page::Chat => self.composer.insert(text),
+                _ => {}
+            },
         }
     }
 
@@ -1131,7 +1171,13 @@ impl Chat {
     /// Where the input method's candidate window should appear.
     #[must_use]
     pub fn ime_area(&self) -> Option<Rect> {
-        self.caret_rect
+        if self.page == Page::Settings {
+            return self.settings.caret();
+        }
+        match &self.find {
+            Some(find) if find.focused => find.caret,
+            _ => self.caret_rect,
+        }
     }
 
     /// Opens Spotlight.
@@ -1180,7 +1226,26 @@ impl Chat {
             }
             return;
         }
+        // The delete dialog takes every key: Enter deletes, Escape cancels.
+        if let Some(id) = self.confirm_delete {
+            match &event.logical_key {
+                Key::Named(NamedKey::Enter) => {
+                    self.confirm_delete = None;
+                    self.delete_conversation(id, actions);
+                }
+                Key::Named(NamedKey::Escape) => self.confirm_delete = None,
+                _ => {}
+            }
+            return;
+        }
         let is = |c: &str, ch: &str| c.eq_ignore_ascii_case(ch);
+        // A focused settings field takes typing first.
+        if self.page == Page::Settings && self.menu.is_none() && self.settings.key(event, mods, cb, actions) {
+            return;
+        }
+        if self.page == Page::Chat && self.menu.is_none() && self.find_key(event, mods, cb) {
+            return;
+        }
         let commands = self.commands();
         match &event.logical_key {
             Key::Named(NamedKey::Escape) if self.menu.is_some() => self.close_menu(),
@@ -1189,6 +1254,7 @@ impl Chat {
             Key::Character(c) if primary && is(c, ",") => self.toggle_settings(actions),
             Key::Character(c) if primary && is(c, "n") => self.new_conversation(),
             Key::Character(c) if primary && is(c, "o") => actions.push(Action::OpenProject(None)),
+            Key::Character(c) if primary && is(c, "f") && self.page == Page::Chat => self.open_find(),
             _ if self.page == Page::Settings => {}
             // Copy a message selection; otherwise the composer handles it.
             Key::Character(c) if primary && is(c, "c") && self.composer.selection().is_empty() && self.selection.is_some() => {
@@ -1238,6 +1304,30 @@ impl Chat {
         }
     }
 
+    /// Keys for the find bar: stepping through matches, closing it, and
+    /// typing while it has focus. Returns whether the key was used.
+    fn find_key(&mut self, event: &KeyEvent, mods: ModifiersState, cb: &mut Option<Clipboard>) -> bool {
+        let Some(find) = &mut self.find else { return false };
+        match &event.logical_key {
+            Key::Named(NamedKey::F3) => find.step(mods.shift_key()),
+            Key::Named(NamedKey::Escape) => self.find = None,
+            Key::Named(NamedKey::Enter) if find.focused => find.step(mods.shift_key()),
+            // Tab hands typing back to the composer.
+            Key::Named(NamedKey::Tab) if find.focused => find.focused = false,
+            _ if find.focused => {
+                let primary = if cfg!(target_os = "macos") { mods.super_key() } else { mods.control_key() };
+                let key = |k: &str| matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case(k));
+                // Global shortcuts (Ctrl+K, Ctrl+N, …) still reach the screen,
+                // and so does copying a message selection.
+                let shortcut = primary && !["a", "c", "x", "v"].iter().any(|k| key(k));
+                let copy_messages = primary && key("c") && find.field.editor.selection().is_empty();
+                return !shortcut && !copy_messages && edit_key(&mut find.field.editor, event, mods, cb);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// Draws the screen.
     pub fn draw(&mut self, p: &mut Painter, ui: &mut Ui, view: Rect, scheme: Scheme, actions: &mut Vec<Action>) {
         let sidebar = Rect::new(0.0, 0.0, theme::SIDEBAR_WIDTH, view.h);
@@ -1246,8 +1336,12 @@ impl Chat {
         // Overlays are drawn last, on top. Spotlight blocks everything
         // beneath it; an open menu blocks its own area (rect from last frame).
         self.sync_command_menu();
-        let modal = self.spotlight.is_some();
-        ui.blocker = if modal { Some(view) } else if self.menu.is_some() { self.menu_rect } else { None };
+        // A dialog opened this frame shows from the next, so the click that
+        // opened it doesn't also count as a click outside it.
+        let confirming = self.confirm_delete.is_some();
+        let modal = self.spotlight.is_some() || confirming;
+        let find_bar = self.find.as_ref().filter(|_| self.page == Page::Chat).map(|f| f.rect);
+        ui.blocker = if modal { Some(view) } else if self.menu.is_some() { self.menu_rect } else { find_bar };
         self.draw_sidebar(p, ui, sidebar, actions);
         let toolbar = if self.page == Page::Settings {
             let totals = self.totals();
@@ -1258,6 +1352,19 @@ impl Chat {
             let (composer_top, toolbar) = self.draw_composer(p, ui, main, actions);
             let messages = Rect::new(main.x, theme::HEADER_HEIGHT, main.w, composer_top - theme::HEADER_HEIGHT - 12.0);
             self.draw_messages(p, ui, messages, actions);
+            // The find bar floats over the messages' top right.
+            if !modal && self.menu.is_none() {
+                ui.blocker = None;
+            }
+            if let Some(find) = &mut self.find {
+                let (event, step) = find.draw(p, ui, messages, self.current);
+                if let Some(back) = step {
+                    find.step(back);
+                }
+                if event == find::BarEvent::Close {
+                    self.find = None;
+                }
+            }
             toolbar
         };
         if !modal {
@@ -1289,6 +1396,12 @@ impl Chat {
                 Outcome::Close => self.spotlight = None,
                 Outcome::Stay => {}
             }
+        }
+        if confirming {
+            ui.blocker = None;
+            self.draw_confirm_delete(p, ui, view, actions);
+        } else if self.confirm_delete.is_some() {
+            ui.animating = true;
         }
     }
 
@@ -1825,13 +1938,18 @@ mod tests {
         let job = start(&mut chat, "take notes");
         assert!(!job.tools && job.project.is_none());
         assert_eq!(job.user_skills.as_deref(), Some(&*mine), "the request uses the cached catalog");
-        let calls = vec![call("s", "use_skill", r#"{"name":"notes"}"#), call("r", "read_file", r#"{"path":"a"}"#)];
+        let calls = vec![
+            call("s", "use_skill", r#"{"name":"notes"}"#),
+            call("r", "read_file", r#"{"path":"a"}"#),
+            call("f", "fetch_url", r#"{"url":"https://example.com"}"#),
+        ];
         let actions = finish(&mut chat, &job, Completion { tool_calls: calls, ..Completion::default() });
         let runs: Vec<&ToolJob> = actions.iter().filter_map(|a| if let Action::RunTool(t) = a { Some(t) } else { None }).collect();
         assert_eq!(runs.len(), 1);
         assert!(runs[0].call.name == "use_skill" && runs[0].root.is_none() && runs[0].skills.len() == 1);
         let calls = chat.current().tool_calls().cloned().unwrap();
         assert!(calls[1].status == ToolStatus::Failed && calls[1].output.contains("only available in a project"));
+        assert_eq!(calls[2].status, ToolStatus::Pending, "fetching works without a project, after approval");
     }
 
     #[test]
@@ -2059,6 +2177,26 @@ mod tests {
         assert!(chat.menu == Some(Menu::Model) && chat.composer.text().is_empty());
         // A command followed by text is just a message.
         assert!(next_send(enter(&mut chat, "/new plans")).is_some());
+    }
+
+    #[test]
+    fn mcp_tools_work_without_a_project_and_ask_first() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        let job = start(&mut chat, "file an issue");
+        let calls = vec![call("m", "mcp__tracker__create_issue", r#"{"title":"Bug"}"#), call("r", "read_file", "{}")];
+        let actions = finish(&mut chat, &job, Completion { tool_calls: calls, ..Completion::default() });
+        assert!(!actions.iter().any(|a| matches!(a, Action::RunTool(_))), "an MCP tool not known to be read-only waits");
+        let records = chat.current().tool_calls().cloned().unwrap();
+        assert_eq!(records[0].status, ToolStatus::Pending);
+        assert!(records[1].status == ToolStatus::Failed && records[1].output.contains("only available in a project"));
+        let view = tools::view(&records[0].call);
+        assert_eq!((view.verb, view.target.as_str()), ("Use", "tracker · create_issue"));
+
+        let entry = chat.current().entries.len() - 1;
+        let mut actions = Vec::new();
+        chat.decide(entry, 0, Decision::Allow, &mut actions);
+        let runs: Vec<&ToolJob> = actions.iter().filter_map(|a| if let Action::RunTool(t) = a { Some(t) } else { None }).collect();
+        assert!(runs.len() == 1 && runs[0].root.is_none() && runs[0].call.name == "mcp__tracker__create_issue");
     }
 
     #[test]

@@ -174,17 +174,19 @@ pub fn fetch_generated(client: &Client, kind: MediaKind, job: &str, prompt: &str
     Ok(Some(Attachment { name, mime, size, path: named.to_string_lossy().into_owned(), dimensions }))
 }
 
-/// Saves a JPEG screenshot a tool took into `store`, so the session keeps it.
+/// Saves an image a tool returned (a browser screenshot, an MCP tool's
+/// picture) into `store`, so the session keeps it.
 ///
 /// # Errors
 /// The file could not be written.
-pub fn save_screenshot(jpeg: &[u8], store: &Path) -> Result<Attachment, String> {
-    let fail = |e: std::io::Error| format!("The screenshot could not be saved: {e}");
+pub fn save_tool_image(mime: &str, bytes: &[u8], store: &Path) -> Result<Attachment, String> {
+    let fail = |e: std::io::Error| format!("The image could not be saved: {e}");
     fs::create_dir_all(store).map_err(fail)?;
-    let path = store.join(format!("{}-screenshot.jpg", new_session_id()));
-    fs::write(&path, jpeg).map_err(fail)?;
-    let dimensions = crate::image::dimensions(&path);
-    Ok(Attachment { name: "screenshot.jpg".into(), mime: "image/jpeg".into(), size: jpeg.len() as u64, path: path.to_string_lossy().into_owned(), dimensions })
+    let name = if mime == "image/jpeg" { "screenshot.jpg".to_owned() } else { format!("image.{}", extension(mime)) };
+    let path = store.join(format!("{}-{name}", new_session_id()));
+    fs::write(&path, bytes).map_err(fail)?;
+    let dimensions = if crate::image::supported(mime) { crate::image::dimensions(&path) } else { None };
+    Ok(Attachment { name, mime: mime.to_owned(), size: bytes.len() as u64, path: path.to_string_lossy().into_owned(), dimensions })
 }
 
 /// A file name (no extension) from the first words of `prompt`, or `fallback`.

@@ -212,12 +212,129 @@ pub fn keycap(p: &mut Painter, keys: &str, right: f32, y: f32) -> f32 {
     cap.w
 }
 
+/// An on/off switch in `rect` (about 32×18). Returns whether it was clicked.
+pub fn switch(p: &mut Painter, ui: &mut Ui, rect: Rect, on: bool, key: u64) -> bool {
+    let t = p.theme;
+    let hovered = ui.hovered(rect);
+    let at = ui.anim(key, f32::from(u8::from(on)));
+    let track = mix(t.border_strong, t.accent, at);
+    p.rect(rect, if hovered { mix(track, t.text, 0.08) } else { track }, rect.h * 0.5);
+    let knob = rect.h - 4.0;
+    let x = rect.x + 2.0 + (rect.w - knob - 4.0) * at;
+    p.rect(Rect::new(x, rect.y + 2.0, knob, knob), mix(t.surface, t.on_accent, at), knob * 0.5);
+    if hovered {
+        ui.cursor = CursorIcon::Pointer;
+    }
+    ui.clicked(rect)
+}
+
+/// A text input's editing state, plus how far it is scrolled.
+#[derive(Default)]
+pub struct TextField {
+    /// The text and caret.
+    pub editor: Editor,
+    scroll: f32,
+    selecting: bool,
+}
+
+/// How a [`text_field`] looks.
+pub struct FieldStyle<'a> {
+    /// Shown while empty.
+    pub placeholder: &'a str,
+    /// Wraps and grows to several lines (Enter is the caller's to handle).
+    pub multiline: bool,
+    /// Uses the monospace font (commands, URLs, keys).
+    pub mono: bool,
+}
+
+/// Draws `field` in `rect`: a click places the caret (and asks for focus),
+/// a drag selects. Returns `(pressed, caret)`: whether it was pressed this
+/// frame, and where the caret is when `focused` (for input methods).
+pub fn text_field(p: &mut Painter, ui: &mut Ui, rect: Rect, field: &mut TextField, focused: bool, style: &FieldStyle<'_>) -> (bool, Option<Rect>) {
+    let t = p.theme;
+    let focus = ui.anim(id(("field-focus", rect.x.to_bits(), rect.y.to_bits())), f32::from(u8::from(focused && ui.focused)));
+    p.bordered(rect, t.bg, theme::RADIUS_SM, 1.0, mix(t.border_strong, t.border_focus, focus));
+    let text_style = if style.mono { crate::text::Style::mono(12.5) } else { theme::SMALL };
+    let pad = 10.0;
+    let inner = Rect::new(rect.x + pad, rect.y + 6.0, rect.w - 2.0 * pad, rect.h - 12.0);
+    let wrap = style.multiline.then_some(inner.w);
+    let layout = p.layout(field.editor.text(), text_style, wrap);
+    let line_h = layout.line_height();
+    let (caret_x, caret_y) = layout.caret(field.editor.cursor());
+    // Keep the caret in view: sideways for one line, down for several.
+    if style.multiline {
+        field.scroll = field.scroll.clamp(caret_y + line_h - inner.h, caret_y).clamp(0.0, (layout.height() - inner.h).max(0.0));
+    } else {
+        field.scroll = field.scroll.clamp(caret_x + 2.0 - inner.w, caret_x).clamp(0.0, (layout.width() + 2.0 - inner.w).max(0.0));
+    }
+    let origin = if style.multiline {
+        (inner.x, inner.y - field.scroll)
+    } else {
+        (inner.x - field.scroll, rect.y + (rect.h - line_h) * 0.5)
+    };
+
+    let hovered = ui.hovered(rect);
+    let hit = |ui: &Ui| layout.hit(ui.mouse.0 - origin.0, ui.mouse.1 - origin.1);
+    let mut pressed = false;
+    if hovered {
+        ui.cursor = CursorIcon::Text;
+        if ui.pressed {
+            pressed = true;
+            field.editor.set_cursor(hit(ui), ui.mods.shift_key() && focused);
+            if ui.clicks == 2 {
+                field.editor.select_word();
+            } else if ui.clicks >= 3 {
+                field.editor.select_all();
+            }
+            field.selecting = true;
+            ui.last_edit = ui.time;
+        }
+    }
+    if field.selecting {
+        if ui.down && ui.clicks < 2 {
+            field.editor.set_cursor(hit(ui), true);
+        } else if !ui.down {
+            field.selecting = false;
+        }
+    }
+
+    let clip = p.push_clip(Rect::new(inner.x - 1.0, rect.y + 1.0, inner.w + 2.0, rect.h - 2.0));
+    let selection = field.editor.selection();
+    if focused && !selection.is_empty() {
+        for (start, end, y) in layout.line_spans() {
+            let (from, to) = (selection.start.max(start), selection.end.min(end));
+            if from > to || (from == to && selection.end <= end) {
+                continue;
+            }
+            let x0 = layout.caret(from).0;
+            let x1 = if selection.end > end { layout.caret(to).0 + 6.0 } else { layout.caret(to).0 };
+            p.rect(Rect::new(origin.0 + x0, origin.1 + y, x1 - x0, line_h), t.selection, 2.0);
+        }
+    }
+    if field.editor.text().is_empty() {
+        p.label(style.placeholder, text_style, origin.0, origin.1, t.text_faint);
+    } else {
+        p.text(&layout, origin.0, origin.1, t.text);
+    }
+    let caret = Rect::new(origin.0 + caret_x - 1.0, origin.1 + caret_y + 2.0, 2.0, line_h - 4.0);
+    if focused && ui.caret_visible() && selection.is_empty() {
+        p.rect(caret, t.accent, 0.0);
+    }
+    p.set_clip(clip);
+    (pressed, focused.then_some(caret))
+}
+
 /// Opens the clipboard lazily; `None` when the platform has none.
 fn clipboard(slot: &mut Option<Clipboard>) -> Option<&mut Clipboard> {
     if slot.is_none() {
         *slot = Clipboard::new().ok();
     }
     slot.as_mut()
+}
+
+/// The text on the system clipboard, if there is any.
+pub fn paste(slot: &mut Option<Clipboard>) -> Option<String> {
+    clipboard(slot).and_then(|cb| cb.get_text().ok())
 }
 
 /// Copies `text` to the system clipboard, ignoring failures.

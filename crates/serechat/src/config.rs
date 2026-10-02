@@ -42,6 +42,10 @@ pub struct Config {
     pub video_model: Option<String>,
     /// Model `/audio` generates with.
     pub audio_model: Option<String>,
+    /// `off` to only check for updates, not install them; anything else installs.
+    pub auto_update: Option<String>,
+    /// Browser the agent drives, interpreted by the app; absent means Auto.
+    pub browser: Option<String>,
 }
 
 impl Config {
@@ -128,6 +132,8 @@ impl Config {
                 "image_model" => config.image_model = Some(value),
                 "video_model" => config.video_model = Some(value),
                 "audio_model" => config.audio_model = Some(value),
+                "auto_update" => config.auto_update = Some(value),
+                "browser" => config.browser = Some(value),
                 _ => {}
             }
         }
@@ -148,6 +154,8 @@ impl Config {
             ("image_model", &self.image_model),
             ("video_model", &self.video_model),
             ("audio_model", &self.audio_model),
+            ("auto_update", &self.auto_update),
+            ("browser", &self.browser),
         ];
         for (key, value) in fields {
             if let Some(value) = value {
@@ -230,7 +238,10 @@ fn push_quoted(out: &mut String, value: &str) {
 /// Writes a sibling `.tmp` file and renames it over the original, so a crash
 /// mid-write never leaves a truncated file behind. On Unix the file is
 /// created `0600` inside a `0700` directory; on Windows the profile ACLs apply.
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+///
+/// # Errors
+/// Any I/O failure while creating the directory or writing the file.
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         create_private_dir(dir)?;
     }
@@ -286,6 +297,8 @@ mod tests {
             image_model: Some("gpt-image-2.5-flare".into()),
             video_model: Some("veo-3.1-fast".into()),
             audio_model: None,
+            auto_update: Some("off".into()),
+            browser: Some("brave".into()),
         };
         assert_eq!(Config::parse(&config.serialize()).unwrap(), config);
     }

@@ -247,17 +247,23 @@ impl ResponseRequest<'_> {
 /// Encodes `bytes` as a `data:` URL of type `mime`.
 #[must_use]
 pub fn data_url(mime: &str, bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(mime.len() + 13 + bytes.len().div_ceil(3) * 4);
-    out.push_str("data:");
-    out.push_str(mime);
-    out.push_str(";base64,");
+    format!("data:{mime};base64,{}", base64(bytes, false))
+}
+
+/// Encodes `bytes` as base64: the standard alphabet with padding, or with
+/// `url_safe` the URL alphabet without padding (RFC 4648 §5).
+#[must_use]
+pub fn base64(bytes: &[u8], url_safe: bool) -> String {
+    const STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let alphabet = if url_safe { URL } else { STANDARD };
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
         for i in 0..4 {
             if i <= chunk.len() {
-                out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
-            } else {
+                out.push(char::from(alphabet[(n >> (18 - 6 * i) & 63) as usize]));
+            } else if !url_safe {
                 out.push('=');
             }
         }
@@ -509,5 +515,6 @@ mod tests {
         assert_eq!(data_url("a/b", b"fo"), "data:a/b;base64,Zm8=");
         assert_eq!(data_url("a/b", b"foo"), "data:a/b;base64,Zm9v");
         assert_eq!(data_url("a/b", &[0xFF, 0xFE, 0xFD, 0x00]), "data:a/b;base64,//79AA==");
+        assert_eq!(base64(&[0xFF, 0xFE, 0xFD, 0x00], true), "__79AA");
     }
 }

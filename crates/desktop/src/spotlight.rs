@@ -169,7 +169,7 @@ impl Spotlight {
             ("New chat", "Start a fresh conversation", Pick::NewChat),
             ("Open folder…", "Open a project folder for the agent", Pick::OpenFolder),
             ("Attach files…", "Add images, PDFs or text files", Pick::Attach),
-            ("Settings", "Appearance, usage, data and account", Pick::Settings),
+            ("Settings", "Appearance, browser, usage, data and account", Pick::Settings),
         ];
         group("Commands", commands.into_iter().filter_map(|(t, d, p)| row(t, d.to_owned(), p, 0)).collect());
         if !query.is_empty() {

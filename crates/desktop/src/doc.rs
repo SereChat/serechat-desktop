@@ -285,6 +285,20 @@ impl Doc {
     /// Draws the selection between two ordered positions.
     pub fn draw_selection(&self, p: &mut Painter, origin: (f32, f32), from: DocPos, to: DocPos) {
         let color = p.theme.selection;
+        self.draw_highlight(p, origin, from, to, color);
+    }
+
+    /// Where position `pos` is, relative to the document: the top of its
+    /// line and the line's height.
+    #[must_use]
+    pub fn position(&self, (piece, byte): DocPos) -> Option<(f32, f32)> {
+        let piece = self.texts.get(piece)?;
+        let (_, y) = piece.layout.caret(byte.min(piece.text.len()));
+        Some((piece.y + y, piece.layout.line_height()))
+    }
+
+    /// Fills the text between two ordered positions with `color`.
+    pub fn draw_highlight(&self, p: &mut Painter, origin: (f32, f32), from: DocPos, to: DocPos, color: Color) {
         for (index, piece) in self.texts.iter().enumerate().take(to.0 + 1).skip(from.0) {
             let first = if index == from.0 { from.1 } else { 0 };
             let last = if index == to.0 { to.1 } else { piece.text.len() };

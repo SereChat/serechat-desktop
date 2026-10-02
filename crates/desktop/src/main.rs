@@ -22,17 +22,20 @@ mod highlight;
 mod image;
 mod login;
 mod markdown;
+mod mcp;
 mod paint;
 mod platform;
 mod process;
 mod raster;
 mod settings;
+mod sha256;
 mod skills;
 mod spotlight;
 mod text;
 mod theme;
 mod tools;
 mod ui;
+mod update;
 mod websocket;
 
 use std::process::ExitCode;
@@ -86,6 +89,9 @@ impl ApplicationHandler<WorkerEvent> for Handler {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(app) = &self.app {
+            if app.restart_requested() {
+                event_loop.exit();
+            }
             event_loop.set_control_flow(app.control_flow());
         }
     }
@@ -101,9 +107,17 @@ fn main() -> ExitCode {
     };
     let mut handler = Handler { app: None, proxy: event_loop.create_proxy(), error: None };
     let result = event_loop.run_app(&mut handler);
-    // Dev servers, watchers and the browser the agent started must not outlive the app.
+    let restart = handler.app.as_ref().is_some_and(App::restart_requested);
+    // Dropping the app finishes its queued file writes.
+    drop(handler.app.take());
+    // Dev servers, watchers, MCP servers and the browser the agent started
+    // must not outlive the app.
     process::stop_all();
     browser::shutdown();
+    mcp::shutdown();
+    if restart {
+        update::relaunch();
+    }
     if let Err(e) = result {
         eprintln!("serechat: event loop failed: {e}");
         return ExitCode::FAILURE;

@@ -120,7 +120,7 @@ pub struct SendJob {
     pub user_skills: Option<Arc<Catalog>>,
     /// The project's skills and AGENTS.md, if scanned; likewise.
     pub project_skills: Option<Arc<Catalog>>,
-    /// Offer the agent's tools.
+    /// Offer all the agent's tools; without, only those that need no project.
     pub tools: bool,
     /// `tool_choice`, or `None` to let the model decide.
     pub tool_choice: Option<&'static str>,
@@ -135,7 +135,7 @@ pub struct ToolJob {
     /// The call.
     pub call: ToolCall,
     /// Project folder the tool is confined to; `None` in a chat without one,
-    /// where only `use_skill` runs.
+    /// where only [`tools::works_without_project`] tools run.
     pub root: Option<PathBuf>,
     /// The skills `use_skill` may load.
     pub skills: Arc<[Skill]>,
@@ -200,10 +200,10 @@ fn screenshot_parts(records: &[&ToolRecord]) -> Vec<Part> {
     let mut parts = Vec::with_capacity(records.len() * 2);
     for record in records {
         let Some(image) = &record.image else { continue };
-        parts.push(Part::Text(format!("The screenshot from your {} call {}:", record.call.name, record.call.call_id)));
+        parts.push(Part::Text(format!("The image from your {} call {}:", record.call.name, record.call.call_id)));
         parts.push(match fs::read(&image.path) {
             Ok(bytes) => Part::Image(data_url(&image.mime, &bytes)),
-            Err(_) => Part::Text("(The screenshot's file is missing.)".to_owned()),
+            Err(_) => Part::Text("(The image's file is missing.)".to_owned()),
         });
     }
     parts
@@ -229,7 +229,11 @@ pub(super) fn instructions(project: Option<&str>) -> String {
              Keep each tool call reasonably small: edit files in place rather than rewriting large ones. Answer in Markdown and keep \
              answers focused."
         ),
-        None => format!("You are SereChat, a helpful AI assistant in a desktop app on {os}. Answer in Markdown and keep answers focused."),
+        None => format!(
+            "You are SereChat, a helpful AI assistant in a desktop app on {os}. You can fetch URLs and use a browser; fetching and \
+             acting in the browser need the user's approval. No project folder is open, so you cannot read or write files or run commands: when a task needs that, \
+             give the code or steps in your reply and suggest the user open a project folder. Answer in Markdown and keep answers focused."
+        ),
     }
 }
 
@@ -606,10 +610,10 @@ impl Chat {
         let cancel = Arc::clone(&conversation.tool_cancel);
         let Some(calls) = conversation.tool_calls() else { return };
         for record in calls.iter_mut().filter(|r| r.status == ToolStatus::Pending) {
-            // Skills work in every chat; the other tools need a project.
-            if root.is_none() && record.call.name != "use_skill" {
+            // Skills, MCP tools and the web work in every chat; files and commands need a project.
+            if root.is_none() && !tools::works_without_project(&record.call.name) {
                 record.status = ToolStatus::Failed;
-                "Tools are only available in a project.".clone_into(&mut record.output);
+                tools::NEEDS_PROJECT.clone_into(&mut record.output);
                 continue;
             }
             if !tools::needs_approval(&record.call.name) || allowed.contains(&record.call.name) {
@@ -681,13 +685,13 @@ impl Chat {
             Decision::Allow => {
                 // Approve just this call: run it right away.
                 let root = conversation.project.clone().map(PathBuf::from);
-                if let Some(root) = root {
+                if root.is_some() || tools::works_without_project(&record.call.name) {
                     record.status = ToolStatus::Running;
                     // Calls that need approval never load skills.
                     actions.push(Action::RunTool(ToolJob {
                         conversation: id,
                         call: record.call.clone(),
-                        root: Some(root),
+                        root,
                         skills: Arc::new([]),
                         cancel: Arc::clone(&conversation.tool_cancel),
                     }));

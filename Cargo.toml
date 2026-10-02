@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Proprietary"
-repository = "https://github.com/OnlyF0uR/serechat-desktop"
+repository = "https://github.com/SereChat/serechat-desktop"
 
 [workspace.dependencies]
 serechat = { path = "crates/serechat" }
