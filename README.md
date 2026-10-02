@@ -27,6 +27,10 @@ cargo clippy --workspace --all-targets
   write and edit files, run commands and fetch web pages. Every tool is confined to the
   project folder. Each chat has its own folder: pick or change it from the chip in the header. New chats start
   without one; the app reopens in the folder picked last.
+- **Diffs**: a file edit or write waiting for approval shows as a diff against the file on
+  disk, with line numbers, three lines of context, the changed words picked out, and its
+  `+added −removed` count in the card's header. Long diffs fold after 16 rows ("Show all").
+  A finished change opens to the same diff.
 - **Long tasks**: the agent keeps a plan (shown as a checklist) and works until it is done, up
   to 100 tool rounds before it pauses. Dropped connections, rate limits and server errors are
   retried automatically; when a conversation outgrows the model's context, the model
@@ -48,8 +52,16 @@ cargo clippy --workspace --all-targets
   Settings lists the skills the open chat can use, and any problems reading them.
 - **Reasoning**: the effort picker offers the levels the selected model supports.
 - **Spotlight** (Ctrl/Cmd+K): one search over commands, projects, sessions, models, themes
-- **Slash commands** in the composer, completed as you type (Tab completes, Enter runs, Esc dismisses): `/clear` deletes the open chat and starts an empty one in the same folder
   and the full text of every saved message.
+- **Slash commands** in the composer, completed as you type (Tab completes, Enter runs, Esc
+  dismisses): `/new` starts a chat in the same folder, `/clear` deletes the open chat and
+  starts an empty one there, `/compact` summarises the chat to free up context, `/model`
+  opens the model menu, and `/init` asks the agent to write the project's `AGENTS.md`.
+- **Image, video and audio generation**: `/image`, `/video` and `/audio` followed by a prompt.
+  While the composer holds one, the model button picks that kind's model (with its price).
+  The chat stays usable while it runs; images show inline at their own aspect ratio, videos
+  and audio as cards that open in the system player. The job lives on the server, so a
+  generation still running when the app closes is picked up when its chat is opened again.
 - **Emoji and CJK**: colour emoji (Twemoji), and Chinese, Japanese and Korean text through the
   operating system's fonts, with input-method (IME) support for typing them.
 - **Settings**, in tabs: Appearance (Dark, One Dark and Light schemes, reasoning display), Skills,
@@ -59,7 +71,7 @@ cargo clippy --workspace --all-targets
 
 | Crate             | Purpose                                                                          |
 |-------------------|----------------------------------------------------------------------------------|
-| `crates/serechat` | API client: sign-in, models, streaming Responses API with attachments and tools, config, sessions, projects |
+| `crates/serechat` | API client: sign-in, models, streaming Responses API with attachments and tools, image/video/audio generation jobs, config, sessions, projects |
 | `crates/desktop`  | The app: winit window, wgpu renderer, text engine, immediate-mode UI, agent tools |
 
 `crates/desktop/src`:
@@ -84,8 +96,9 @@ cargo clippy --workspace --all-targets
 - `process.rs`: background processes the agent starts, reads and stops.
 - `skills.rs`: Agent Skills scanning and loading, and the project's `AGENTS.md`;
   `chat/skills.rs` keeps the scanned catalogs and decides when to scan again.
-- `tools.rs`, `attachments.rs`, `platform.rs`: agent tools, file attachments, OS integration
-  (browser, file manager, native pickers).
+- `tools.rs`, `attachments.rs`, `platform.rs`: agent tools, file attachments (and downloads
+  of generated files), OS integration (browser, file manager, native pickers).
+- `diff.rs`: line diffs of the agent's file changes.
 - `theme.rs`: the colour schemes, sizes and text styles.
 - `app.rs`: event routing, worker threads and the frame loop.
 
@@ -103,11 +116,13 @@ The first time the app starts, it runs SereChat's device-code flow. The browser 
 approval page, and the user types the 6-digit code into the app. Everything lives in
 `~/.serechat/`:
 
-- `config.toml`: token, model, reasoning effort and display, colour scheme and current project.
+- `config.toml`: token, model, reasoning effort and display, colour scheme, current project, and
+  the image, video and audio models.
 - `sessions/<id>.json`: one file per conversation, with each reply's tokens and cost at the
   prices of the time, attachments and tool calls. `.index.json` next to them holds titles and
   totals, so startup reads only the index; a session's messages load when it is opened.
-- `attachments/`: the app's copies of attached files (deleted with their session).
+- `attachments/`: the app's copies of attached files, and generated files (deleted with their
+  session).
 - `projects.json`: project folders.
 
 On Unix these files have mode `0600`, and they are written atomically. Signing out (or a `401`

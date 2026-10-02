@@ -13,14 +13,16 @@ mod messages;
 mod sidebar;
 mod skills;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use arboard::Clipboard;
 use serechat::{
-    Attachment, Error, Model, Project, Role, Session, SessionSummary, StoredMessage, ToolRecord, ToolStatus, Usage, new_session_id, unix_now,
+    Attachment, Error, MediaJob, MediaKind, MediaModel, MediaTicket, Model, Project, Role, SPARK_USD, Session, SessionSummary, StoredMessage,
+    ToolRecord, ToolStatus, Usage, new_session_id, unix_now,
 };
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -39,9 +41,13 @@ use crate::tools;
 pub use agent::{SendJob, ToolJob, input_items};
 use agent::{ActiveStream, Retry};
 use composer::Command;
+use messages::DiffView;
 
 /// Model used until the user picks one.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5.5";
+/// Generation models used until the user picks one (or the list says
+/// otherwise), by [`MediaKind::index`].
+const DEFAULT_MEDIA: [&str; 3] = ["gpt-image-2.5-flare", "veo-3.1-fast", "elevenlabs-v4-turbo"];
 /// Name of the platform's primary shortcut modifier.
 const PRIMARY_KEY: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
 
@@ -184,6 +190,29 @@ enum Menu {
     Project,
     /// Slash commands completing the composer text; open while any match.
     Commands,
+    /// Generation models of one kind, while the composer holds its command.
+    Media(MediaKind),
+}
+
+/// A generation for a worker thread to run: submit it (or pick up a job
+/// already submitted), wait for it, and download the file.
+pub struct MediaRequest {
+    /// Conversation it belongs to.
+    pub conversation: u64,
+    /// Entry the file goes into.
+    pub entry: u64,
+    /// What it makes.
+    pub kind: MediaKind,
+    /// Model id.
+    pub model: String,
+    /// Mode that takes a prompt alone, or `None` for the model's default.
+    pub mode: Option<String>,
+    /// The prompt.
+    pub prompt: String,
+    /// A job already submitted (after a restart): only wait for it.
+    pub job: Option<String>,
+    /// Raised when nobody waits for the result any more.
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// One message in a conversation, with its cached layouts.
@@ -204,6 +233,10 @@ struct Entry {
     tool_bodies: Vec<ToolBody>,
     /// Tool calls the model is writing right now (never saved).
     streaming_calls: Vec<StreamingCall>,
+    /// Diffs of the file changes among the tool calls, by call id.
+    diffs: HashMap<String, DiffView>,
+    /// Since when this app has been waiting for the entry's generation.
+    media_since: Option<Instant>,
 }
 
 /// A tool call still being written, shown as it streams in.
@@ -230,6 +263,8 @@ impl Entry {
             reasoning_len: 0,
             tool_bodies: Vec::new(),
             streaming_calls: Vec::new(),
+            diffs: HashMap::new(),
+            media_since: None,
         }
     }
 
@@ -285,6 +320,8 @@ struct Conversation {
     steps: u32,
     /// Raised to stop running tools.
     tool_cancel: Arc<AtomicBool>,
+    /// Raised to stop waiting for generations (the chat was deleted).
+    media_cancel: Arc<AtomicBool>,
 }
 
 impl Conversation {
@@ -307,6 +344,7 @@ impl Conversation {
             allowed: HashSet::new(),
             steps: 0,
             tool_cancel: Arc::default(),
+            media_cancel: Arc::default(),
         }
     }
 
@@ -344,7 +382,10 @@ impl Conversation {
             messages: self
                 .entries
                 .iter()
-                .filter(|e| !e.message.content.is_empty() || !e.message.tool_calls.is_empty() || !e.message.attachments.is_empty())
+                .filter(|e| {
+                    let m = &e.message;
+                    !m.content.is_empty() || !m.tool_calls.is_empty() || !m.attachments.is_empty() || m.media.is_some()
+                })
                 .map(|e| e.message.clone())
                 .collect(),
         }
@@ -418,6 +459,10 @@ pub struct Chat {
     notice: Option<(String, Option<f32>)>,
     models: Vec<Model>,
     model: String,
+    /// Generation models that work from a prompt, by [`MediaKind::index`].
+    media_models: [Vec<MediaModel>; 3],
+    /// The chosen generation model of each kind.
+    media_model: [String; 3],
     reasoning: Reasoning,
     reasoning_view: ReasoningView,
     projects: Vec<Project>,
@@ -479,6 +524,8 @@ impl Chat {
             notice: None,
             models: Vec::new(),
             model: model.unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
+            media_models: Default::default(),
+            media_model: DEFAULT_MEDIA.map(str::to_owned),
             reasoning,
             reasoning_view: ReasoningView::default(),
             projects,
@@ -631,6 +678,7 @@ impl Chat {
             stream.cancel.store(true, Ordering::Relaxed);
         }
         conversation.tool_cancel.store(true, Ordering::Relaxed);
+        conversation.media_cancel.store(true, Ordering::Relaxed);
         actions.push(Action::DeleteSession(conversation.session_id));
         actions.push(Action::StopProcesses(conversation.id));
         if self.current == id {
@@ -670,13 +718,31 @@ impl Chat {
         self.menu = None;
     }
 
-    /// Runs a slash command, taking it out of the composer.
+    /// Runs a slash command, taking it out of the composer. Commands that
+    /// need a prompt are completed instead, ready for it.
     fn run_command(&mut self, command: Command, actions: &mut Vec<Action>) {
         self.composer.take();
         self.command_dismissed = None;
         self.menu = None;
         match command {
+            Command::Media(kind) => self.composer.insert(&format!("/{} ", kind.noun())),
+            Command::New => {
+                let project = self.current().project.clone();
+                self.new_conversation();
+                self.current().project.clone_from(&project);
+                self.ensure_skills(project.as_deref(), actions);
+            }
             Command::Clear => self.clear(actions),
+            Command::Compact => self.compact(actions),
+            Command::Model => {
+                self.menu = Some(Menu::Model);
+                self.menu_scroll = 0.0;
+            }
+            // Sent as a message; the model gets its prompt (see `input_items`).
+            Command::Init => {
+                self.composer.insert("/init");
+                self.send(actions);
+            }
         }
     }
 
@@ -692,8 +758,9 @@ impl Chat {
         self.current().project = project;
     }
 
-    /// Stores the messages of a session read on a worker thread.
-    pub fn session_loaded(&mut self, conversation: u64, result: Result<Session, Error>) {
+    /// Stores the messages of a session read on a worker thread, and picks up
+    /// the generations it was still waiting for.
+    pub fn session_loaded(&mut self, conversation: u64, result: Result<Session, Error>, actions: &mut Vec<Action>) {
         let Some(index) = self.conversations.iter().position(|c| c.id == conversation && c.load == Load::Loading) else {
             return;
         };
@@ -713,13 +780,48 @@ impl Chat {
                 "Interrupted: the app closed while this was running.".clone_into(&mut record.output);
             }
         }
+        // A generation the server never accepted is lost; one it did is
+        // still running there, or finished, and is picked up again.
+        for message in messages.iter_mut().filter(|m| m.media_pending() && m.media.as_ref().is_some_and(|j| j.id.is_empty())) {
+            message.failed = true;
+            "Interrupted: the app closed before the generation started.".clone_into(&mut message.content);
+        }
         let first = self.next_id;
         self.next_id += messages.len() as u64;
-        let entries = messages.into_iter().zip(first + 1..).map(|(m, id)| Entry::new(id, m)).collect();
-        let conversation = &mut self.conversations[index];
-        conversation.entries = entries;
-        conversation.allowed = allowed.into_iter().collect();
-        conversation.load = Load::Loaded;
+        let entries: Vec<Entry> = messages.into_iter().zip(first + 1..).map(|(m, id)| Entry::new(id, m)).collect();
+        let target = &mut self.conversations[index];
+        target.entries = entries;
+        target.allowed = allowed.into_iter().collect();
+        target.load = Load::Loaded;
+        for entry in &mut target.entries {
+            if let (true, Some(job)) = (entry.message.media_pending(), &entry.message.media) {
+                entry.media_since = Some(Instant::now());
+                actions.push(Action::Generate(MediaRequest {
+                    conversation,
+                    entry: entry.id,
+                    kind: job.kind,
+                    model: entry.message.model.clone().unwrap_or_default(),
+                    mode: None,
+                    prompt: String::new(),
+                    job: Some(job.id.clone()),
+                    cancel: Arc::clone(&target.media_cancel),
+                }));
+            }
+        }
+        // Changes still waiting for approval show their diff against the file.
+        if let Some(root) = target.project.clone().map(PathBuf::from) {
+            let calls = target.entries.iter().flat_map(|e| &e.message.tool_calls).filter(|r| r.status == ToolStatus::Pending);
+            actions.extend(calls.filter_map(|r| preview(&root, &r.call, conversation)));
+        }
+    }
+
+    /// The diff of a file change arrived from a worker.
+    pub fn diff_ready(&mut self, conversation: u64, call_id: &str, diff: Arc<crate::diff::Diff>) {
+        let Some(target) = self.find(conversation) else { return };
+        if let Some(entry) = target.entries.iter_mut().rev().find(|e| e.message.tool_calls.iter().any(|r| r.call.call_id == call_id)) {
+            let open = entry.diffs.get(call_id).is_some_and(DiffView::full);
+            entry.diffs.insert(call_id.to_owned(), DiffView::new(diff, true, open));
+        }
     }
 
     /// Sets how replies show reasoning. Blocks the user opened or closed
@@ -750,6 +852,7 @@ impl Chat {
             }
             conversation.retry = None;
             conversation.tool_cancel.store(true, Ordering::Relaxed);
+            conversation.media_cancel.store(true, Ordering::Relaxed);
         }
     }
 
@@ -803,9 +906,26 @@ impl Chat {
         self.drop_hover = path.map(std::path::Path::is_dir);
     }
 
-    /// Takes the composer text and starts a reply, if sending is possible.
+    /// Takes the composer text and starts a reply (or runs its slash
+    /// command, or starts its generation), if sending is possible.
     fn send(&mut self, actions: &mut Vec<Action>) {
-        let has_content = !self.composer.text().trim().is_empty() || !self.pending.is_empty();
+        let typed = self.composer.text().trim().to_owned();
+        let command = Command::parse(&typed);
+        let mut media = None;
+        match command {
+            // `/init` is sent as a message; other bare commands just run.
+            Some((Command::Init, "")) if self.current().project.is_none() => {
+                self.notify(format!("Open a project folder first ({PRIMARY_KEY}+O), then run /init in it."));
+                return;
+            }
+            Some((command, "")) if command != Command::Init => {
+                self.run_command(command, actions);
+                return;
+            }
+            Some((Command::Media(kind), prompt)) => media = Some((kind, prompt.to_owned())),
+            _ => {}
+        }
+        let has_content = !typed.is_empty() || !self.pending.is_empty();
         let conversation = self.current();
         // Sending into an unloaded session would save it without its history.
         if conversation.load != Load::Loaded || conversation.busy() || !has_content {
@@ -813,6 +933,10 @@ impl Chat {
         }
         if self.importing > 0 {
             self.notify("Wait for the attachments to finish loading.");
+            return;
+        }
+        if let (Some((kind, _)), false) = (&media, self.pending.is_empty()) {
+            self.notify(format!("/{} works from the text alone. Remove the attachments to generate.", kind.noun()));
             return;
         }
         let images = self.pending.iter().any(Attachment::is_image);
@@ -850,7 +974,98 @@ impl Chat {
         }
         self.composer_scroll = 0.0;
         self.selection = None;
-        self.request_reply(id, actions);
+        match media {
+            Some((kind, prompt)) => self.generate(id, kind, prompt, actions),
+            None => self.request_reply(id, actions),
+        }
+    }
+
+    /// The chosen generation model of `kind`, and the mode to ask for.
+    fn media_choice(&self, kind: MediaKind) -> (String, Option<String>) {
+        let id = &self.media_model[kind.index()];
+        let mode = self.media_models[kind.index()].iter().find(|m| &m.id == id).and_then(MediaModel::prompt_mode);
+        (id.clone(), mode.map(str::to_owned))
+    }
+
+    /// Display name of a text or generation model.
+    fn model_label<'a>(&'a self, id: &'a str) -> &'a str {
+        label_of(&self.models, &self.media_models, id)
+    }
+
+    /// Adds the reply that waits for a generation of `kind` from `prompt` to
+    /// conversation `id`, and starts it.
+    fn generate(&mut self, id: u64, kind: MediaKind, prompt: String, actions: &mut Vec<Action>) {
+        let (model, mode) = self.media_choice(kind);
+        let entry_id = self.next_id();
+        let Some(conversation) = self.find(id) else { return };
+        let mut message = StoredMessage::new(Role::Assistant, String::new());
+        message.model = Some(model.clone());
+        message.media = Some(MediaJob { kind, id: String::new() });
+        let mut entry = Entry::new(entry_id, message);
+        entry.media_since = Some(Instant::now());
+        conversation.entries.push(entry);
+        conversation.updated = unix_now();
+        actions.push(Action::SaveSession(conversation.to_session()));
+        let cancel = Arc::clone(&conversation.media_cancel);
+        actions.push(Action::Generate(MediaRequest { conversation: id, entry: entry_id, kind, model, mode, prompt, job: None, cancel }));
+        if id == self.current {
+            self.stick_to_bottom = true;
+        }
+    }
+
+    /// The server accepted a generation: remember its job, so it survives a
+    /// restart, and what it costs.
+    pub fn media_started(&mut self, conversation: u64, entry: u64, ticket: MediaTicket, actions: &mut Vec<Action>) {
+        let Some(target) = self.find(conversation) else { return };
+        let Some(message) = target.entries.iter_mut().find(|e| e.id == entry).map(|e| &mut e.message) else { return };
+        if let Some(job) = &mut message.media {
+            job.id = ticket.id;
+        }
+        message.cost = ticket.sparks * SPARK_USD;
+        actions.push(Action::SaveSession(target.to_session()));
+    }
+
+    /// A generation finished: its file, or why there is none. `Ok(None)`
+    /// means nobody waits for it any more.
+    pub fn media_done(&mut self, conversation: u64, entry: u64, result: Result<Option<Attachment>, String>, actions: &mut Vec<Action>) {
+        let Some(target) = self.find(conversation) else { return };
+        let Some(found) = target.entries.iter_mut().find(|e| e.id == entry) else { return };
+        let message = &mut found.message;
+        match result {
+            Ok(None) => return,
+            Ok(Some(file)) => message.attachments = vec![file],
+            Err(error) => {
+                let noun = message.media.as_ref().map_or("file", |job| job.kind.noun());
+                message.content = format!("The {noun} could not be generated: {error}");
+                message.failed = true;
+                // The server refunds generations that fail.
+                message.cost = 0.0;
+                found.doc = None;
+            }
+        }
+        found.media_since = None;
+        actions.push(Action::SaveSession(target.to_session()));
+        actions.push(Action::Attention);
+    }
+
+    /// Stores the generation models of `kind` that work from a prompt,
+    /// keeping the choice valid.
+    pub fn set_media_models(&mut self, kind: MediaKind, mut models: Vec<MediaModel>) {
+        models.retain(|m| m.prompt_mode().is_some());
+        let chosen = &mut self.media_model[kind.index()];
+        if !models.iter().any(|m| &m.id == chosen)
+            && let Some(fallback) = models.iter().find(|m| m.id == DEFAULT_MEDIA[kind.index()]).or(models.first())
+        {
+            chosen.clone_from(&fallback.id);
+        }
+        self.media_models[kind.index()] = models;
+    }
+
+    /// Restores the generation model of `kind` picked in an earlier run.
+    pub fn set_media_choice(&mut self, kind: MediaKind, model: Option<String>) {
+        if let Some(model) = model {
+            self.media_model[kind.index()] = model;
+        }
     }
 
     fn toggle_settings(&mut self, actions: &mut Vec<Action>) {
@@ -984,7 +1199,8 @@ impl Chat {
             // Enter runs the picked slash command, Tab completes it.
             Key::Named(key @ (NamedKey::Enter | NamedKey::Tab)) if !commands.is_empty() && !mods.shift_key() => {
                 let command = commands[self.command_pick.min(commands.len() - 1)];
-                if *key == NamedKey::Enter {
+                // Commands that take a prompt complete either way.
+                if *key == NamedKey::Enter || matches!(command, Command::Media(_)) {
                     self.run_command(command, actions);
                 } else {
                     self.composer.take();
@@ -1148,6 +1364,18 @@ enum Decision {
     Deny,
 }
 
+/// The action computing the diff of `call` against its file in `root`, if
+/// it is a file change waiting for approval.
+fn preview(root: &std::path::Path, call: &serechat::ToolCall, conversation: u64) -> Option<Action> {
+    (tools::changes_file(&call.name) && tools::needs_approval(&call.name))
+        .then(|| Action::PreviewChange { conversation, root: root.to_path_buf(), call: call.clone() })
+}
+
+/// Display name of a text or generation model id.
+fn label_of<'a>(models: &'a [Model], media: &'a [Vec<MediaModel>; 3], id: &'a str) -> &'a str {
+    media.iter().flatten().find(|m| m.id == id).map_or_else(|| model_name(models, id), MediaModel::label)
+}
+
 /// Display name of a model id.
 fn model_name<'a>(models: &'a [Model], id: &'a str) -> &'a str {
     models.iter().find(|m| m.id == id && !m.name.is_empty()).map_or(id, |m| m.name.as_str())
@@ -1176,7 +1404,9 @@ pub fn display_path(path: &str) -> String {
 fn usage_caption(model: &str, usage: Usage, cost: f64) -> String {
     let tokens = usage.input_tokens + usage.output_tokens;
     match (tokens, cost > 0.0) {
-        (0, _) => model.to_owned(),
+        (0, false) => model.to_owned(),
+        // Generations are billed per file, not per token.
+        (0, true) => format!("{model}  ·  {}", format_cost(cost)),
         (_, true) => format!("{model}  ·  {} tokens  ·  {}", group_digits(tokens), format_cost(cost)),
         (_, false) => format!("{model}  ·  {} tokens", group_digits(tokens)),
     }
@@ -1239,7 +1469,8 @@ mod tests {
         let usage = Usage::new(1_000, 204);
         assert_eq!(usage_caption("M", usage, 0.0031), "M  ·  1,204 tokens  ·  $0.0031");
         assert_eq!(usage_caption("M", usage, 0.0), "M  ·  1,204 tokens");
-        assert_eq!(usage_caption("M", Usage::default(), 1.0), "M");
+        assert_eq!(usage_caption("M", Usage::default(), 0.0), "M");
+        assert_eq!(usage_caption("M", Usage::default(), 0.04), "M  ·  $0.04");
     }
 
     #[test]
@@ -1366,7 +1597,7 @@ mod tests {
         chat.send(&mut actions);
         assert!(actions.is_empty());
 
-        chat.session_loaded(id, Ok(session.clone()));
+        chat.session_loaded(id, Ok(session.clone()), &mut Vec::new());
         assert_eq!(chat.current().to_session(), session);
         chat.send(&mut actions);
         assert!(matches!(&actions[..], [Action::SaveSession(saved), Action::Send(job)] if saved.messages.len() == 3 && !job.tools));
@@ -1705,7 +1936,7 @@ mod tests {
         chat.close_menu();
         chat.sync_command_menu();
         assert!(chat.menu.is_none() && chat.commands().is_empty());
-        chat.composer.insert("c");
+        chat.composer.insert("cl");
         assert_eq!(chat.commands(), [Command::Clear]);
     }
 
@@ -1724,5 +1955,124 @@ mod tests {
         chat.resume(job.conversation, &mut actions);
         assert!(next_send(actions).is_some());
         assert_eq!(chat.current().steps, 0);
+    }
+
+    /// Types `text` and presses Enter.
+    fn enter(chat: &mut Chat, text: &str) -> Vec<Action> {
+        chat.composer.insert(text);
+        let mut actions = Vec::new();
+        chat.send(&mut actions);
+        actions
+    }
+
+    #[test]
+    fn generations_wait_for_their_file_and_survive_a_restart() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        chat.set_media_choice(MediaKind::Video, Some("veo".into()));
+        let actions = enter(&mut chat, "/video  waves at dusk ");
+        let Some(Action::Generate(request)) = actions.iter().find(|a| matches!(a, Action::Generate(_))) else { panic!("no generation") };
+        assert_eq!((request.kind, request.model.as_str(), request.prompt.as_str(), request.job.as_deref()), (MediaKind::Video, "veo", "waves at dusk", None));
+        let (id, entry) = (request.conversation, request.entry);
+        assert!(!chat.current().busy(), "chatting goes on while it is made");
+        assert!(!chat.current().resumable(), "a generation is not a prompt the model owes");
+
+        let mut actions = Vec::new();
+        chat.media_started(id, entry, MediaTicket { id: "job-1".into(), sparks: 80.0 }, &mut actions);
+        let Some(Action::SaveSession(saved)) = actions.pop() else { panic!("not saved") };
+        let reply = saved.messages.last().unwrap();
+        assert_eq!(reply.media.as_ref().map(|j| j.id.as_str()), Some("job-1"));
+        assert!((reply.cost - 0.8).abs() < 1e-9);
+
+        // The app closes; the session reopens and keeps waiting for the job.
+        let mut reopened = Chat::new(None, Reasoning::Auto, vec![saved.summary()], Vec::new(), None);
+        let conversation = reopened.conversations.iter().find(|c| c.session_id == saved.id).map(|c| c.id).unwrap();
+        reopened.open(conversation, &mut Vec::new());
+        let mut actions = Vec::new();
+        reopened.session_loaded(conversation, Ok(saved.clone()), &mut actions);
+        assert!(actions.iter().any(|a| matches!(a, Action::Generate(r) if r.job.as_deref() == Some("job-1"))));
+
+        let file = Attachment { name: "waves.mp4".into(), mime: "video/mp4".into(), size: 9, path: "x".into(), dimensions: None };
+        let mut actions = Vec::new();
+        chat.media_done(id, entry, Ok(Some(file)), &mut actions);
+        assert!(chat.current().entries.last().is_some_and(|e| !e.message.media_pending() && e.message.attachments.len() == 1));
+        let history: Vec<StoredMessage> = chat.current().entries.iter().map(|e| e.message.clone()).collect();
+        let items = input_items(&history).unwrap();
+        assert!(matches!(&items[1], InputItem::Message { parts, .. } if matches!(&parts[0], Part::Text(t) if t.contains("video waves.mp4"))));
+
+        // A request the server never accepted cannot be picked up again.
+        let mut lost = saved;
+        if let Some(job) = &mut lost.messages.last_mut().unwrap().media {
+            job.id.clear();
+        }
+        let mut chat = Chat::new(None, Reasoning::Auto, vec![lost.summary()], Vec::new(), None);
+        let conversation = chat.conversations.iter().find(|c| c.session_id == lost.id).map(|c| c.id).unwrap();
+        chat.open(conversation, &mut Vec::new());
+        let mut actions = Vec::new();
+        chat.session_loaded(conversation, Ok(lost), &mut actions);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Generate(_))));
+        assert!(chat.current().entries.last().is_some_and(|e| e.message.failed));
+
+        // Generating takes text only.
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        chat.pending.push(Attachment { name: "a.png".into(), mime: "image/png".into(), size: 1, path: "a".into(), dimensions: None });
+        assert!(enter(&mut chat, "/image a fox").is_empty());
+        assert!(chat.notice.is_some());
+    }
+
+    #[test]
+    fn compact_on_request_summarises_without_replying() {
+        let mut chat = project_chat();
+        let job = start(&mut chat, "hello");
+        chat.stream_event(job.conversation, job.stream, StreamEvent::Text("hi".into()));
+        finish(&mut chat, &job, Completion { usage: Usage::new(500, 20), ..Completion::default() });
+
+        let summary = next_send(enter(&mut chat, "/compact")).expect("a summary request");
+        assert_eq!(summary.tool_choice, Some("none"));
+        chat.stream_event(summary.conversation, summary.stream, StreamEvent::Text("They said hello.".into()));
+        let actions = finish(&mut chat, &summary, Completion { usage: Usage::new(600, 10), ..Completion::default() });
+        assert!(next_send(actions).is_none(), "nothing is owed after /compact");
+        assert!(!chat.current().resumable());
+        assert!(chat.current().entries.last().is_some_and(|e| e.message.compaction));
+
+        // Twice in a row has nothing left to summarise.
+        assert!(next_send(enter(&mut chat, "/compact")).is_none());
+        assert!(chat.notice.is_some());
+    }
+
+    #[test]
+    fn init_new_and_model_commands() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        assert!(enter(&mut chat, "/init").is_empty(), "/init needs a project");
+
+        let mut chat = project_chat();
+        let job = next_send(enter(&mut chat, "/init")).expect("/init is sent");
+        assert!(job.history[0].content == "/init", "the chat shows what was typed");
+        let items = input_items(&job.history).unwrap();
+        assert!(matches!(&items[0], InputItem::Message { parts, .. } if matches!(&parts[0], Part::Text(t) if t.contains("AGENTS.md"))));
+
+        let project = chat.current().project.clone();
+        let before = chat.current;
+        enter(&mut chat, "/new");
+        assert!(chat.current != before && chat.current().is_fresh() && chat.current().project == project, "a new chat in the same folder");
+
+        enter(&mut chat, "/model");
+        assert!(chat.menu == Some(Menu::Model) && chat.composer.text().is_empty());
+        // A command followed by text is just a message.
+        assert!(next_send(enter(&mut chat, "/new plans")).is_some());
+    }
+
+    #[test]
+    fn file_changes_are_diffed_before_approval() {
+        let mut chat = project_chat();
+        let job = start(&mut chat, "write it");
+        let calls = vec![call("w", "write_file", r#"{"path":"x.txt","content":"one\ntwo"}"#), call("r", "read_file", r#"{"path":"x.txt"}"#)];
+        let actions = finish(&mut chat, &job, Completion { tool_calls: calls, ..Completion::default() });
+        let previews: Vec<&str> = actions.iter().filter_map(|a| if let Action::PreviewChange { call, .. } = a { Some(call.call_id.as_str()) } else { None }).collect();
+        assert_eq!(previews, ["w"], "only the change waiting for approval");
+
+        let diff = Arc::new(crate::diff::diff("one\n", "one\ntwo\n", true));
+        chat.diff_ready(job.conversation, "w", diff);
+        let entry = chat.current().entries.iter().find(|e| e.diffs.contains_key("w")).expect("stored with its call");
+        assert_eq!(entry.message.tool_calls[0].call.call_id, "w");
     }
 }

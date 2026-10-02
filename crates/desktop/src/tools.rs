@@ -367,6 +367,53 @@ pub fn run(root: &Path, owner: u64, client: &Client, call: &ToolCall, cancel: &A
     Ok(truncate_middle(output, MAX_OUTPUT))
 }
 
+/// Whether `name` changes a file's content, so its card shows a diff.
+#[must_use]
+pub fn changes_file(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file")
+}
+
+/// What a `write_file` or `edit_file` call changes, as `(before, after,
+/// whole file)`: the whole file before and after when it can be read,
+/// otherwise just the call's own text. Reads the file (inside `root`), so
+/// call it off the UI thread.
+#[must_use]
+pub fn file_change(root: &Path, call: &ToolCall) -> Option<(String, String, bool)> {
+    let a = args(call);
+    let path = resolve(root, arg(&a, "path")?).ok()?;
+    let current = match fs::metadata(&path) {
+        Ok(meta) if meta.is_file() && meta.len() <= 2 << 20 => fs::read_to_string(&path).ok(),
+        // A file that does not exist yet is created from nothing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+        _ => None,
+    };
+    match (call.name.as_str(), current) {
+        ("write_file", Some(text)) => Some((text, arg(&a, "content")?.to_owned(), true)),
+        ("edit_file", Some(text)) => {
+            let (old, new) = (arg(&a, "old_string")?, arg(&a, "new_string")?);
+            if !old.is_empty() && text.matches(old).count() == 1 {
+                let after = text.replacen(old, new, 1);
+                Some((text, after, true))
+            } else {
+                snippet_change(call)
+            }
+        }
+        _ => snippet_change(call),
+    }
+}
+
+/// What a `write_file` or `edit_file` call changes, from its arguments
+/// alone: `(old text, new text, false)`. Cheap enough for the UI thread.
+#[must_use]
+pub fn snippet_change(call: &ToolCall) -> Option<(String, String, bool)> {
+    let a = args(call);
+    match call.name.as_str() {
+        "write_file" => Some((String::new(), arg(&a, "content")?.to_owned(), false)),
+        "edit_file" => Some((arg(&a, "old_string")?.to_owned(), arg(&a, "new_string")?.to_owned(), false)),
+        _ => None,
+    }
+}
+
 /// The `id` argument of a process tool.
 fn process_id(args: &Value) -> Result<u32, String> {
     args.get("id").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()).ok_or_else(|| "Missing the 'id' argument.".to_owned())
@@ -759,6 +806,17 @@ mod tests {
         assert!(exec(&root, "edit_file", &json!({ "path": "out/new.txt", "old_string": "a", "new_string": "x" })).unwrap_err().contains("2 times"));
         exec(&root, "edit_file", &json!({ "path": "out/new.txt", "old_string": "b", "new_string": "c" })).unwrap();
         assert_eq!(fs::read_to_string(root.join("out/new.txt")).unwrap(), "a c a");
+
+        // Diffs see the whole file when they can, the call's text otherwise.
+        let edit = call("edit_file", &json!({ "path": "out/new.txt", "old_string": "c", "new_string": "d" }));
+        assert_eq!(file_change(&root, &edit), Some(("a c a".into(), "a d a".into(), true)));
+        let ambiguous = call("edit_file", &json!({ "path": "out/new.txt", "old_string": "a", "new_string": "x" }));
+        assert_eq!(file_change(&root, &ambiguous), Some(("a".into(), "x".into(), false)));
+        let create = call("write_file", &json!({ "path": "out/fresh.txt", "content": "hi" }));
+        assert_eq!(file_change(&root, &create), Some((String::new(), "hi".into(), true)));
+        let outside = call("write_file", &json!({ "path": "../escape.txt", "content": "x" }));
+        assert_eq!(file_change(&root, &outside), None, "never reads outside the project");
+        assert!(changes_file("edit_file") && !changes_file("read_file"));
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -41,6 +41,10 @@ pub struct Palette {
     pub selection: Color,
     /// Errors and destructive actions.
     pub danger: Color,
+    /// Lines a change adds (diffs).
+    pub added: Color,
+    /// Lines a change removes (diffs).
+    pub removed: Color,
     /// Drop shadows under floating surfaces.
     pub shadow: Color,
     /// Background of code blocks.
@@ -72,6 +76,8 @@ impl Palette {
             on_accent: m(self.on_accent, other.on_accent),
             selection: m(self.selection, other.selection),
             danger: m(self.danger, other.danger),
+            added: m(self.added, other.added),
+            removed: m(self.removed, other.removed),
             shadow: m(self.shadow, other.shadow),
             code_bg: m(self.code_bg, other.code_bg),
             link: m(self.link, other.link),
@@ -97,6 +103,8 @@ pub const DARK: Palette = Palette {
     on_accent: hex(0x161618),
     selection: hexa(0xFFFFFF, 0.16),
     danger: hex(0xEB6F6F),
+    added: hex(0x3FB950),
+    removed: hex(0xF85149),
     shadow: hexa(0x000000, 0.5),
     code_bg: hex(0x1B1B1E),
     link: hex(0x8AB4F8),
@@ -121,6 +129,8 @@ pub const BLUE: Palette = Palette {
     on_accent: hex(0x1B1F25),
     selection: hexa(0x74ADE8, 0.24),
     danger: hex(0xD07277),
+    added: hex(0xA1C181),
+    removed: hex(0xD07277),
     shadow: hexa(0x000000, 0.35),
     code_bg: hex(0x23272E),
     link: hex(0x74ADE8),
@@ -145,6 +155,8 @@ pub const LIGHT: Palette = Palette {
     on_accent: hex(0xFFFFFF),
     selection: hexa(0x2563EB, 0.18),
     danger: hex(0xD93636),
+    added: hex(0x1A7F37),
+    removed: hex(0xCF222E),
     shadow: hexa(0x000000, 0.1),
     code_bg: hex(0xF6F6F8),
     link: hex(0x2563EB),

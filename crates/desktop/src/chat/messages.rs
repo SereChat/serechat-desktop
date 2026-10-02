@@ -1,13 +1,18 @@
-//! The message list: Markdown replies, prompts with attachments, the
-//! reasoning block, tool-call cards with approvals, selection and scrolling.
+//! The message list: Markdown replies, prompts with attachments, generated
+//! images, videos and audio, the reasoning block, tool-call cards with
+//! approvals and diffs, selection and scrolling.
 
-use serechat::ToolStatus;
+use std::sync::Arc;
+
+use serechat::{MediaKind, StoredMessage, ToolStatus};
 use winit::window::CursorIcon;
 
-use super::composer::{file_badge, file_icon};
+use super::composer::{capitalized, file_badge, file_icon};
 use super::agent::MAX_RETRIES;
-use super::{Chat, Decision, Entry, Load, PRIMARY_KEY, ReasoningView, SelPos, StreamingCall, format_cost, model_name, usage_caption};
+use super::{Chat, Decision, Entry, Load, PRIMARY_KEY, ReasoningView, SelPos, StreamingCall, format_cost, label_of, usage_caption};
 use crate::app::Action;
+use crate::attachments::human_size;
+use crate::diff::{self, Diff, Kind};
 use crate::doc::{Doc, INK_MUTED, INK_TEXT};
 use crate::image::{self, Lookup};
 use crate::paint::{Painter, Rect, fade, mix};
@@ -40,6 +45,101 @@ const IMAGE_TILE: (f32, f32) = (160.0, 120.0);
 const STREAM_LINES: usize = 14;
 /// Style of tool output.
 const TOOL_STYLE: Style = Style { line_height: 1.5, ..Style::mono(12.0) };
+/// Height of a diff row (one line of [`TOOL_STYLE`]).
+const DIFF_ROW: f32 = 18.0;
+/// Diff rows shown before "Show all".
+const DIFF_ROWS: usize = 16;
+/// Most diff rows ever laid out.
+const DIFF_MAX_ROWS: usize = 2000;
+/// Height of the "Show all" row under a long diff.
+const DIFF_FOOTER: f32 = 28.0;
+/// Largest side of a generated image, before the thumbnail limit.
+const IMAGE_MAX: f32 = 480.0;
+/// Side of the tile an image is generated into.
+const IMAGE_PENDING: f32 = 280.0;
+/// Height of a generated video or audio file's card.
+const MEDIA_CARD_H: f32 = 60.0;
+/// Width of that card.
+const MEDIA_CARD_W: f32 = 420.0;
+
+/// A file change shown as a diff, with its rows laid out.
+pub(super) struct DiffView {
+    diff: Arc<Diff>,
+    /// Diffed against the file itself, so its line numbers are real.
+    exact: bool,
+    /// Every row is shown, not only the first [`DIFF_ROWS`].
+    full: bool,
+    /// Rows laid out, and the (row count, scale) they were laid out for.
+    rows: Option<((usize, u32), DiffRows)>,
+}
+
+/// Laid-out rows of a diff.
+struct DiffRows {
+    /// Width of each line-number column; 0 without numbers.
+    gutter: f32,
+    rows: Vec<RowText>,
+}
+
+/// One diff row's text: old and new line numbers, and the line.
+struct RowText {
+    old: Option<TextLayout>,
+    new: Option<TextLayout>,
+    text: TextLayout,
+}
+
+impl DiffView {
+    /// A view of `diff`; `exact` when diffed against the whole file.
+    pub(super) fn new(diff: Arc<Diff>, exact: bool, full: bool) -> Self {
+        Self { diff, exact, full, rows: None }
+    }
+
+    /// Whether the user asked for every row.
+    pub(super) fn full(&self) -> bool {
+        self.full
+    }
+
+    /// Rows shown (an unchanged file shows one saying so).
+    fn shown(&self) -> usize {
+        let rows = self.diff.lines.len().max(1);
+        rows.min(if self.full { DIFF_MAX_ROWS } else { DIFF_ROWS })
+    }
+
+    /// Whether a "Show all" row follows.
+    fn footer(&self) -> bool {
+        self.diff.lines.len() > DIFF_ROWS
+    }
+
+    fn height(&self) -> f32 {
+        12.0 + self.shown() as f32 * DIFF_ROW + if self.footer() { DIFF_FOOTER } else { 0.0 }
+    }
+
+    /// Lays out the rows shown, unless done for this count and scale.
+    fn layout(&mut self, p: &Painter) {
+        let key = (self.shown(), p.scale.to_bits());
+        if self.rows.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        let lines = &self.diff.lines[..key.0.min(self.diff.lines.len())];
+        let digits = lines.iter().map(|l| l.old.max(l.new)).max().unwrap_or(0).to_string().len();
+        let numbered = self.exact && lines.iter().any(|l| l.old > 0 || l.new > 0);
+        let gutter = if numbered { p.layout(&"8".repeat(digits), TOOL_STYLE, None).width() + 16.0 } else { 0.0 };
+        let number = |n: usize| (numbered && n > 0).then(|| p.layout(&n.to_string(), TOOL_STYLE, None));
+        let mut rows: Vec<RowText> = lines
+            .iter()
+            .map(|line| {
+                let text = match line.kind {
+                    Kind::Skipped => format!("⋯ {} unchanged line{}", line.skipped, if line.skipped == 1 { "" } else { "s" }),
+                    _ => line.text.clone(),
+                };
+                RowText { old: number(line.old), new: number(line.new), text: p.layout(&text, TOOL_STYLE, None) }
+            })
+            .collect();
+        if rows.is_empty() {
+            rows.push(RowText { old: None, new: None, text: p.layout("No changes.", TOOL_STYLE, None) });
+        }
+        self.rows = Some((key, DiffRows { gutter, rows }));
+    }
+}
 
 /// Where a laid-out document was drawn, for hit-testing after the frame.
 struct Target {
@@ -83,6 +183,9 @@ impl Entry {
             self.doc_key = key;
         }
         let doc_h = self.doc.as_ref().map_or(0.0, |d| d.height);
+        if self.message.media.is_some() && !boxed {
+            return media_size(&self.message, width, p.scale).1 + META_H;
+        }
         if boxed {
             let chips = attachment_layout(p, &self.message.attachments, wrap).1;
             let text = if self.message.content.is_empty() { 0.0 } else { doc_h };
@@ -150,11 +253,49 @@ impl Entry {
         Some(lines.join("\n"))
     }
 
+    /// Whether tool card `index` shows its file change as a diff: while it
+    /// waits for approval, and once done when opened.
+    fn shows_diff(&self, index: usize) -> bool {
+        let record = &self.message.tool_calls[index];
+        tools::changes_file(&record.call.name)
+            && match record.status {
+                ToolStatus::Pending => tools::needs_approval(&record.call.name),
+                ToolStatus::Done => self.open_tools.contains(&index),
+                ToolStatus::Running | ToolStatus::Failed | ToolStatus::Denied => false,
+            }
+    }
+
+    /// The diff of tool card `index` if it changes a file (and the change is
+    /// pending or made). Until the file's own arrives from a worker, it is
+    /// made from the call's text.
+    fn diff_view(&mut self, index: usize) -> Option<&mut DiffView> {
+        let record = &self.message.tool_calls[index];
+        if !tools::changes_file(&record.call.name) || !matches!(record.status, ToolStatus::Pending | ToolStatus::Done) {
+            return None;
+        }
+        let id = &record.call.call_id;
+        if !self.diffs.contains_key(id) {
+            let (before, after, whole) = tools::snippet_change(&record.call)?;
+            self.diffs.insert(id.clone(), DiffView::new(Arc::new(diff::diff(&before, &after, whole)), false, false));
+        }
+        self.diffs.get_mut(id)
+    }
+
     /// Height of tool card `index`, refreshing its body layout.
     fn tool_height(&mut self, p: &Painter, index: usize, width: f32) -> f32 {
+        let shows_diff = self.shows_diff(index);
         let record = &self.message.tool_calls[index];
         let status = record.status;
         let approval = status == ToolStatus::Pending && tools::needs_approval(&record.call.name);
+        // The header shows a change's size even while its diff is closed.
+        if let Some(view) = self.diff_view(index)
+            && shows_diff
+        {
+            view.layout(p);
+            let height = TOOL_ROW + view.height() + if approval { APPROVAL_ROW } else { 0.0 };
+            self.tool_bodies[index] = None;
+            return height;
+        }
         let body = self.tool_body(index);
         let slot = &mut self.tool_bodies[index];
         let mut height = TOOL_ROW;
@@ -233,7 +374,7 @@ impl Chat {
         let selection = self.selection.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
         let current = self.current;
         let reasoning_view = self.reasoning_view;
-        let models = &self.models;
+        let (models, media_models) = (&self.models, &self.media_models);
         let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == current) else { return };
 
         match &conversation.load {
@@ -355,6 +496,19 @@ impl Chat {
             }
 
             let mut top = area.y;
+            if entry.message.media.is_some() {
+                // A generation: the file it made, or a placeholder while it waits.
+                let model = entry.message.model.as_deref().map_or("", |m| label_of(models, media_models, m));
+                let (media_w, media_h) = media_size(&entry.message, width, p.scale);
+                if let Some(path) = draw_media(p, ui, entry, Rect::new(x, top, media_w, media_h), model, in_view) {
+                    effects.open_path = Some(path);
+                }
+                if !entry.message.media_pending() {
+                    let caption = p.layout(&usage_caption(model, entry.message.usage, entry.message.cost), theme::TINY, None);
+                    p.text(&caption, x, top + media_h + 6.0 + (24.0 - caption.height()) * 0.5, t.text_faint);
+                }
+                continue;
+            }
             if entry.message.compaction {
                 // A summary replaced the messages above for the model; it
                 // opens like a reasoning block.
@@ -456,7 +610,7 @@ impl Chat {
             // Caption and hover actions under a finished reply.
             let meta_y = top + 6.0;
             if let Some(model) = &entry.message.model {
-                let text = usage_caption(model_name(models, model), entry.message.usage, entry.message.cost);
+                let text = usage_caption(label_of(models, media_models, model), entry.message.usage, entry.message.cost);
                 let caption = p.layout(&text, theme::TINY, None);
                 p.text(&caption, x, meta_y + (24.0 - caption.height()) * 0.5, t.text_faint);
             }
@@ -722,7 +876,7 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
     let verb = p.layout(view.verb, theme::LABEL, None);
     p.text(&verb, header.x + 34.0, header.y + (TOOL_ROW - verb.height()) * 0.5, t.text);
     let expandable = status.is_finished() && !record.output.is_empty() && !shows_plan(record);
-    let right = if approval {
+    let mut right = if approval {
         let waiting = p.layout("Needs approval", theme::TINY, None);
         p.text(&waiting, header.right() - 12.0 - waiting.width(), header.y + (TOOL_ROW - waiting.height()) * 0.5, t.accent);
         waiting.width() + 24.0
@@ -732,6 +886,18 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
     } else {
         12.0
     };
+    // A file change's size: `+12 −3`.
+    if let Some(change) = entry.diffs.get(&record.call.call_id).filter(|_| matches!(status, ToolStatus::Pending | ToolStatus::Done)) {
+        let (added, removed) = (change.diff.added, change.diff.removed);
+        for (count, sign, color) in [(removed, '−', t.removed), (added, '+', t.added)] {
+            if count > 0 || (added == 0 && removed == 0 && sign == '+') {
+                let label = p.layout(&format!("{sign}{count}"), Style::mono(11.5), None);
+                right += label.width() + 6.0;
+                p.text(&label, header.right() - right, header.y + (TOOL_ROW - label.height()) * 0.5, color);
+            }
+        }
+        right += 6.0;
+    }
     let mut target = p.layout(&view.target.replace('\n', " "), TOOL_STYLE, None);
     target.truncate(p.fonts, (rect.w - 46.0 - verb.width() - right).max(20.0));
     p.text(&target, header.x + 42.0 + verb.width(), header.y + (TOOL_ROW - target.height()) * 0.5, t.text_muted);
@@ -742,9 +908,19 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
         }
     }
 
-    // Body: the preview awaiting approval, or the expanded output.
+    // Body: the change as a diff, the preview awaiting approval, or the expanded output.
     let mut y = header.bottom();
-    if let Some((_, layout)) = entry.tool_bodies.get(index).and_then(Option::as_ref) {
+    if let Some(change) = entry.diffs.get(&record.call.call_id).filter(|_| entry.shows_diff(index)) {
+        p.rect(Rect::new(rect.x, y, rect.w, 1.0), t.border, 0.0);
+        let body = Rect::new(rect.x, y, rect.w, change.height());
+        if draw_diff(p, ui, change, body, interactive)
+            && let Some(change) = entry.diffs.get_mut(&record.call.call_id)
+        {
+            change.full = !change.full;
+            ui.animating = true;
+        }
+        y = body.bottom();
+    } else if let Some((_, layout)) = entry.tool_bodies.get(index).and_then(Option::as_ref) {
         p.rect(Rect::new(rect.x, y, rect.w, 1.0), t.border, 0.0);
         let body_h = layout.height().min(TOOL_BODY_MAX);
         let clip = p.push_clip(Rect::new(rect.x, y + 7.0, rect.w, body_h));
@@ -775,6 +951,172 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
         }
     }
     None
+}
+
+/// Draws a diff into `rect` (its rows laid out by [`DiffView::layout`]):
+/// tinted rows with a coloured edge for added and removed lines, line
+/// numbers, and the changed part of edited lines picked out. Returns whether
+/// "Show all" (or "Show fewer") was clicked.
+fn draw_diff(p: &mut Painter, ui: &mut Ui, view: &DiffView, rect: Rect, interactive: bool) -> bool {
+    let t = p.theme;
+    let Some((_, rows)) = &view.rows else { return false };
+    let gutter = rows.gutter;
+    let sign_x = rect.x + gutter * 2.0 + 10.0;
+    let text_x = sign_x + 16.0;
+    let clip = p.push_clip(Rect::new(rect.x, rect.y, rect.w, rect.h - if view.footer() { DIFF_FOOTER } else { 0.0 }));
+    let mut y = rect.y + 6.0;
+    for (index, row) in rows.rows.iter().enumerate() {
+        let line = view.diff.lines.get(index);
+        let kind = line.map_or(Kind::Skipped, |l| l.kind);
+        // Inside the card's hairline border.
+        let band = Rect::new(rect.x + 1.0, y, rect.w - 2.0, DIFF_ROW);
+        let middle = |layout: &TextLayout| y + (DIFF_ROW - layout.height()) * 0.5;
+        let (ink, text_color) = match kind {
+            Kind::Added => (Some(t.added), t.text),
+            Kind::Removed => (Some(t.removed), t.text),
+            Kind::Same => (None, t.text_muted),
+            Kind::Skipped => (None, t.text_faint),
+        };
+        match ink {
+            Some(color) => {
+                p.rect(band, fade(color, 0.1), 0.0);
+                p.rect(Rect::new(band.x, y, 2.0, DIFF_ROW), color, 0.0);
+            }
+            None if kind == Kind::Skipped => p.rect(band, fade(t.text, 0.03), 0.0),
+            None => {}
+        }
+        // Line numbers, right-aligned in their columns.
+        for (number, column) in [(&row.old, 0.0), (&row.new, 1.0)] {
+            if let Some(number) = number {
+                p.text(number, rect.x + gutter * (column + 1.0) - 6.0 - number.width(), middle(number), t.text_faint);
+            }
+        }
+        if let Some(color) = ink {
+            let sign = if kind == Kind::Added { "+" } else { "−" };
+            p.label(sign, TOOL_STYLE, sign_x, y + 1.0, color);
+            if let Some((start, end)) = line.and_then(|l| l.changed) {
+                let (from, to) = (row.text.caret(start).0, row.text.caret(end).0);
+                p.rect(Rect::new(text_x + from, y + 1.0, (to - from).max(2.0), DIFF_ROW - 2.0), fade(color, 0.3), 2.0);
+            }
+        }
+        p.text(&row.text, text_x, middle(&row.text), text_color);
+        y += DIFF_ROW;
+    }
+    p.set_clip(clip);
+    if !view.footer() {
+        return false;
+    }
+    let footer = Rect::new(rect.x, rect.bottom() - DIFF_FOOTER, rect.w, DIFF_FOOTER);
+    p.rect(Rect::new(footer.x, footer.y, footer.w, 1.0), t.border, 0.0);
+    let total = view.diff.lines.len();
+    let label = if view.full {
+        "Show fewer lines".to_owned()
+    } else {
+        format!("Show all {total} lines")
+    };
+    let hovered = interactive && ui.hovered(footer);
+    let label = p.layout(&label, theme::TINY, None);
+    p.text(&label, text_x, footer.y + (DIFF_FOOTER - label.height()) * 0.5, if hovered { t.text } else { t.text_muted });
+    if view.full && total > DIFF_MAX_ROWS {
+        let more = p.layout(&format!("{} more not shown", total - DIFF_MAX_ROWS), theme::TINY, None);
+        p.text(&more, footer.right() - 12.0 - more.width(), footer.y + (DIFF_FOOTER - more.height()) * 0.5, t.text_faint);
+    }
+    if hovered {
+        ui.cursor = CursorIcon::Pointer;
+        return ui.clicked(footer);
+    }
+    false
+}
+
+/// Size of a generation's block at column `width`: a generated image at its
+/// own aspect ratio (within the thumbnail limit at `scale`), a square tile
+/// while one is made, or a file card.
+fn media_size(message: &StoredMessage, width: f32, scale: f32) -> (f32, f32) {
+    let card = (width.min(MEDIA_CARD_W), MEDIA_CARD_H);
+    let Some(job) = &message.media else { return card };
+    if message.media_pending() {
+        return if job.kind == MediaKind::Image { (IMAGE_PENDING.min(width), IMAGE_PENDING) } else { card };
+    }
+    match message.attachments.first() {
+        Some(file) if image::supported(&file.mime) => {
+            let limit = image::MAX_THUMB as f32 / scale.max(1.0);
+            let (w, h) = file.dimensions.map_or((1.0, 1.0), |(w, h)| (w as f32, h as f32));
+            let (max_w, max_h) = (width.min(IMAGE_MAX).min(limit), IMAGE_MAX.min(limit));
+            // Fit inside the box; small images keep their pixel size.
+            let fit = (max_w / w).min(max_h / h).min(if file.dimensions.is_some() { 1.0 } else { f32::MAX });
+            ((w * fit).floor().max(16.0), (h * fit).floor().max(16.0))
+        }
+        _ => card,
+    }
+}
+
+/// Draws a generation into `rect`: the waiting placeholder, the image, or a
+/// card for other files. Returns the file to open when clicked.
+fn draw_media(p: &mut Painter, ui: &mut Ui, entry: &Entry, rect: Rect, model: &str, interactive: bool) -> Option<String> {
+    let t = p.theme;
+    let message = &entry.message;
+    let job = message.media.as_ref()?;
+    if message.media_pending() {
+        let secs = entry.media_since.map_or(0, |since| since.elapsed().as_secs());
+        let what = format!("Generating {}", job.kind.noun());
+        let detail = if model.is_empty() { clock(secs) } else { format!("{model}  ·  {}", clock(secs)) };
+        if job.kind == MediaKind::Image {
+            // A tile that breathes while the picture is made.
+            let pulse = (ui.time * 1.8).sin() * 0.5 + 0.5;
+            p.rect(rect, mix(t.surface, t.hover, 0.3 + 0.5 * pulse), theme::RADIUS);
+            p.bordered(rect, [0.0; 4], theme::RADIUS, 1.0, t.border);
+            spinner(p, ui, Rect::new(rect.x + rect.w * 0.5 - 8.0, rect.y + rect.h * 0.5 - 24.0, 16.0, 16.0));
+            let label = p.layout(&what, theme::LABEL, None);
+            p.text_aligned(&label, rect.x, rect.y + rect.h * 0.5 + 2.0, Align::Center, rect.w, t.text_muted);
+            let mut detail = p.layout(&detail, theme::TINY, None);
+            detail.truncate(p.fonts, rect.w - 24.0);
+            p.text_aligned(&detail, rect.x, rect.y + rect.h * 0.5 + 24.0, Align::Center, rect.w, t.text_faint);
+        } else {
+            p.bordered(rect, t.surface, theme::RADIUS, 1.0, t.border);
+            spinner(p, ui, Rect::new(rect.x + 24.0, rect.y + (rect.h - 16.0) * 0.5, 16.0, 16.0));
+            p.label(&what, theme::LABEL, rect.x + 64.0, rect.y + 13.0, t.text);
+            let mut detail = p.layout(&detail, theme::TINY, None);
+            detail.truncate(p.fonts, rect.w - 80.0);
+            p.text(&detail, rect.x + 64.0, rect.y + 33.0, t.text_faint);
+        }
+        ui.animating = true;
+        return None;
+    }
+    let file = message.attachments.first()?;
+    let hovered = interactive && ui.hovered(rect);
+    if image::supported(&file.mime) {
+        match p.image(&file.path, rect, theme::RADIUS) {
+            Lookup::Ready(_) => {}
+            Lookup::Loading => p.rect(rect, t.hover, theme::RADIUS),
+            Lookup::Failed => {
+                p.rect(rect, t.hover, theme::RADIUS);
+                file_badge(p, &file.mime, &file.name, Rect::new(rect.x + (rect.w - 34.0) * 0.5, rect.y + (rect.h - 20.0) * 0.5, 34.0, 20.0));
+            }
+        }
+        p.bordered(rect, [0.0; 4], theme::RADIUS, 1.0, if hovered { t.border_focus } else { t.border });
+    } else {
+        p.bordered(rect, if hovered { t.hover } else { t.surface }, theme::RADIUS, 1.0, if hovered { t.border_strong } else { t.border });
+        file_badge(p, &file.mime, &file.name, Rect::new(rect.x + 12.0, rect.y + (rect.h - 30.0) * 0.5, 40.0, 30.0));
+        let open = p.layout("Open", theme::SMALL, None);
+        let mut name = p.layout(&file.name, theme::LABEL, None);
+        name.truncate(p.fonts, rect.w - 96.0 - open.width());
+        p.text(&name, rect.x + 64.0, rect.y + 13.0, t.text);
+        let detail = format!("{}  ·  {}", capitalized(job.kind.noun()), human_size(file.size));
+        p.label(&detail, theme::TINY, rect.x + 64.0, rect.y + 33.0, t.text_faint);
+        p.text(&open, rect.right() - 16.0 - open.width(), rect.y + (rect.h - open.height()) * 0.5, if hovered { t.text } else { t.text_muted });
+    }
+    if hovered {
+        ui.cursor = CursorIcon::Pointer;
+        if ui.clicked(rect) {
+            return Some(file.path.clone());
+        }
+    }
+    None
+}
+
+/// A wait in seconds as `12s` or `3m 05s`.
+fn clock(secs: u64) -> String {
+    if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) }
 }
 
 /// A small spinner in the 16×16 `icon`: eight dots fading around a circle.
@@ -849,7 +1191,24 @@ fn draw_empty(p: &mut Painter, view: Rect, project: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::reasoning_label;
+    use super::{IMAGE_MAX, IMAGE_PENDING, MEDIA_CARD_H, clock, media_size, reasoning_label};
+
+    #[test]
+    fn media_sizes() {
+        use serechat::{Attachment, MediaJob, MediaKind, Role, StoredMessage};
+        let mut message = StoredMessage::new(Role::Assistant, String::new());
+        message.media = Some(MediaJob { kind: MediaKind::Image, id: "j".into() });
+        assert_eq!(media_size(&message, 760.0, 1.0), (IMAGE_PENDING, IMAGE_PENDING), "a square tile while it is made");
+        let file = |mime: &str, dimensions| Attachment { name: "a".into(), mime: mime.into(), size: 1, path: "a".into(), dimensions };
+        message.attachments = vec![file("image/png", Some((1536, 1024)))];
+        assert_eq!(media_size(&message, 760.0, 1.0), (IMAGE_MAX, 320.0), "wide images keep their shape");
+        assert_eq!(media_size(&message, 760.0, 4.0), (256.0, 170.0), "never more pixels than a thumbnail holds");
+        message.attachments = vec![file("image/png", Some((64, 32)))];
+        assert_eq!(media_size(&message, 760.0, 1.0), (64.0, 32.0), "small images are not blown up");
+        message.attachments = vec![file("video/mp4", None)];
+        assert_eq!(media_size(&message, 300.0, 1.0), (300.0, MEDIA_CARD_H));
+        assert_eq!((clock(9), clock(185)), ("9s".to_owned(), "3m 05s".to_owned()));
+    }
 
     #[test]
     fn reasoning_labels() {

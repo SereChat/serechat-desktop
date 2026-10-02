@@ -22,7 +22,7 @@ const MAX_FILE: u64 = 32 << 20;
 /// Largest image decoded, in pixels (about 190 MB of RGBA).
 const MAX_PIXELS: usize = 48_000_000;
 /// Largest thumbnail side, in pixels.
-const MAX_THUMB: u32 = 1024;
+pub(crate) const MAX_THUMB: u32 = 1024;
 
 /// A thumbnail: the file and the exact size it is drawn at.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -157,6 +157,28 @@ pub fn thumbnail(key: &ImageKey) -> Result<Vec<u8>, String> {
     let (tw, th) = if swap { (key.h, key.w) } else { (key.w, key.h) };
     let small = cover(&rgba, w, h, tw, th);
     Ok(orient(&small, tw, th, orientation))
+}
+
+/// Width and height of a PNG or JPEG as displayed (EXIF rotation applied),
+/// read from its header. Reads the file, so call it off the UI thread.
+#[must_use]
+pub fn dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    let mut bytes = Vec::new();
+    fs::File::open(path).ok()?.take(MAX_FILE).read_to_end(&mut bytes).ok()?;
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        // The IHDR chunk always comes first.
+        let field = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+        return Some((field(16)?, field(20)?)).filter(|(w, h)| *w > 0 && *h > 0);
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        let mut decoder = zune_jpeg::JpegDecoder::new(zune_jpeg::zune_core::bytestream::ZCursor::new(&bytes));
+        decoder.decode_headers().ok()?;
+        let info = decoder.info()?;
+        let (w, h) = (u32::from(info.width), u32::from(info.height));
+        let swap = decoder.exif().is_some_and(|exif| exif_orientation(exif) >= 5);
+        return Some(if swap { (h, w) } else { (w, h) }).filter(|(w, h)| *w > 0 && *h > 0);
+    }
+    None
 }
 
 /// Decodes a PNG to straight-alpha RGBA.
@@ -341,6 +363,7 @@ mod tests {
         assert_eq!(&square[4..8], [0, 0, 255, 255]);
         // Upscaling repeats pixels.
         assert_eq!(thumbnail(&key(8, 4)).unwrap().len(), 8 * 4 * 4);
+        assert_eq!(dimensions(&path), Some((4, 2)));
 
         fs::write(&path, b"\x89PNG\r\n\x1a\ngarbage").unwrap();
         assert!(thumbnail(&key(2, 2)).is_err());
@@ -348,6 +371,7 @@ mod tests {
         assert!(thumbnail(&key(2, 2)).is_err());
         fs::write(&path, b"GIF89a").unwrap();
         assert!(thumbnail(&key(2, 2)).is_err());
+        assert_eq!(dimensions(&path), None);
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -2,6 +2,7 @@
 //! preedit), the toolbar with attach, model, reasoning and send, and the
 //! slash commands it completes.
 
+use serechat::MediaKind;
 use winit::window::CursorIcon;
 
 use super::{Chat, Menu, model_name};
@@ -23,24 +24,55 @@ const NOTICE_SECS: f32 = 7.0;
 /// A command typed as `/name` in the composer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Command {
+    /// Generates an image, video or audio from the prompt after it.
+    Media(MediaKind),
+    /// Starts a new chat in the same folder.
+    New,
     /// Deletes the open chat and starts over in the same folder.
     Clear,
+    /// Summarises the chat to free up context.
+    Compact,
+    /// Opens the model menu.
+    Model,
+    /// Asks the agent to write the project's `AGENTS.md`.
+    Init,
 }
 
 impl Command {
-    const ALL: [Self; 1] = [Self::Clear];
+    const ALL: [Self; 8] = [
+        Self::Media(MediaKind::Image),
+        Self::Media(MediaKind::Video),
+        Self::Media(MediaKind::Audio),
+        Self::New,
+        Self::Clear,
+        Self::Compact,
+        Self::Model,
+        Self::Init,
+    ];
 
     /// What follows the slash.
     pub(super) fn name(self) -> &'static str {
         match self {
+            Self::Media(kind) => kind.noun(),
+            Self::New => "new",
             Self::Clear => "clear",
+            Self::Compact => "compact",
+            Self::Model => "model",
+            Self::Init => "init",
         }
     }
 
     /// What it does, shown next to it.
     pub(super) fn detail(self) -> &'static str {
         match self {
+            Self::Media(MediaKind::Image) => "Generate an image",
+            Self::Media(MediaKind::Video) => "Generate a video",
+            Self::Media(MediaKind::Audio) => "Generate speech or music",
+            Self::New => "Start a new chat in this folder",
             Self::Clear => "Clear this chat's messages",
+            Self::Compact => "Summarise the chat to free up context",
+            Self::Model => "Choose the model",
+            Self::Init => "Write an AGENTS.md for this project",
         }
     }
 
@@ -51,6 +83,13 @@ impl Command {
             return Vec::new();
         }
         Self::ALL.into_iter().filter(|c| c.name().starts_with(typed)).collect()
+    }
+
+    /// The command `text` starts with, and what follows it (trimmed).
+    pub(super) fn parse(text: &str) -> Option<(Self, &str)> {
+        let rest = text.trim_start().strip_prefix('/')?;
+        let (name, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        Self::ALL.into_iter().find(|c| c.name() == name).map(|c| (c, rest.trim()))
     }
 }
 
@@ -178,10 +217,17 @@ impl Chat {
                 actions.push(Action::PickFiles);
             }
         }
-        let name = model_name(&self.models, &self.model).to_owned();
-        let model = self.toolbar_button(p, ui, attach.right() + 4.0, item_y, &name, Menu::Model);
-        let reasoning = format!("Reasoning: {}", self.reasoning_in_use().label());
-        let reasoning = self.toolbar_button(p, ui, model.right() + 4.0, item_y, &reasoning, Menu::Reasoning);
+        // While the text is a generation command, its model replaces the chat's.
+        let (model, reasoning) = if let Some((Command::Media(kind), _)) = Command::parse(self.composer.text()) {
+            let name = self.model_label(&self.media_model[kind.index()]);
+            let label = format!("{}: {name}", capitalized(kind.noun()));
+            (self.toolbar_button(p, ui, attach.right() + 4.0, item_y, &label, Menu::Media(kind)), Rect::default())
+        } else {
+            let name = model_name(&self.models, &self.model).to_owned();
+            let model = self.toolbar_button(p, ui, attach.right() + 4.0, item_y, &name, Menu::Model);
+            let reasoning = format!("Reasoning: {}", self.reasoning_in_use().label());
+            (model, self.toolbar_button(p, ui, model.right() + 4.0, item_y, &reasoning, Menu::Reasoning))
+        };
 
         let busy = self.current().busy();
         let ready = !self.composer.text().trim().is_empty() || !self.pending.is_empty();
@@ -305,7 +351,7 @@ impl Chat {
         let rect = Rect::new(x, y, text.width() + 34.0, 26.0);
         let open = self.menu == Some(menu);
         let hovered = ui.hovered(rect);
-        let hover = ui.anim(id(("toolbar", menu == Menu::Model)), f32::from(u8::from(hovered || open)));
+        let hover = ui.anim(id(("toolbar", menu == Menu::Reasoning)), f32::from(u8::from(hovered || open)));
         p.rect(rect, fade(t.hover, hover), theme::RADIUS_SM);
         let color = mix(t.text_muted, t.text, hover);
         p.text(&text, rect.x + 8.0, y + (26.0 - text.height()) * 0.5, color);
@@ -319,6 +365,12 @@ impl Chat {
         }
         rect
     }
+}
+
+/// `word` with its first letter in upper case.
+pub(super) fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
 }
 
 /// An image's thumbnail, or [`file_badge`] while it loads and for other files.
@@ -346,16 +398,28 @@ pub(super) fn file_badge(p: &mut Painter, mime: &str, name: &str, rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::Command;
+    use serechat::MediaKind;
 
     #[test]
     fn commands_complete_a_bare_slash_word() {
-        assert_eq!(Command::matching("/"), [Command::Clear]);
-        assert_eq!(Command::matching("/cl"), [Command::Clear]);
+        assert_eq!(Command::matching("/").len(), Command::ALL.len());
+        assert_eq!(Command::matching("/c"), [Command::Clear, Command::Compact]);
         assert_eq!(Command::matching("/clear"), [Command::Clear]);
+        assert_eq!(Command::matching("/i"), [Command::Media(MediaKind::Image), Command::Init]);
         assert!(Command::matching("/clearer").is_empty());
-        assert!(Command::matching("/clear it").is_empty(), "text after a command makes it a message");
+        assert!(Command::matching("/clear it").is_empty(), "text after a command closes the menu");
         assert!(Command::matching("/etc/hosts\n").is_empty());
         assert!(Command::matching("clear").is_empty());
         assert!(Command::matching("").is_empty());
+    }
+
+    #[test]
+    fn commands_parse_with_their_prompt() {
+        assert_eq!(Command::parse("/image  a red fox \n"), Some((Command::Media(MediaKind::Image), "a red fox")));
+        assert_eq!(Command::parse("/video\nwaves"), Some((Command::Media(MediaKind::Video), "waves")));
+        assert_eq!(Command::parse("/new"), Some((Command::New, "")));
+        assert_eq!(Command::parse("/images of cats"), None);
+        assert_eq!(Command::parse("/etc/hosts"), None);
+        assert_eq!(Command::parse("image"), None);
     }
 }

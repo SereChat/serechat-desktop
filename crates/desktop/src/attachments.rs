@@ -1,7 +1,8 @@
-//! Files attached to prompts.
+//! Files attached to prompts, and the files generations make.
 //!
 //! Importing copies the file into `~/.serechat/attachments/` so a session
-//! stays complete when the original moves. Images are sent as images, PDFs
+//! stays complete when the original moves. Generated images, videos and
+//! audio are downloaded there too. Images are sent as images, PDFs
 //! as documents, and anything that reads as UTF-8 text is inlined into the
 //! prompt, which every model understands. PNG and JPEG images show as
 //! thumbnails (`image.rs`).
@@ -12,8 +13,10 @@
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use serechat::{Attachment, Part, data_url, new_session_id};
+use serechat::{Attachment, Client, MediaKind, MediaStatus, Part, data_url, new_session_id};
 
 /// Largest image accepted.
 const MAX_IMAGE: u64 = 20 << 20;
@@ -78,7 +81,7 @@ pub fn import(path: &Path, store: &Path) -> Result<Attachment, String> {
     let safe: String = name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).take(80).collect();
     let copy = store.join(format!("{}-{safe}", new_session_id()));
     fs::copy(path, &copy).map_err(|e| format!("{name}: {e}"))?;
-    Ok(Attachment { name, mime: mime.to_owned(), size, path: copy.to_string_lossy().into_owned() })
+    Ok(Attachment { name, mime: mime.to_owned(), size, path: copy.to_string_lossy().into_owned(), dimensions: None })
 }
 
 /// The API parts of a prompt: its text, then each attachment. Reads the
@@ -102,6 +105,116 @@ pub fn parts(text: &str, attachments: &[Attachment]) -> Result<Vec<Part>, String
         });
     }
     Ok(parts)
+}
+
+/// Longest the app waits for one generation.
+const MAX_WAIT: Duration = Duration::from_secs(30 * 60);
+/// Failed status checks in a row before a generation is given up on.
+const MAX_FAILED_CHECKS: u32 = 20;
+
+/// Waits for generation `job` of `kind` and downloads its file into `store`
+/// as an attachment named after `prompt`. Blocks for as long as the job
+/// takes, so run it on a worker thread. `Ok(None)` when `cancel` was raised.
+///
+/// # Errors
+/// The generation failed (the server refunds it), took too long, or its
+/// file could not be downloaded or saved.
+pub fn fetch_generated(client: &Client, kind: MediaKind, job: &str, prompt: &str, store: &Path, cancel: &AtomicBool) -> Result<Option<Attachment>, String> {
+    let started = Instant::now();
+    let mut failed_checks = 0;
+    let (url, mime) = loop {
+        // Quick ones (most images) are noticed fast; long ones polled gently.
+        let pause = if started.elapsed() < Duration::from_secs(60) { 2 } else { 5 };
+        for _ in 0..pause * 10 {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        match client.media_status(kind, job) {
+            Ok(MediaStatus::Pending) => failed_checks = 0,
+            Ok(MediaStatus::Succeeded { url, mime }) => break (url, mime),
+            Ok(MediaStatus::Failed(reason)) => return Err(reason),
+            Err(e) if e.is_retryable() && failed_checks < MAX_FAILED_CHECKS => failed_checks += 1,
+            Err(e) => return Err(e.to_string()),
+        }
+        if started.elapsed() > MAX_WAIT {
+            return Err(format!("it was still not done after {} minutes", MAX_WAIT.as_secs() / 60));
+        }
+    };
+
+    fs::create_dir_all(store).map_err(|e| e.to_string())?;
+    let limit = match kind {
+        MediaKind::Image => 64 << 20,
+        MediaKind::Audio => 256 << 20,
+        MediaKind::Video => 1 << 30,
+    };
+    // The extension follows the type; the type is checked once the file is in.
+    let path = store.join(format!("{}-{}", new_session_id(), slug(prompt, kind.noun())));
+    let saved = fs::File::create(&path).map_err(|e| e.to_string()).and_then(|mut file| {
+        let header = client.download(&url, limit, &mut file).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        Ok(header)
+    });
+    let header = match saved {
+        Ok(header) => header,
+        Err(e) => {
+            let _ = fs::remove_file(&path);
+            return Err(format!("the file could not be saved: {e}"));
+        }
+    };
+    let mime = mime.or(header).map_or_else(|| default_mime(kind).to_owned(), |m| m.split(';').next().unwrap_or_default().trim().to_ascii_lowercase());
+    let named = path.with_extension(extension(&mime));
+    fs::rename(&path, &named).map_err(|e| e.to_string())?;
+    let size = fs::metadata(&named).map_err(|e| e.to_string())?.len();
+    let name = named.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // The id prefix keeps copies apart on disk; the name shown leaves it out.
+    let name = name.split_once('-').map_or(name.clone(), |(_, rest)| rest.to_owned());
+    let dimensions = if crate::image::supported(&mime) { crate::image::dimensions(&named) } else { None };
+    Ok(Some(Attachment { name, mime, size, path: named.to_string_lossy().into_owned(), dimensions }))
+}
+
+/// A file name (no extension) from the first words of `prompt`, or `fallback`.
+fn slug(prompt: &str, fallback: &str) -> String {
+    let words: Vec<String> = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .scan(0, |len, word| {
+            *len += word.len() + 1;
+            (*len <= 40).then_some(word)
+        })
+        .collect();
+    if words.is_empty() { fallback.to_owned() } else { words.join("-") }
+}
+
+/// The type assumed when the server names none.
+fn default_mime(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Image => "image/png",
+        MediaKind::Video => "video/mp4",
+        MediaKind::Audio => "audio/mpeg",
+    }
+}
+
+/// File extension for a MIME type.
+fn extension(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/svg+xml" => "svg",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/ogg" => "ogg",
+        "audio/flac" => "flac",
+        "audio/mp4" | "audio/aac" | "audio/x-m4a" => "m4a",
+        _ => "bin",
+    }
 }
 
 /// `1536` -> `1.5 KB`.
@@ -146,6 +259,18 @@ mod tests {
         assert_eq!(parts[1], Part::Text("<file name=\"notes.md\">\nhéllo\n</file>".into()));
         assert!(matches!(&parts[2], Part::Image(url) if url.starts_with("data:image/png;base64,")));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn generated_file_names() {
+        assert_eq!(slug("A red fox, in the snow!", "image"), "a-red-fox-in-the-snow");
+        assert_eq!(slug("   ...", "video"), "video");
+        assert!(slug(&"word ".repeat(50), "x").len() <= 40);
+        assert_eq!(slug("café ünïcode", "x"), "café-ünïcode");
+        assert_eq!((extension("image/svg+xml"), extension("audio/x-wav"), extension("text/html")), ("svg", "wav", "bin"));
+        let cancelled = AtomicBool::new(true);
+        let store = std::env::temp_dir();
+        assert_eq!(fetch_generated(&Client::new(None), MediaKind::Image, "j", "p", &store, &cancelled), Ok(None), "a cancelled wait ends at once");
     }
 
     #[test]

@@ -1,9 +1,10 @@
-//! Drop-down menus: model and reasoning (above the composer toolbar),
+//! Drop-down menus: model, generation model and reasoning (above the composer toolbar),
 //! slash commands (above the composer) and project (below the header's
 //! folder chip).
 
 use winit::window::CursorIcon;
 
+use super::composer::capitalized;
 use super::{Chat, Menu, MenuItem, PRIMARY_KEY, Reasoning, display_path, price};
 use crate::app::Action;
 use crate::paint::{Painter, Rect, fade};
@@ -19,7 +20,17 @@ impl Chat {
             self.menu_rect = None;
             return;
         };
+        let media_title;
         let (anchor, width, below, header, items) = match menu {
+            Menu::Media(kind) => {
+                let chosen = &self.media_model[kind.index()];
+                let items = self.media_models[kind.index()]
+                    .iter()
+                    .map(|m| MenuItem { label: m.label().to_owned(), detail: m.pricing.clone(), selected: &m.id == chosen })
+                    .collect();
+                media_title = format!("{} model", capitalized(kind.noun()));
+                (anchors[0], 380.0, false, (media_title.as_str(), "Price"), items)
+            }
             Menu::Model => {
                 let items = self
                     .models
@@ -64,6 +75,12 @@ impl Chat {
             self.menu = None;
             ui.released = false;
             match menu {
+                Menu::Media(kind) => {
+                    if let Some(model) = self.media_models[kind.index()].get(index) {
+                        self.media_model[kind.index()].clone_from(&model.id);
+                        actions.push(Action::SelectMediaModel(kind, model.id.clone()));
+                    }
+                }
                 Menu::Model => {
                     if let Some(model) = self.models.get(index) {
                         self.model.clone_from(&model.id);

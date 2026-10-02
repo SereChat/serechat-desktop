@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use serechat::{Completion, Error, InputItem, Part, Role, StoredMessage, StreamEvent, ToolCall, ToolRecord, ToolStatus, Usage, unix_now};
 
+use super::composer::Command;
 use super::{Chat, Conversation, Decision, Entry, Load, Reasoning, StreamingCall};
 use crate::app::Action;
 use crate::skills::{Catalog, Skill};
@@ -52,6 +53,11 @@ const COMPACT_PROMPT: &str = "The conversation is about to exceed the context wi
     error messages. Reply with the summary only, without calling tools.";
 /// Introduces a summary when it is sent in place of the history.
 const SUMMARY_INTRO: &str = "Earlier messages were replaced by this summary to fit the context window. Continue from where it leaves off.";
+/// What the model is asked when the user sends `/init`.
+const INIT_PROMPT: &str = "Write an AGENTS.md file at the root of this project for coding agents that will work in it. Look through the \
+    project first instead of guessing: what it is, how to build, test and run it, how the code is laid out, the conventions to follow, \
+    and anything surprising. Keep it short and specific to this project. If an AGENTS.md already exists, improve it rather than \
+    starting over.";
 /// Output of a call from a reply that hit the output limit.
 const TRUNCATED_CALL: &str = "Not run: your reply reached the output limit before this call was complete, so its arguments may be \
     cut off. Split the work into smaller steps, e.g. write a large file in parts with edit_file.";
@@ -142,10 +148,18 @@ pub fn input_items(history: &[StoredMessage]) -> Result<Vec<InputItem>, String> 
     for message in history[start..].iter().filter(|m| !m.failed) {
         match message.role {
             _ if message.compaction => items.push(InputItem::text(Role::User, format!("{SUMMARY_INTRO}\n\n{}", message.content))),
-            Role::User => items.push(InputItem::Message { role: Role::User, parts: attachments::parts(&message.content, &message.attachments)? }),
+            Role::User => {
+                // `/init` shows as typed; the model gets what it stands for.
+                let text = if message.content == "/init" { INIT_PROMPT } else { &message.content };
+                items.push(InputItem::Message { role: Role::User, parts: attachments::parts(text, &message.attachments)? });
+            }
             Role::Assistant => {
                 if !message.content.is_empty() {
                     items.push(InputItem::Message { role: Role::Assistant, parts: vec![Part::Text(message.content.clone())] });
+                }
+                // A generated file: the model learns it exists, not its bytes.
+                if let (Some(job), Some(file)) = (&message.media, message.attachments.first()) {
+                    items.push(InputItem::text(Role::Assistant, format!("(Generated the {} {} from the prompt above.)", job.kind.noun(), file.name)));
                 }
                 // Only answered calls go back; the API needs an output for each.
                 for record in message.tool_calls.iter().filter(|r| r.status.is_finished()) {
@@ -193,6 +207,17 @@ fn context_used(entries: &[Entry]) -> u64 {
         .map_or(0, |e| e.message.usage.input_tokens + e.message.usage.output_tokens)
 }
 
+/// Whether the model owes the conversation a reply: its last message is a
+/// prompt, or a round of answered tool calls. Summaries are looked past: one
+/// asked for with `/compact` owes nothing, one made mid-run owes what the
+/// message before it did. Generations are answered by their file.
+fn owes_reply(entries: &[Entry]) -> bool {
+    entries.iter().rev().map(|e| &e.message).find(|m| !m.failed && !m.compaction).is_some_and(|m| match m.role {
+        Role::User => !matches!(Command::parse(&m.content), Some((Command::Media(_), _))),
+        Role::Assistant => !m.tool_calls.is_empty() && m.tool_calls.iter().all(|r| r.status.is_finished()),
+    })
+}
+
 /// Context use that triggers compaction for a model with `window` tokens.
 fn compact_limit(window: u64) -> u64 {
     let window = if window == 0 { DEFAULT_WINDOW } else { window };
@@ -204,12 +229,7 @@ impl Conversation {
     /// summary or round of tool results was never answered, because the run
     /// failed, paused, was stopped or the app closed. Continue sends it.
     pub(super) fn resumable(&self) -> bool {
-        self.load == Load::Loaded
-            && !self.busy()
-            && self.entries.iter().rev().find(|e| !e.message.failed).is_some_and(|e| {
-                let m = &e.message;
-                m.role == Role::User || m.compaction || (!m.tool_calls.is_empty() && m.tool_calls.iter().all(|r| r.status.is_finished()))
-            })
+        self.load == Load::Loaded && !self.busy() && owes_reply(&self.entries)
     }
 
     /// Tool rounds and cost of the latest run: everything after the last prompt.
@@ -396,6 +416,11 @@ impl Chat {
                     Self::cut_short(target, reason, note_id);
                 }
                 actions.push(Action::SaveSession(target.to_session()));
+                // File changes that wait for approval show their diff against the file.
+                if let (Some(root), Some(last)) = (&target.project, target.entries.last()) {
+                    let waiting = last.message.tool_calls.iter().filter(|r| r.status == ToolStatus::Pending && !target.allowed.contains(&r.call.name));
+                    actions.extend(waiting.filter_map(|r| super::preview(std::path::Path::new(root), &r.call, id)));
+                }
                 if active.incomplete.as_deref().is_none_or(|r| r == "max_output_tokens") {
                     self.advance(id, actions);
                 }
@@ -511,7 +536,26 @@ impl Chat {
             entry.message.content = format!("{}\n\n**Skills in use**\n\n{}", entry.message.content.trim_end(), loaded.join("\n\n"));
         }
         actions.push(Action::SaveSession(conversation.to_session()));
-        self.start_request(id, false, 0, actions);
+        // Mid-run, the reply it was made for follows; after `/compact`, nothing.
+        if conversation.resumable() {
+            self.start_request(id, false, 0, actions);
+        }
+    }
+
+    /// Summarises the open conversation now (`/compact`): later requests
+    /// start from the summary.
+    pub(super) fn compact(&mut self, actions: &mut Vec<Action>) {
+        let conversation = self.current();
+        if conversation.load != Load::Loaded || conversation.busy() {
+            self.notify("Wait for the reply to finish, then summarise.");
+            return;
+        }
+        if context_used(&conversation.entries) == 0 {
+            self.notify("There is nothing to summarise yet.");
+            return;
+        }
+        let id = conversation.id;
+        self.start_request(id, true, 0, actions);
     }
 
     /// Starts tool calls that may run on their own, and continues the

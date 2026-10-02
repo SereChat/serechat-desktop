@@ -14,15 +14,16 @@ use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use serechat::{
-    AccessToken, Attachment, Client, Config, Error, Model, Projects, ResponseRequest, SearchHit, Session, SessionStore, SessionSummary,
-    StreamEvent, ToolSpec,
+    AccessToken, Attachment, Client, Config, Error, MediaKind, MediaModel, MediaTicket, Model, Projects, ResponseRequest, SearchHit,
+    Session, SessionStore, SessionSummary, StreamEvent, ToolCall, ToolSpec,
 };
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{CursorIcon, Theme, UserAttentionType, Window};
 
-use crate::chat::{self, Chat, Reasoning, ReasoningView, SendJob, ToolJob};
+use crate::chat::{self, Chat, MediaRequest, Reasoning, ReasoningView, SendJob, ToolJob};
+use crate::diff::{self, Diff};
 use crate::gpu::{GpuError, Instance, Renderer};
 use crate::image::{self, ImageAtlas, ImageKey};
 use crate::login::Login;
@@ -95,6 +96,35 @@ pub enum WorkerEvent {
     },
     /// A thumbnail was decoded (or could not be).
     Thumbnail(ImageKey, Result<Vec<u8>, String>),
+    /// The generation models of one kind arrived.
+    MediaModels(MediaKind, Result<Vec<MediaModel>, Error>),
+    /// The server accepted a generation.
+    MediaStarted {
+        /// Conversation id.
+        conversation: u64,
+        /// Entry waiting for it.
+        entry: u64,
+        /// Its job and price.
+        ticket: MediaTicket,
+    },
+    /// A generation finished (or failed, or nobody waits any more: `Ok(None)`).
+    MediaDone {
+        /// Conversation id.
+        conversation: u64,
+        /// Entry waiting for it.
+        entry: u64,
+        /// The downloaded file, or why there is none.
+        result: Result<Option<Attachment>, String>,
+    },
+    /// The diff of a file change was computed.
+    DiffReady {
+        /// Conversation that made the call.
+        conversation: u64,
+        /// The call's id.
+        call_id: String,
+        /// The change.
+        diff: Arc<Diff>,
+    },
     /// The skills (and `AGENTS.md`) of a project were found.
     Skills {
         /// Project folder scanned; `None` for the user's skills.
@@ -123,8 +153,21 @@ pub enum Action {
     Send(SendJob),
     /// Run a tool call.
     RunTool(ToolJob),
+    /// Diff a file change waiting for approval against its file.
+    PreviewChange {
+        /// Conversation that made the call.
+        conversation: u64,
+        /// Project folder the call is confined to.
+        root: PathBuf,
+        /// The `write_file` or `edit_file` call.
+        call: ToolCall,
+    },
+    /// Run a generation and download its file.
+    Generate(MediaRequest),
     /// Persist a model choice.
     SelectModel(String),
+    /// Persist a generation model choice.
+    SelectMediaModel(MediaKind, String),
     /// Persist a reasoning effort.
     SetReasoning(Reasoning),
     /// Switch and persist the colour scheme.
@@ -329,11 +372,18 @@ impl App {
         let projects = self.projects.as_ref().map(|p| p.list.clone()).unwrap_or_default();
         let mut chat = Chat::new(self.config.model.clone(), reasoning, sessions, projects, self.config.project.clone());
         chat.set_reasoning_view(ReasoningView::from_key(self.config.reasoning_view.as_deref()));
+        let chosen = [&self.config.image_model, &self.config.video_model, &self.config.audio_model];
+        for (kind, model) in MediaKind::ALL.into_iter().zip(chosen) {
+            chat.set_media_choice(kind, model.clone());
+        }
         // Skills are known before the first message: the user's and the open project's.
         let mut actions = Vec::new();
         chat.refresh_skills(true, &mut actions);
         self.screen = Screen::Chat(Box::new(chat));
         self.spawn(|client, _| WorkerEvent::Models(client.models()));
+        for kind in MediaKind::ALL {
+            self.spawn(move |client, _| WorkerEvent::MediaModels(kind, client.media_models(kind)));
+        }
         self.apply(actions);
     }
 
@@ -485,7 +535,7 @@ impl App {
             }
             (WorkerEvent::Models(Ok(models)), Screen::Chat(chat)) => chat.set_models(models),
             (WorkerEvent::Models(Err(e)), _) => eprintln!("serechat: could not load models: {e}"),
-            (WorkerEvent::SessionLoaded { conversation, result }, Screen::Chat(chat)) => chat.session_loaded(conversation, result),
+            (WorkerEvent::SessionLoaded { conversation, result }, Screen::Chat(chat)) => chat.session_loaded(conversation, result, &mut actions),
             (WorkerEvent::Stream { conversation, stream, event }, Screen::Chat(chat)) => {
                 chat.stream_event(conversation, stream, event);
             }
@@ -500,6 +550,11 @@ impl App {
             (WorkerEvent::ToolDone { conversation, call_id, result }, Screen::Chat(chat)) => {
                 chat.tool_done(conversation, &call_id, result, &mut actions);
             }
+            (WorkerEvent::MediaModels(kind, Ok(models)), Screen::Chat(chat)) => chat.set_media_models(kind, models),
+            (WorkerEvent::MediaModels(kind, Err(e)), _) => eprintln!("serechat: could not load {} models: {e}", kind.noun()),
+            (WorkerEvent::MediaStarted { conversation, entry, ticket }, Screen::Chat(chat)) => chat.media_started(conversation, entry, ticket, &mut actions),
+            (WorkerEvent::MediaDone { conversation, entry, result }, Screen::Chat(chat)) => chat.media_done(conversation, entry, result, &mut actions),
+            (WorkerEvent::DiffReady { conversation, call_id, diff }, Screen::Chat(chat)) => chat.diff_ready(conversation, &call_id, diff),
             (WorkerEvent::Imported(results), Screen::Chat(chat)) => chat.attachments_imported(results),
             (WorkerEvent::FilesPicked(paths), Screen::Chat(chat)) => chat.attach(paths, &mut actions),
             (WorkerEvent::FolderPicked(Some(path)), Screen::Chat(_)) => actions.push(Action::OpenProject(Some(path))),
@@ -570,16 +625,54 @@ impl App {
                 };
                 WorkerEvent::StreamEnded { conversation, stream, result }
             }),
-            Action::RunTool(job) => self.spawn(move |client, _| {
+            Action::RunTool(job) => self.spawn(move |client, proxy| {
+                // A file change is diffed against the file as it was just before.
+                let change = job.root.as_deref().filter(|_| tools::changes_file(&job.call.name)).and_then(|root| tools::file_change(root, &job.call));
                 let result = match &job.root {
                     _ if job.call.name == "use_skill" => skills::run(&job.skills, &job.call.arguments),
                     Some(root) => tools::run(root, job.conversation, client, &job.call, &job.cancel),
                     None => Err("Tools are only available in a project.".to_owned()),
                 };
+                if let (Ok(_), Some((before, after, whole))) = (&result, change) {
+                    let diff = Arc::new(diff::diff(&before, &after, whole));
+                    let _ = proxy.send_event(WorkerEvent::DiffReady { conversation: job.conversation, call_id: job.call.call_id.clone(), diff });
+                }
                 WorkerEvent::ToolDone { conversation: job.conversation, call_id: job.call.call_id, result }
             }),
+            Action::PreviewChange { conversation, root, call } => self.spawn(move |_, _| {
+                let (before, after, whole) = tools::file_change(&root, &call).unwrap_or_default();
+                WorkerEvent::DiffReady { conversation, call_id: call.call_id, diff: Arc::new(diff::diff(&before, &after, whole)) }
+            }),
+            Action::Generate(request) => {
+                let dir = self.reader().map_or_else(|| std::env::temp_dir().join("serechat-attachments"), |store| store.attachments_dir());
+                self.spawn(move |client, proxy| {
+                    let MediaRequest { conversation, entry, kind, model, mode, prompt, job, cancel } = request;
+                    let job = match job {
+                        Some(job) => job,
+                        None => match client.generate_media(kind, &model, mode.as_deref(), &prompt) {
+                            Ok(ticket) => {
+                                let id = ticket.id.clone();
+                                let _ = proxy.send_event(WorkerEvent::MediaStarted { conversation, entry, ticket });
+                                id
+                            }
+                            Err(e) => return WorkerEvent::MediaDone { conversation, entry, result: Err(e.to_string()) },
+                        },
+                    };
+                    let result = attachments::fetch_generated(client, kind, &job, &prompt, &dir, &cancel);
+                    WorkerEvent::MediaDone { conversation, entry, result }
+                });
+            }
             Action::SelectModel(model) => {
                 self.config.model = Some(model);
+                self.save_config();
+            }
+            Action::SelectMediaModel(kind, model) => {
+                let slot = match kind {
+                    MediaKind::Image => &mut self.config.image_model,
+                    MediaKind::Video => &mut self.config.video_model,
+                    MediaKind::Audio => &mut self.config.audio_model,
+                };
+                *slot = Some(model);
                 self.save_config();
             }
             Action::SetReasoning(reasoning) => {

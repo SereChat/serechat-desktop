@@ -36,6 +36,12 @@ pub struct Config {
     pub theme: Option<String>,
     /// How replies show the model's reasoning, interpreted by the app.
     pub reasoning_view: Option<String>,
+    /// Model `/image` generates with.
+    pub image_model: Option<String>,
+    /// Model `/video` generates with.
+    pub video_model: Option<String>,
+    /// Model `/audio` generates with.
+    pub audio_model: Option<String>,
 }
 
 impl Config {
@@ -119,6 +125,9 @@ impl Config {
                 "theme" => config.theme = Some(value),
                 "project" => config.project = Some(value),
                 "reasoning_view" => config.reasoning_view = Some(value),
+                "image_model" => config.image_model = Some(value),
+                "video_model" => config.video_model = Some(value),
+                "audio_model" => config.audio_model = Some(value),
                 _ => {}
             }
         }
@@ -136,6 +145,9 @@ impl Config {
             ("theme", &self.theme),
             ("project", &self.project),
             ("reasoning_view", &self.reasoning_view),
+            ("image_model", &self.image_model),
+            ("video_model", &self.video_model),
+            ("audio_model", &self.audio_model),
         ];
         for (key, value) in fields {
             if let Some(value) = value {
@@ -271,6 +283,9 @@ mod tests {
             theme: Some("light".into()),
             project: Some(r"C:\work\café".into()),
             reasoning_view: Some("expanded".into()),
+            image_model: Some("gpt-image-2.5-flare".into()),
+            video_model: Some("veo-3.1-fast".into()),
+            audio_model: None,
         };
         assert_eq!(Config::parse(&config.serialize()).unwrap(), config);
     }

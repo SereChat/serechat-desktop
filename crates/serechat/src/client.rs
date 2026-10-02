@@ -196,13 +196,34 @@ impl Client {
         check_status(response)
     }
 
-    fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: &Value, auth: bool) -> Result<T> {
+    pub(crate) fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: &Value, auth: bool) -> Result<T> {
         read_json(self.post(path, body, auth)?)
+    }
+
+    /// GETs an absolute `url` and returns the response after checking the
+    /// status. The token is only ever sent to the API's own origin.
+    pub(crate) fn get(&self, url: &str, auth: bool) -> Result<Response<ureq::Body>> {
+        let mut request = self.agent.get(url);
+        if auth && self.owns(url) {
+            let token = self.token.as_deref().unwrap_or_default();
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        check_status(request.call()?)
+    }
+
+    /// `path` on the API's origin.
+    pub(crate) fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
+    }
+
+    /// Whether `url` is on the API's own origin, where the token may go.
+    pub(crate) fn owns(&self, url: &str) -> bool {
+        url.strip_prefix(&self.base).is_some_and(|rest| rest.starts_with('/'))
     }
 }
 
 /// Decodes a JSON body after checking the status code.
-fn read_json<T: serde::de::DeserializeOwned>(response: Response<ureq::Body>) -> Result<T> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(response: Response<ureq::Body>) -> Result<T> {
     let mut response = check_status(response)?;
     let text = response.body_mut().read_to_string()?;
     Ok(serde_json::from_str(&text)?)

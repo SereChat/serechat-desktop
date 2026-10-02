@@ -12,6 +12,7 @@ mod app;
 mod atlas;
 mod attachments;
 mod chat;
+mod diff;
 mod doc;
 mod editor;
 mod font;

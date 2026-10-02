@@ -136,6 +136,10 @@ pub struct StoredMessage {
     /// The earlier messages stay in the session for the user.
     #[serde(default, skip_serializing_if = "is_default")]
     pub compaction: bool,
+    /// The image, video or audio generation this reply is, or waits for.
+    /// Its file arrives as an attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<crate::media::MediaJob>,
 }
 
 impl StoredMessage {
@@ -154,7 +158,14 @@ impl StoredMessage {
             attachments: Vec::new(),
             tool_calls: Vec::new(),
             compaction: false,
+            media: None,
         }
+    }
+
+    /// A generation whose file has not arrived and that has not failed.
+    #[must_use]
+    pub fn media_pending(&self) -> bool {
+        self.media.is_some() && self.attachments.is_empty() && !self.failed
     }
 }
 
@@ -170,6 +181,10 @@ pub struct Attachment {
     pub size: u64,
     /// Absolute path of the app's copy.
     pub path: String,
+    /// Width and height in pixels, for images whose size is known (generated
+    /// ones), so they show at their own aspect ratio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<(u32, u32)>,
 }
 
 impl Attachment {
@@ -595,7 +610,7 @@ mod tests {
         fs::write(&copy, "x").unwrap();
 
         let mut prompt = StoredMessage::new(Role::User, "first line\nThe Quick brown fox jumps".into());
-        prompt.attachments.push(Attachment { name: "a.txt".into(), mime: "text/plain".into(), size: 1, path: copy.to_string_lossy().into() });
+        prompt.attachments.push(Attachment { name: "a.txt".into(), mime: "text/plain".into(), size: 1, path: copy.to_string_lossy().into(), dimensions: None });
         let mut s = session("s1", 5, 0.0);
         s.messages.insert(0, prompt);
         store.save(&s).unwrap();
