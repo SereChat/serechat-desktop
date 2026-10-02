@@ -26,7 +26,7 @@ See `README.md` for features, the crate layout and the architecture.
 
 ## Conventions
 
-- Deliberate shortcuts are marked `ponytail:` with their limit and upgrade path. Current ones: fallback fonts are read fully into memory; no complex-script shaping (Arabic, Indic) or bidi; grapheme clusters follow a practical subset of UAX #29; GIF and WebP attachments have no thumbnails; native pickers run helper processes; the config file uses a flat, string-only TOML subset.
+- Deliberate shortcuts are marked `ponytail:` with their limit and upgrade path. Current ones: fallback fonts are read fully into memory; no complex-script shaping (Arabic, Indic) or bidi; grapheme clusters follow a practical subset of UAX #29; GIF and WebP attachments have no thumbnails; native pickers run helper processes; the config file uses a flat, string-only TOML subset; the exe icon (`build.rs`, from `assets/icon/`) is embedded for MSVC only; macOS gets its icon from the `.app` and Linux from `serechat.desktop`, both made by the release job from `packaging/`.
 - Every file the app writes (sessions, config, projects) goes through the `Writer` thread in `app.rs`, in order; reads run on workers. Never write files from the UI thread.
 - Glyphs and image thumbnails live in two 2048² atlases packed by `atlas.rs`, which evicts the least recently drawn shelf when full. Images are drawn with `Painter::image`, which decodes on a worker on first use.
 - Screens never touch disk or network: they push `Action`s; the app runs them (on worker threads when slow) and reports back via `WorkerEvent`. Never block the UI thread.

@@ -108,7 +108,9 @@ worker threads and post results back to the event loop. Every file write goes th
 writer thread, in order, which finishes its queue before the app exits.
 
 CI (`.github/workflows/ci.yml`) runs clippy and the tests on Windows, macOS and Linux. Pushing
-a `v*` tag attaches release binaries to a GitHub release.
+a `v*` tag attaches release builds to a GitHub release: `serechat.exe` (icon embedded), `SereChat.app`
+(`com.luvarly.serechat`) for macOS, and for Linux the binary with `serechat.desktop`, its icon and
+`install.sh` (installs all three for the current user). The packaging files are in `packaging/`.
 
 ## Sign-in and storage
 
@@ -134,7 +136,7 @@ from the API) removes the token but keeps sessions.
 - GIF and WebP attachments show as chips, not thumbnails.
 - Native file and folder pickers run the platform's helper (PowerShell, `osascript`,
   `zenity`/`kdialog`), so they take a moment to appear.
-- Release binaries are unsigned and not packaged as installers or a macOS `.app` yet.
+- Release builds are unsigned (the macOS `.app` is ad-hoc signed only) and there are no installers.
 
 ## Fonts
 

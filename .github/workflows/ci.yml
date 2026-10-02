@@ -56,15 +56,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p serechat-desktop
+      # Windows: the exe carries its icon (build.rs). macOS: a SereChat.app
+      # bundle, whose icon the Dock shows. Linux: the binary with a launcher
+      # entry, icon and install.sh, so desktops show its name and icon.
       - name: Package
         shell: bash
         run: |
-          cd target/release
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a "../../${{ matrix.archive }}" serechat.exe
-          else
-            tar czf "../../${{ matrix.archive }}" serechat
-          fi
+          icons=crates/desktop/assets/icon
+          case "$RUNNER_OS" in
+            Windows)
+              7z a "${{ matrix.archive }}" ./target/release/serechat.exe
+              ;;
+            macOS)
+              app=SereChat.app
+              mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" AppIcon.iconset
+              cp target/release/serechat "$app/Contents/MacOS/serechat"
+              sed "s/@VERSION@/${GITHUB_REF_NAME#v}/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+              for size in 16 32 128 256 512; do
+                sips -z "$size" "$size" "$icons/macos.png" --out "AppIcon.iconset/icon_${size}x${size}.png" > /dev/null
+                sips -z "$((size * 2))" "$((size * 2))" "$icons/macos.png" --out "AppIcon.iconset/icon_${size}x${size}@2x.png" > /dev/null
+              done
+              iconutil -c icns AppIcon.iconset -o "$app/Contents/Resources/AppIcon.icns"
+              # Ad-hoc sign the bundle as a whole; Apple silicon refuses unsigned code.
+              codesign --force --deep --sign - "$app"
+              tar czf "${{ matrix.archive }}" "$app"
+              ;;
+            Linux)
+              dir=serechat-linux-x86_64
+              mkdir "$dir"
+              cp target/release/serechat packaging/linux/serechat.desktop packaging/linux/install.sh "$dir/"
+              cp "$icons/256.png" "$dir/serechat.png"
+              chmod +x "$dir/serechat" "$dir/install.sh"
+              tar czf "${{ matrix.archive }}" "$dir"
+              ;;
+          esac
       - uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.archive }}

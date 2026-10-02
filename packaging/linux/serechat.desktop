@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SereChat
+Comment=AI chat and coding agent on your desktop
+Exec=serechat
+Icon=serechat
+Terminal=false
+Categories=Network;Chat;Development;
+StartupWMClass=serechat
