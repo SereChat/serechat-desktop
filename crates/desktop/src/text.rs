@@ -698,7 +698,7 @@ mod tests {
         let l = layout(text, None);
         // a, family, b, flag, c.
         assert_eq!(l.glyphs.len(), 5);
-        assert!(l.glyphs.iter().filter(|g| g.font == FontId::EMOJI).count() == 2);
+        assert_eq!(l.glyphs.iter().filter(|g| g.font == FontId::EMOJI).count(), 2);
         // The caret skips over a whole sequence.
         let b = text.find('b').unwrap();
         assert_eq!(l.hit(l.caret(b).0 + 0.1, 1.0), b);

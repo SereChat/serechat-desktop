@@ -1163,7 +1163,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let (connection, hello) = Connection::open(&web(base), None, &notify, &cancel).unwrap();
         assert_eq!(hello.version, "2025-06-18");
-        assert!(list_tools(&connection, &cancel).unwrap().is_empty());
+        assert_eq!(list_tools(&connection, &cancel).unwrap().len(), 0);
         assert!(list_tools(&connection, &cancel).unwrap().is_empty(), "a lost session is started over");
         assert_eq!((initialized.load(Ordering::SeqCst), lists.load(Ordering::SeqCst)), (2, 3));
     }

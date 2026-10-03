@@ -50,11 +50,10 @@ impl Sha256 {
             self.block(&block);
             self.buffered = 0;
         }
-        let mut blocks = data.chunks_exact(64);
-        for block in blocks.by_ref() {
+        let (blocks, rest) = data.as_chunks::<64>();
+        for block in blocks {
             self.block(block);
         }
-        let rest = blocks.remainder();
         self.buffer[..rest.len()].copy_from_slice(rest);
         self.buffered = rest.len();
     }
@@ -72,7 +71,7 @@ impl Sha256 {
         self.update(&tail[..pad + 8]);
         self.length = length;
         let mut out = [0u8; 32];
-        for (chunk, word) in out.chunks_exact_mut(4).zip(self.state) {
+        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
             chunk.copy_from_slice(&word.to_be_bytes());
         }
         out
@@ -81,8 +80,8 @@ impl Sha256 {
     #[allow(clippy::many_single_char_names, reason = "the standard names the working variables a to h and w")]
     fn block(&mut self, block: &[u8]) {
         let mut w = [0u32; 64];
-        for (i, word) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);

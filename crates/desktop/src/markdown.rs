@@ -659,12 +659,12 @@ mod tests {
     #[test]
     fn hostile_nesting_is_bounded() {
         let quotes = ">".repeat(100_000) + " x";
-        assert!(!parse(&quotes).is_empty());
+        assert_ne!(parse(&quotes).len(), 0);
         let lists = "- ".repeat(50_000) + "x";
-        assert!(!parse(&lists).is_empty());
+        assert_ne!(parse(&lists).len(), 0);
         let links = "[".repeat(20_000) + &"x](u)".repeat(20_000);
-        assert!(!parse_inline(&links).text.is_empty());
+        assert_ne!(parse_inline(&links).text.len(), 0);
         let stars = "*".repeat(3) + &"_a ".repeat(10_000);
-        assert!(!parse_inline(&stars).text.is_empty());
+        assert_ne!(parse_inline(&stars).text.len(), 0);
     }
 }

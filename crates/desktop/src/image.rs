@@ -199,8 +199,8 @@ pub fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
         let row = &row[..(w as usize * info.color_type.samples()).min(row.len())];
         match info.color_type {
             png::ColorType::Rgba => rgba.extend_from_slice(row),
-            png::ColorType::Rgb => row.chunks_exact(3).for_each(|p| rgba.extend_from_slice(&[p[0], p[1], p[2], 255])),
-            png::ColorType::GrayscaleAlpha => row.chunks_exact(2).for_each(|p| rgba.extend_from_slice(&[p[0], p[0], p[0], p[1]])),
+            png::ColorType::Rgb => row.as_chunks::<3>().0.iter().for_each(|p| rgba.extend_from_slice(&[p[0], p[1], p[2], 255])),
+            png::ColorType::GrayscaleAlpha => row.as_chunks::<2>().0.iter().for_each(|p| rgba.extend_from_slice(&[p[0], p[0], p[0], p[1]])),
             png::ColorType::Grayscale => row.iter().for_each(|&g| rgba.extend_from_slice(&[g, g, g, 255])),
             png::ColorType::Indexed => return Err("unexpanded palette image".into()),
         }
@@ -293,9 +293,9 @@ fn cover(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
             }
             let n = u64::from(rows.end - rows.start) * u64::from(cols.end - cols.start);
             let o = &mut out[(ty as usize * dw as usize + tx as usize) * 4..][..4];
-            if sum[3] > 0 {
-                for c in 0..3 {
-                    o[c] = (sum[c] / sum[3]) as u8;
+            for c in 0..3 {
+                if let Some(v) = sum[c].checked_div(sum[3]) {
+                    o[c] = v as u8;
                 }
             }
             o[3] = (sum[3] / n) as u8;
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(atlas.lookup(&key), Lookup::Loading);
         assert_eq!(atlas.lookup(&key), Lookup::Loading);
         assert_eq!(atlas.take_wanted(), std::slice::from_ref(&key));
-        assert!(atlas.take_wanted().is_empty());
+        assert_eq!(atlas.take_wanted().len(), 0);
         atlas.insert(key.clone(), Ok(vec![0; 16]));
         assert!(matches!(atlas.lookup(&key), Lookup::Ready(_)));
         assert_eq!(atlas.uploads.len(), 1);

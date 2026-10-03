@@ -2046,7 +2046,7 @@ mod tests {
         assert!(job.cancel.load(Ordering::Relaxed), "the running reply is stopped");
         assert!(matches!(&actions[..], [Action::DeleteSession(_), Action::StopProcesses(_)]));
         assert!(chat.current().is_fresh() && chat.current().project == project);
-        assert!(chat.composer.text().is_empty());
+        assert_eq!(chat.composer.text(), "");
 
         // Closing the menu keeps it closed until the text changes.
         chat.composer.insert("/");

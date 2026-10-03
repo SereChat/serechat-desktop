@@ -100,7 +100,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("serechat-projects-{}", std::process::id()));
         let file = dir.join("projects.json");
         let mut projects = Projects::load_from(file.clone()).unwrap();
-        assert!(projects.list.is_empty());
+        assert_eq!(projects.list.len(), 0);
         projects.touch(Path::new("/work/alpha"));
         projects.touch(Path::new("/work/beta"));
         assert_eq!(projects.touch(Path::new("/work/alpha")).name, "alpha");

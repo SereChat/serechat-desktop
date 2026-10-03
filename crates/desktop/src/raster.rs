@@ -177,7 +177,7 @@ impl Accumulator {
             let cells = &mut self.cells[base..base + self.stride];
             if xbi <= xai + 1 {
                 // The segment stays within one pixel column in this row.
-                let xmf = 0.5 * (xa + xb) - xa_floor;
+                let xmf = f32::midpoint(xa, xb) - xa_floor;
                 cells[xai] += d - d * xmf;
                 cells[xai + 1] += d * xmf;
             } else {

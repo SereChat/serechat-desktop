@@ -378,7 +378,7 @@ mod tests {
     fn unterminated_constructs_run_to_the_end() {
         assert_eq!(tokens("js", "/* open"), [("/* open", Token::Comment)]);
         assert_eq!(tokens("py", "x = \"\"\"doc\nmore"), [("\"\"\"doc\nmore", Token::String)]);
-        assert!(tokens("unknown-lang", "anything { goes }").is_empty());
+        assert_eq!(tokens("unknown-lang", "anything { goes }").len(), 0);
     }
 
     #[test]

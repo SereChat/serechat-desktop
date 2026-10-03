@@ -408,11 +408,11 @@ mod tests {
         assert_eq!(Command::matching("/c"), [Command::Clear, Command::Compact]);
         assert_eq!(Command::matching("/clear"), [Command::Clear]);
         assert_eq!(Command::matching("/i"), [Command::Media(MediaKind::Image), Command::Init]);
-        assert!(Command::matching("/clearer").is_empty());
+        assert_eq!(Command::matching("/clearer").len(), 0);
         assert!(Command::matching("/clear it").is_empty(), "text after a command closes the menu");
-        assert!(Command::matching("/etc/hosts\n").is_empty());
-        assert!(Command::matching("clear").is_empty());
-        assert!(Command::matching("").is_empty());
+        assert_eq!(Command::matching("/etc/hosts\n").len(), 0);
+        assert_eq!(Command::matching("clear").len(), 0);
+        assert_eq!(Command::matching("").len(), 0);
     }
 
     #[test]

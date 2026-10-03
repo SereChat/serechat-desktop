@@ -555,7 +555,7 @@ mod tests {
     #[test]
     fn save_list_load_delete() {
         let (dir, mut store) = temp_store("sessions");
-        assert!(store.list().unwrap().0.is_empty());
+        assert_eq!(store.list().unwrap().0.len(), 0);
 
         let (old, new) = (session("a1", 1, 0.5), session("b2", 2, 0.25));
         store.save(&old).unwrap();
@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session, "s1");
         assert_eq!(hits[0].snippet, "The Quick brown fox jumps");
-        assert!(store.search("  ", 10).unwrap().is_empty());
+        assert_eq!(store.search("  ", 10).unwrap().len(), 0);
         assert_eq!(snippet(&"x".repeat(100), "xx").chars().last(), Some('…'));
 
         store.delete("s1").unwrap();
