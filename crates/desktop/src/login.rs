@@ -3,10 +3,12 @@
 
 use arboard::Clipboard;
 use serechat::{AccessToken, Error};
+use accesskit::Role;
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::CursorIcon;
 
+use crate::a11y::Node;
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::paint::{Painter, Rect, mix};
@@ -162,12 +164,12 @@ impl Login {
         let awaiting = matches!(self.phase, Phase::AwaitingCode | Phase::Verifying);
         let width = 400.0;
         let inner = width - 64.0;
-        let subtitle = if awaiting {
+        let subtitle_text = if awaiting {
             "Approve SereChat Desktop in your browser, then enter the 6-digit code shown there."
         } else {
             "Sign in with your SereChat account to start chatting."
         };
-        let subtitle = p.layout(subtitle, Style { line_height: 1.5, ..theme::SMALL }, Some(inner));
+        let subtitle = p.layout(subtitle_text, Style { line_height: 1.5, ..theme::SMALL }, Some(inner));
         let message = self.error.as_deref().map(|e| (e, t.danger)).or(self.notice.as_deref().map(|n| (n, t.text_muted)));
         let message = message.map(|(text, color)| (p.layout(text, theme::SMALL, Some(inner)), color));
 
@@ -190,7 +192,9 @@ impl Login {
         let title = p.layout("Sign in to SereChat", theme::TITLE, None);
         p.text_aligned(&title, x, y, Align::Center, inner, t.text);
         y += 30.0 + 6.0;
+        ui.describe(|| Node::new(Role::Heading, Rect::new(x, y - 36.0, inner, 30.0), "Sign in to SereChat"));
         p.text_aligned(&subtitle, x, y, Align::Center, inner, t.text_muted);
+        ui.describe(|| Node::new(Role::Label, Rect::new(x, y, inner, subtitle.height()), subtitle_text));
         y += subtitle.height() + 24.0;
 
         if awaiting {
@@ -230,6 +234,9 @@ impl Login {
         if let Some((layout, color)) = &message {
             y += 16.0;
             p.text_aligned(layout, x, y, Align::Center, inner, *color);
+            if let Some(text) = self.error.as_deref().or(self.notice.as_deref()) {
+                ui.describe(|| Node::new(Role::Alert, Rect::new(x, y, inner, layout.height()), text));
+            }
         }
     }
 
@@ -242,6 +249,7 @@ impl Login {
         let digits = self.code.text().as_bytes();
         let active = digits.len().min(CODE_LEN - 1);
         let editable = self.phase == Phase::AwaitingCode;
+        ui.describe(|| Node::input(area, "6-digit code", self.code.text(), false, editable));
         for i in 0..CODE_LEN {
             let cell = Rect::new(start + i as f32 * (size + gap), area.y, size, area.h);
             let focus = ui.anim(crate::ui::id(("code", i)), f32::from(u8::from(editable && i == active)));

@@ -8,9 +8,11 @@
 
 use std::ops::Range;
 
+use accesskit::Role;
 use winit::window::CursorIcon;
 
 use super::{Conversation, ReasoningView};
+use crate::a11y::Node;
 use crate::doc::Doc;
 use crate::paint::{Painter, Rect, fade};
 use crate::text::Style;
@@ -149,6 +151,7 @@ impl Find {
             p.rect(rect, fade(t.hover, hover), theme::RADIUS_SM);
             let style = if key == 0 { Style::regular(16.0) } else { Style::semibold(13.0) };
             p.label_centered(label, style, rect, if hovered { t.text } else { t.text_muted });
+            ui.describe(|| Node::new(Role::Button, rect, ["Close find", "Next match", "Previous match"][key]));
             if hovered {
                 ui.cursor = CursorIcon::Pointer;
                 if ui.clicked(rect) {

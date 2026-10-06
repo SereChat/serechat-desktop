@@ -1,9 +1,11 @@
 //! The sidebar: new chat, every saved session, and settings.
 
 use serechat::unix_now;
+use accesskit::Role;
 use winit::window::CursorIcon;
 
 use super::{Chat, Page, PRIMARY_KEY, ago};
+use crate::a11y::Node;
 use crate::app::Action;
 use crate::paint::{Painter, Rect, fade, hexa, mix};
 use crate::text::Style;
@@ -60,6 +62,9 @@ impl Chat {
             let selected = on_chat && conversation.id == self.current;
             p.rect(item, if selected { t.active } else { fade(t.hover, hover) }, theme::RADIUS_SM);
 
+            ui.describe(|| Node::new(Role::Button, item, &conversation.title));
+            // Hidden until hovered, but always there for screen readers.
+            ui.describe(|| Node::new(Role::Button, Rect::new(item.right() - 26.0, item.y + 5.0, 20.0, 20.0), &format!("Delete {}", conversation.title)));
             // Right side: age, or the delete control while hovered.
             let mut on_control = false;
             let right_w = if hovered {
@@ -169,5 +174,6 @@ pub(super) fn list_row(p: &mut Painter, ui: &mut Ui, rect: Rect, key: u64, label
     if hovered {
         ui.cursor = CursorIcon::Pointer;
     }
+    ui.describe(|| Node::new(Role::Button, rect, label));
     ui.clicked(rect)
 }

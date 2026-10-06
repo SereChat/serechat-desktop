@@ -77,6 +77,16 @@ pub struct MediaSchema {
     /// Every parameter it accepts, by name.
     #[serde(default)]
     pub properties: serde_json::Map<String, Value>,
+    /// Kinds of input file the mode needs (`image`, `video`, `audio`).
+    #[serde(default)]
+    pub required_files: Vec<String>,
+}
+
+impl MediaSchema {
+    /// Whether one of its parameters takes files of `kind`.
+    fn accepts(&self, kind: MediaKind) -> bool {
+        self.properties.values().any(|p| p.get("media_type").and_then(Value::as_str) == Some(kind.noun()))
+    }
 }
 
 /// A generation model offered by the API.
@@ -113,6 +123,27 @@ impl MediaModel {
         std::iter::once(self.default_mode.as_str())
             .chain(self.modes.iter().map(|m| m.id.as_str()))
             .find(|mode| self.schemas.get(*mode).is_some_and(prompt_only))
+    }
+
+    /// The mode that makes something from input `files` (their kinds): one
+    /// that needs files, has all the kinds it needs among them, and takes
+    /// every kind given. The default mode if it fits, otherwise the first.
+    #[must_use]
+    pub fn file_mode(&self, files: &[MediaKind]) -> Option<&str> {
+        let fits = |s: &MediaSchema| {
+            !s.required_files.is_empty()
+                && s.required_files.iter().all(|k| files.iter().any(|f| f.noun() == k))
+                && files.iter().all(|f| s.accepts(*f))
+        };
+        std::iter::once(self.default_mode.as_str())
+            .chain(self.modes.iter().map(|m| m.id.as_str()))
+            .find(|mode| self.schemas.get(*mode).is_some_and(fits))
+    }
+
+    /// Whether any mode takes input files.
+    #[must_use]
+    pub fn takes_files(&self) -> bool {
+        self.schemas.values().any(|s| !s.required_files.is_empty())
     }
 
     /// The name to show, falling back to the id.
@@ -171,13 +202,14 @@ impl Client {
         Ok(body.data)
     }
 
-    /// Submits a generation from a text `prompt` and returns its ticket
-    /// without waiting for it. `mode` `None` uses the model's default.
+    /// Submits a generation from a text `prompt` and the uploaded `file_ids`
+    /// (see [`Client::upload_file`]) and returns its ticket without waiting
+    /// for it. `mode` `None` uses the model's default.
     ///
     /// # Errors
     /// Network failure or an API error, e.g. `insufficient_sparks` (402) or
     /// `content_policy_violation` (422).
-    pub fn generate_media(&self, kind: MediaKind, model: &str, mode: Option<&str>, prompt: &str) -> Result<MediaTicket> {
+    pub fn generate_media(&self, kind: MediaKind, model: &str, mode: Option<&str>, prompt: &str, file_ids: &[String]) -> Result<MediaTicket> {
         #[derive(Deserialize)]
         struct Body {
             id: String,
@@ -187,6 +219,9 @@ impl Client {
         let mut body = json!({ "model": model, "prompt": prompt, "async": true });
         if let Some(mode) = mode {
             body["mode"] = json!(mode);
+        }
+        if !file_ids.is_empty() {
+            body["file_ids"] = json!(file_ids);
         }
         let ticket: Body = self.post_json(&format!("/v1/{}/generations", kind.path()), &body, true)?;
         if !valid_job_id(&ticket.id) {
@@ -229,6 +264,53 @@ impl Client {
         }
     }
 
+    /// Uploads a file for generations to use and returns its id. The server
+    /// measures clips itself; a length sent along would only be shown.
+    ///
+    /// # Errors
+    /// Network failure or a rejection: too large (over [`MAX_UPLOAD`]), a
+    /// type the server does not take, or the user's file limit.
+    pub fn upload_file(&self, name: &str, mime: &str, bytes: &[u8]) -> Result<String> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Body {
+            file_id: String,
+        }
+        let (boundary, form) = multipart(name, mime, bytes, &[("maxBytes", bytes.len().to_string())]);
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let body: Body = read_json(self.post_bytes("/api/files/upload", &content_type, &form)?)?;
+        if !valid_job_id(&body.file_id) {
+            return Err(Error::Response { code: None, message: "The server returned an invalid file id.".into() });
+        }
+        Ok(body.file_id)
+    }
+
+    /// Deletes the caller's uploaded files `ids`. Ids that are not theirs or
+    /// no longer exist are ignored.
+    ///
+    /// # Errors
+    /// An invalid id, a network failure or a rejection.
+    pub fn delete_files(&self, ids: &[String]) -> Result<()> {
+        if !ids.iter().all(|id| valid_job_id(id)) {
+            return Err(Error::Response { code: None, message: "Invalid file id.".into() });
+        }
+        let body = serde_json::to_vec(&json!({ "fileIds": ids }))?;
+        self.delete_bytes("/api/user/files", "application/json", &body).map(drop)
+    }
+
+    /// Cancels generation `id` and refunds it, while it still waits in the
+    /// queue; its status then reads failed.
+    ///
+    /// # Errors
+    /// An invalid id, a network failure, or a rejection: `409` once the job
+    /// has started, `404` if it is not the caller's.
+    pub fn cancel_media(&self, id: &str) -> Result<()> {
+        if !valid_job_id(id) {
+            return Err(Error::Response { code: None, message: "Invalid job id.".into() });
+        }
+        self.post(&format!("/api/assets/{id}/cancel"), &json!({}), true).map(drop)
+    }
+
     /// Downloads `url` into `out`, refusing files over `limit` bytes. The
     /// token is sent only to the API's own origin. Returns the content type.
     ///
@@ -248,6 +330,28 @@ impl Client {
         }
         Ok(content_type)
     }
+}
+
+/// Largest file the server takes for a generation's input.
+pub const MAX_UPLOAD: u64 = 100 << 20;
+
+/// A `multipart/form-data` body holding `fields` and the file, and its
+/// boundary, which never occurs in the file.
+fn multipart(name: &str, mime: &str, bytes: &[u8], fields: &[(&str, String)]) -> (String, Vec<u8>) {
+    let mut boundary = format!("serechat-{}", crate::new_session_id());
+    while bytes.windows(boundary.len()).any(|w| w == boundary.as_bytes()) {
+        boundary.push_str(&crate::new_session_id());
+    }
+    // Quotes and line breaks would end the header early.
+    let name: String = name.chars().map(|c| if matches!(c, '"' | '\\' | '\r' | '\n') { '_' } else { c }).collect();
+    let mut out = Vec::with_capacity(bytes.len() + 512);
+    for (key, value) in fields {
+        out.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n").as_bytes());
+    }
+    out.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: {mime}\r\n\r\n").as_bytes());
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (boundary, out)
 }
 
 /// Job ids go into URL paths: only UUID-like ids are accepted.
@@ -277,6 +381,35 @@ mod tests {
         let picked: Vec<Option<&str>> = models.iter().map(MediaModel::prompt_mode).collect();
         assert_eq!(picked, [Some("generate"), Some("prompt"), Some("generate"), None]);
         assert_eq!((models[0].label(), models[1].label()), ("Flare", "song"));
+    }
+
+    #[test]
+    fn files_pick_a_mode_that_takes_them() {
+        let json = r#"{"id":"kling","default_mode":"text","modes":[{"id":"text"},{"id":"image"},{"id":"frames"},{"id":"remix"}],"schemas":{
+            "text":{"required":["prompt"],"required_files":[],"properties":{"prompt":{}}},
+            "image":{"required":["image_url","prompt"],"required_files":["image"],"properties":{"image_url":{"media_type":"image"},"prompt":{}}},
+            "frames":{"required":["image_urls"],"required_files":["image"],"properties":{"image_urls":{"media_type":"image"}}},
+            "remix":{"required":["video_url"],"required_files":["video"],"properties":{"video_url":{"media_type":"video"},"image_url":{"media_type":"image"}}}}}"#;
+        let model: MediaModel = serde_json::from_str(json).unwrap();
+        assert!(model.takes_files());
+        assert_eq!(model.file_mode(&[MediaKind::Image]), Some("image"), "the first that fits");
+        assert_eq!(model.file_mode(&[MediaKind::Video, MediaKind::Image]), Some("remix"));
+        assert_eq!(model.file_mode(&[MediaKind::Audio]), None);
+        assert_eq!(model.file_mode(&[]), None, "no files, no file mode");
+        assert_eq!(model.prompt_mode(), Some("text"));
+    }
+
+    #[test]
+    fn uploads_are_well_formed() {
+        let (boundary, body) = multipart("a\"b\r\n.png", "image/png", b"PNG", &[("duration", "1.500".into())]);
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.starts_with(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"duration\"\r\n\r\n1.500\r\n")));
+        assert!(text.contains("filename=\"a_b__.png\"\r\nContent-Type: image/png\r\n\r\nPNG\r\n"));
+        assert!(text.ends_with(&format!("\r\n--{boundary}--\r\n")));
+        // A file that contains the boundary gets a longer one.
+        let (first, _) = multipart("x", "text/plain", b"", &[]);
+        let (other, _) = multipart("x", "text/plain", first.as_bytes(), &[]);
+        assert!(!first.as_bytes().windows(other.len()).any(|w| w == other.as_bytes()));
     }
 
     #[test]

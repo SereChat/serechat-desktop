@@ -4,10 +4,12 @@
 use std::collections::HashSet;
 
 use arboard::Clipboard;
+use accesskit::Role;
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::CursorIcon;
 
+use crate::a11y::Node;
 use crate::app::{Action, McpAction};
 use crate::browser::{self, Installed};
 use crate::chat::{ReasoningView, format_cost, group_digits};
@@ -338,6 +340,7 @@ impl SettingsView {
             let mut text = p.layout(&text, theme::SMALL, None);
             text.truncate(p.fonts, row.w - 58.0);
             p.text(&text, row.x + 42.0, row.y + 36.0, t.text_muted);
+            ui.describe(|| Node::choice(row, &title, selected, false));
             if hovered {
                 ui.cursor = CursorIcon::Pointer;
                 if ui.clicked(row) {
@@ -599,7 +602,7 @@ impl SettingsView {
 
         // Controls.
         let mut on_control = false;
-        if switch(p, ui, toggle, server.enabled, id(("mcp-switch", &server.name))) {
+        if switch(p, ui, toggle, server.enabled, id(("mcp-switch", &server.name)), &server.name) {
             actions.push(Action::Mcp(McpAction::Enable(server.name.clone(), !server.enabled)));
         }
         on_control |= ui.hovered(toggle);
@@ -621,6 +624,9 @@ impl SettingsView {
         }
         // The card itself opens and closes the tool list.
         let expandable = !server.tools.is_empty() || !server.warnings.is_empty();
+        if expandable {
+            ui.describe(|| Node::new(Role::Button, card, &format!("{} tools", server.name)));
+        }
         if hovered && !on_control && expandable {
             ui.cursor = CursorIcon::Pointer;
             if ui.clicked(card) && !self.open_servers.remove(&server.name) {
@@ -665,7 +671,7 @@ impl SettingsView {
         let row = group(p, x, y, width);
         setting_row(p, row, "Install updates automatically", "Download new versions in the background; they start with the next launch.", 44.0);
         let toggle = Rect::new(row.right() - 16.0 - 34.0, row.y + (row.h - 20.0) * 0.5, 34.0, 20.0);
-        if switch(p, ui, toggle, self.auto_update, id("auto-update")) {
+        if switch(p, ui, toggle, self.auto_update, id("auto-update"), "Install updates automatically") {
             actions.push(Action::SetAutoUpdate(!self.auto_update));
         }
         y += ROW_H;
@@ -689,6 +695,7 @@ fn tabs(p: &mut Painter, ui: &mut Ui, mut x: f32, bar: Rect, open: Tab) -> Optio
         if tab == open {
             p.rect(Rect::new(cell.x + 8.0, cell.bottom() - 2.0, cell.w - 16.0, 2.0), t.accent, 1.0);
         }
+        ui.describe(|| Node::choice(cell, tab.label(), tab == open, true));
         if hovered {
             ui.cursor = CursorIcon::Pointer;
             if ui.clicked(cell) {
@@ -750,6 +757,7 @@ fn segmented(p: &mut Painter, ui: &mut Ui, rect: Rect, labels: &[&str], selected
         }
         let color = if i == selected { t.text } else { mix(t.text_muted, t.text, hover) };
         p.label_centered(label, theme::LABEL, cell, color);
+        ui.describe(|| Node::choice(cell, label, i == selected, false));
         if hovered {
             ui.cursor = CursorIcon::Pointer;
             if ui.clicked(cell) {
@@ -774,6 +782,7 @@ fn theme_card(p: &mut Painter, ui: &mut Ui, card: Rect, preview_h: f32, scheme: 
     radio(p, Rect::new(card.x + 12.0, label_y + 7.0, 14.0, 14.0), selected);
     let name = p.layout(scheme.label(), theme::LABEL, None);
     p.text(&name, card.x + 34.0, label_y + (28.0 - name.height()) * 0.5, t.text);
+    ui.describe(|| Node::choice(card, scheme.label(), selected, false));
 
     if hovered {
         ui.cursor = CursorIcon::Pointer;
@@ -818,4 +827,78 @@ fn preview(p: &mut Painter, r: Rect, c: &Palette) {
     let composer = Rect::new(col.x, main.bottom() - 22.0, col.w, 16.0);
     p.bordered(composer, c.surface, 3.0, 1.0, c.border_strong);
     p.rect(Rect::new(composer.right() - 13.0, composer.y + 3.0, 10.0, 10.0), c.accent, 2.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(name: &str) -> ServerView {
+        ServerView {
+            name: name.into(),
+            target: "https://example.com/mcp".into(),
+            enabled: true,
+            web: true,
+            status: McpStatus::Ready,
+            version: String::new(),
+            tools: Vec::new(),
+            signed_in: false,
+            takes_sign_in: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// A settings page with the add-server form open and filled in.
+    fn filled(name: &str, target: &str) -> SettingsView {
+        let mut view = SettingsView { mcp: vec![server("docs")], ..SettingsView::default() };
+        let mut form = Form { focus: Some(NAME), ..Form::default() };
+        form.fields[NAME].editor.insert(name);
+        form.fields[TARGET].editor.insert(target);
+        view.form = Some(form);
+        view
+    }
+
+    #[test]
+    fn the_form_adds_valid_servers_only() {
+        let mut actions = Vec::new();
+        let mut view = filled("tracker", "https://tracker.example/mcp");
+        view.submit(&mut actions);
+        assert!(view.form.is_none(), "the form closes once added");
+        assert!(matches!(&actions[..], [Action::Mcp(McpAction::Add(s))] if s.name == "tracker"));
+
+        let mut view = filled("docs", "https://other.example/mcp");
+        view.submit(&mut actions);
+        let form = view.form.as_ref().expect("stays open");
+        assert!(form.error.as_deref().is_some_and(|e| e.contains("already a server named docs")));
+        assert_eq!(form.focus, Some(NAME), "focus goes to the clashing name");
+
+        let mut view = filled("", "https://tracker.example/mcp");
+        view.submit(&mut actions);
+        assert!(view.form.as_ref().is_some_and(|f| f.error.is_some()));
+        assert_eq!(actions.len(), 1, "nothing more was added");
+    }
+
+    #[test]
+    fn typing_goes_to_the_focused_field_only() {
+        let mut view = filled("a", "b");
+        view.caret = Some(Rect::default());
+        view.insert("z");
+        assert_eq!(view.form.as_ref().map(|f| f.fields[NAME].editor.text()), Some("az"));
+        assert!(view.caret().is_some());
+
+        if let Some(form) = &mut view.form {
+            form.focus = None;
+        }
+        view.insert("y");
+        assert_eq!(view.form.as_ref().map(|f| f.fields[NAME].editor.text()), Some("az"));
+        assert!(view.caret().is_none(), "no input method window without a focused field");
+    }
+
+    #[test]
+    fn opened_servers_are_forgotten_once_removed() {
+        let mut view = SettingsView::default();
+        view.open_servers.extend(["docs".to_owned(), "gone".to_owned()]);
+        view.set_mcp(vec![server("docs")]);
+        assert_eq!(view.open_servers, HashSet::from(["docs".to_owned()]));
+    }
 }

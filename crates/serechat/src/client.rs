@@ -196,6 +196,24 @@ impl Client {
         check_status(response)
     }
 
+    /// POSTs a raw `body` of `content_type` with the token and returns the
+    /// response after checking the status.
+    pub(crate) fn post_bytes(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Response<ureq::Body>> {
+        self.send_authed(self.agent.post(self.url(path)), content_type, body)
+    }
+
+    /// DELETE with a body (`DELETE /api/user/files` takes its ids as JSON).
+    pub(crate) fn delete_bytes(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Response<ureq::Body>> {
+        self.send_authed(self.agent.delete(self.url(path)).force_send_body(), content_type, body)
+    }
+
+    /// Sends `request` with `body` and the token, and checks the status.
+    fn send_authed(&self, request: ureq::RequestBuilder<ureq::typestate::WithBody>, content_type: &str, body: &[u8]) -> Result<Response<ureq::Body>> {
+        let token = self.token.as_deref().unwrap_or_default();
+        let request = request.content_type(content_type).header("Authorization", format!("Bearer {token}"));
+        check_status(request.send(body)?)
+    }
+
     pub(crate) fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: &Value, auth: bool) -> Result<T> {
         read_json(self.post(path, body, auth)?)
     }
@@ -245,16 +263,22 @@ fn check_status(mut response: Response<ureq::Body>) -> Result<Response<ureq::Bod
     })
 }
 
-/// Extracts `(code, message)` from an error body. Accepts both
-/// `{"error": {"code", "message"}}` and flat `{"error": "code", "message"}`.
+/// Extracts `(code, message)` from an error body. Accepts
+/// `{"error": {"code", "message"}}`, flat `{"error": "code", "message"}`,
+/// and the web routes' `{"error": "Message."}` and `{"detail": "Message."}`.
 pub(crate) fn parse_error_body(text: &str) -> (Option<String>, Option<String>) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return (None, None);
     };
     let error = value.get("error").unwrap_or(&value);
     let field = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
-    let code = field(error, "code").or_else(|| error.as_str().map(str::to_owned));
-    let message = field(error, "message").or_else(|| field(&value, "message"));
+    // A bare string is a code (`not_found`) or a sentence for the user.
+    let (code, sentence) = match error.as_str() {
+        Some(s) if s.contains(' ') => (None, Some(s.to_owned())),
+        bare => (bare.map(str::to_owned), None),
+    };
+    let code = field(error, "code").or(code);
+    let message = field(error, "message").or_else(|| field(&value, "message")).or(sentence).or_else(|| field(&value, "detail"));
     (code, message)
 }
 
@@ -289,5 +313,9 @@ mod tests {
         let flat = r#"{"error":"authorization_pending","message":"Not yet"}"#;
         assert_eq!(parse_error_body(flat), (Some("authorization_pending".into()), Some("Not yet".into())));
         assert_eq!(parse_error_body("<html>"), (None, None));
+        let sentence = r#"{"error":"This generation has already started."}"#;
+        assert_eq!(parse_error_body(sentence), (None, Some("This generation has already started.".into())));
+        let detail = r#"{"detail":"File too large. Maximum size is 25MB."}"#;
+        assert_eq!(parse_error_body(detail), (None, Some("File too large. Maximum size is 25MB.".into())));
     }
 }

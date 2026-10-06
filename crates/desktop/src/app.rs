@@ -31,6 +31,7 @@ use crate::mcp::{self, ServerConfig};
 use crate::paint::{Painter, Rect};
 use crate::text::{Fonts, GlyphAtlas};
 use crate::theme::{Palette, Scheme};
+use crate::a11y::Access;
 use crate::ui::{Ui, copy, paste};
 use crate::update::{self, Updater};
 use crate::{attachments, platform, skills, tools};
@@ -120,6 +121,16 @@ pub enum WorkerEvent {
         /// The downloaded file, or why there is none.
         result: Result<Option<Attachment>, String>,
     },
+    /// A request to cancel a generation was answered. A cancelled job then
+    /// ends through its status, as failed (and refunded).
+    Cancelled {
+        /// Conversation id.
+        conversation: u64,
+        /// Entry waiting for it.
+        entry: u64,
+        /// Why it could not be cancelled, e.g. it has already started.
+        result: Result<(), String>,
+    },
     /// The diff of a file change was computed.
     DiffReady {
         /// Conversation that made the call.
@@ -148,6 +159,14 @@ pub enum WorkerEvent {
     Update(update::Status),
     /// The browsers the agent can drive were looked up.
     Browsers(Vec<crate::browser::Installed>),
+    /// A screen reader connected, left, or asked for something.
+    Access(accesskit_winit::WindowEvent),
+}
+
+impl From<accesskit_winit::Event> for WorkerEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        Self::Access(event.window_event)
+    }
 }
 
 /// A change to the MCP servers, asked for in settings.
@@ -200,6 +219,15 @@ pub enum Action {
     },
     /// Run a generation and download its file.
     Generate(MediaRequest),
+    /// Cancel the queued generation `job` of entry `entry`.
+    CancelGeneration {
+        /// Conversation id.
+        conversation: u64,
+        /// Entry waiting for it.
+        entry: u64,
+        /// Job id.
+        job: String,
+    },
     /// Persist a model choice.
     SelectModel(String),
     /// Persist a generation model choice.
@@ -350,6 +378,8 @@ pub struct App {
     update_status: update::Status,
     /// Quit and start the updated copy.
     restart: bool,
+    /// The connection to screen readers.
+    access: Access,
 }
 
 impl App {
@@ -381,6 +411,8 @@ impl App {
         #[cfg(target_os = "linux")]
         let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(attributes, "serechat", "serechat");
         let window = Arc::new(event_loop.create_window(attributes).map_err(StartupError::Window)?);
+        // Before the window is first shown, as AccessKit requires.
+        let access = Access::new(event_loop, &window, proxy.clone());
         set_icon(&window);
         // Chinese, Japanese and Korean input methods deliver text through IME events.
         window.set_ime_allowed(true);
@@ -445,6 +477,7 @@ impl App {
             updater,
             update_status: update::Status::Idle,
             restart: false,
+            access,
         };
         app.ui.focused = true;
         if app.config.token.is_some() {
@@ -533,6 +566,7 @@ impl App {
 
     /// Routes a window event.
     pub fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        self.access.window_event(&self.window, &event);
         let scale = self.window.scale_factor() as f32;
         let mut actions = Vec::new();
         match event {
@@ -682,6 +716,7 @@ impl App {
             (WorkerEvent::MediaModels(kind, Err(e)), _) => eprintln!("serechat: could not load {} models: {e}", kind.noun()),
             (WorkerEvent::MediaStarted { conversation, entry, ticket }, Screen::Chat(chat)) => chat.media_started(conversation, entry, ticket, &mut actions),
             (WorkerEvent::MediaDone { conversation, entry, result }, Screen::Chat(chat)) => chat.media_done(conversation, entry, result, &mut actions),
+            (WorkerEvent::Cancelled { conversation, entry, result }, Screen::Chat(chat)) => chat.cancelled(conversation, entry, result),
             (WorkerEvent::DiffReady { conversation, call_id, diff }, Screen::Chat(chat)) => chat.diff_ready(conversation, &call_id, diff),
             (WorkerEvent::Imported(results), Screen::Chat(chat)) => chat.attachments_imported(results),
             (WorkerEvent::FilesPicked(paths), Screen::Chat(chat)) => chat.attach(paths, &mut actions),
@@ -689,6 +724,15 @@ impl App {
             (WorkerEvent::SearchResults { generation, hits }, Screen::Chat(chat)) => chat.search_results(generation, hits),
             (WorkerEvent::Skills { project, generation, catalog }, Screen::Chat(chat)) => chat.skills_scanned(project, generation, catalog),
             (WorkerEvent::Browsers(found), Screen::Chat(chat)) => chat.set_browsers(found, self.config.browser.clone()),
+            (WorkerEvent::Access(event), _) => {
+                let (click, redraw) = self.access.event(&event);
+                if let Some(at) = click {
+                    self.ui.replay_click(at);
+                }
+                if !redraw {
+                    return;
+                }
+            }
             // Results for a screen that is no longer shown.
             _ => return,
         }
@@ -789,22 +833,35 @@ impl App {
             Action::Generate(request) => {
                 let dir = self.reader().map_or_else(|| std::env::temp_dir().join("serechat-attachments"), |store| store.attachments_dir());
                 self.spawn(move |client, proxy| {
-                    let MediaRequest { conversation, entry, kind, model, mode, prompt, job, cancel } = request;
-                    let job = match job {
-                        Some(job) => job,
-                        None => match client.generate_media(kind, &model, mode.as_deref(), &prompt) {
+                    let MediaRequest { conversation, entry, kind, model, mode, prompt, files, job, cancel } = request;
+                    // A job submitted before a restart is only waited for.
+                    let job = if let Some(job) = job {
+                        job
+                    } else {
+                        let mut ids = Vec::new();
+                        let submitted = files
+                            .iter()
+                            .try_for_each(|f| attachments::upload(client, f).map(|id| ids.push(id)))
+                            .and_then(|()| client.generate_media(kind, &model, mode.as_deref(), &prompt, &ids).map_err(|e| attachments::generation_error(&e)));
+                        // Accepted or not, the job no longer needs the uploads.
+                        attachments::forget_uploads(client, &ids);
+                        match submitted {
                             Ok(ticket) => {
                                 let id = ticket.id.clone();
                                 let _ = proxy.send_event(WorkerEvent::MediaStarted { conversation, entry, ticket });
                                 id
                             }
-                            Err(e) => return WorkerEvent::MediaDone { conversation, entry, result: Err(e.to_string()) },
-                        },
+                            Err(e) => return WorkerEvent::MediaDone { conversation, entry, result: Err(e) },
+                        }
                     };
                     let result = attachments::fetch_generated(client, kind, &job, &prompt, &dir, &cancel);
                     WorkerEvent::MediaDone { conversation, entry, result }
                 });
             }
+            Action::CancelGeneration { conversation, entry, job } => self.spawn(move |client, _| {
+                let result = client.cancel_media(&job).map_err(|e| e.to_string());
+                WorkerEvent::Cancelled { conversation, entry, result }
+            }),
             Action::SelectModel(model) => {
                 self.config.model = Some(model);
                 self.save_config();
@@ -1057,7 +1114,11 @@ impl App {
         let view = Rect::new(0.0, 0.0, size.width as f32 / scale, size.height as f32 / scale);
         let mut actions = Vec::new();
         // A second pass runs only if the glyph atlas overflowed mid-frame.
+        self.ui.access = self.access.active().then(Vec::new);
         for _ in 0..2 {
+            if let Some(nodes) = &mut self.ui.access {
+                nodes.clear();
+            }
             let mut painter = Painter::new(&self.fonts, (&mut self.atlas, &mut self.images), &mut self.instances, scale, view, &self.palette);
             match &mut self.screen {
                 Screen::Login(login) => login.draw(&mut painter, &mut self.ui, view, &mut actions),
@@ -1073,6 +1134,9 @@ impl App {
         }
 
         self.renderer.render(&self.instances, &mut self.atlas.uploads, &mut self.images.uploads, scale, self.palette.bg);
+        if let Some(nodes) = self.ui.access.take() {
+            self.access.update(nodes, f64::from(scale));
+        }
         self.ui.end();
         if !self.shown {
             self.shown = true;

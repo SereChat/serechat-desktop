@@ -21,7 +21,7 @@ cargo clippy --workspace --all-targets
   messages (drag, double-click for a word, triple-click for a paragraph) and copied.
 - **Attachments**: drop files on the window or use the `+` button. Images go to vision models
   as images (PNG and JPEG show as thumbnails), PDFs as documents, and text files are inlined
-  into the prompt.
+  into the prompt. Video and audio files (up to 100 MB) are for generations.
 - **Projects and the agent**: open a folder (Ctrl/Cmd+O, or drop it on the window) and chats in
   that project get tools to list, read, search and find files, and (with your approval) to
   write and edit files, run commands and fetch web pages. Every tool is confined to the
@@ -68,6 +68,10 @@ cargo clippy --workspace --all-targets
   registration); tokens refresh by themselves. Tools a server marks read-only run at once; the
   rest ask first, like the agent's own. Images they return reach the model.
 - **Reasoning**: the effort picker offers the levels the selected model supports.
+- **Edit and retry**: hovering a prompt shows **Edit**, which loads it into the composer (Esc
+  cancels and brings back what you were typing); sending replaces it and every message after
+  it. **Retry** under the last reply asks again, with the model now selected, or makes a
+  generation again. What the replaced replies cost stays in the totals.
 - **Find in chat** (Ctrl/Cmd+F): highlights every match in the open chat; Enter and Shift+Enter
   (or F3) step through them.
 - **Updates**: the app checks GitHub releases at startup and every six hours, downloads the
@@ -85,6 +89,13 @@ cargo clippy --workspace --all-targets
   The chat stays usable while it runs; images show inline at their own aspect ratio, videos
   and audio as cards that open in the system player. The job lives on the server, so a
   generation still running when the app closes is picked up when its chat is opened again.
+  Attach images, video or audio to work from them (edit a picture, animate it, remix a clip):
+  the app uploads them and picks the model's mode that takes those files; `/image` alone with
+  a file attached works from the file. A job still queued has a **Cancel** button, and is
+  refunded.
+- **Screen readers** (Windows and macOS): the window describes itself through AccessKit:
+  messages, buttons, menus, fields and switches, with the focused field and clicks from the
+  screen reader. Nothing is collected while no screen reader is running.
 - **Emoji and CJK**: colour emoji (Twemoji), and Chinese, Japanese and Korean text through the
   operating system's fonts, with input-method (IME) support for typing them.
 - **Settings**, in tabs: General (Dark, One Dark and Light schemes, reasoning display, the agent's browser), Skills,
@@ -130,6 +141,8 @@ cargo clippy --workspace --all-targets
   of generated files), OS integration (browser, file manager, native pickers).
 - `diff.rs`: line diffs of the agent's file changes.
 - `theme.rs`: the colour schemes, sizes and text styles.
+- `a11y.rs`: screen readers. While one is connected, widgets describe themselves to `Ui` as
+  they draw, and each frame's list becomes the AccessKit tree.
 - `app.rs`: event routing, worker threads and the frame loop.
 
 The app redraws only when something changes: input, network events, animations, or the
@@ -169,6 +182,8 @@ from the API) removes the token but keeps sessions.
 ## Known limits (deliberate, for now)
 
 - No complex-script shaping (Arabic joining, Indic reordering) and no bidi.
+- Screen readers work on Windows and macOS only (Linux's AT-SPI adapter needs an async
+  runtime), and the tree they get is flat: no groups or headings within settings.
 - GIF and WebP attachments show as chips, not thumbnails.
 - Native file and folder pickers run the platform's helper (PowerShell, `osascript`,
   `zenity`/`kdialog`), so they take a moment to appear.

@@ -34,6 +34,15 @@ fn mime_for(path: &Path) -> Option<&'static str> {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "pdf" => "application/pdf",
+        // Inputs for generations; chat models get a note instead.
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
         _ => return None,
     })
 }
@@ -66,11 +75,12 @@ pub fn import(path: &Path, store: &Path) -> Result<Attachment, String> {
     let mime = match mime_for(path) {
         Some(mime) => mime,
         None if looks_like_text(path).map_err(|e| format!("{name}: {e}"))? => "text/plain",
-        None => return Err(format!("{name} can't be attached: only images, PDFs and text files are supported.")),
+        None => return Err(format!("{name} can't be attached: only images, PDFs, text, video and audio files are supported.")),
     };
     let limit = match mime {
         "text/plain" => MAX_TEXT,
         "application/pdf" => MAX_DOCUMENT,
+        m if is_clip(m) => serechat::MAX_UPLOAD,
         _ => MAX_IMAGE,
     };
     if size > limit {
@@ -95,6 +105,11 @@ pub fn parts(text: &str, attachments: &[Attachment]) -> Result<Vec<Part>, String
         parts.push(Part::Text(text.to_owned()));
     }
     for attachment in attachments {
+        if is_clip(&attachment.mime) {
+            // Only generations take these; a chat model gets their name.
+            parts.push(Part::Text(format!("<file name=\"{}\" type=\"{}\">(not readable here)</file>", attachment.name, attachment.mime)));
+            continue;
+        }
         let bytes = fs::read(&attachment.path).map_err(|e| format!("The attachment {} could not be read: {e}", attachment.name))?;
         parts.push(if attachment.is_image() {
             Part::Image(data_url(&attachment.mime, &bytes))
@@ -105,6 +120,62 @@ pub fn parts(text: &str, attachments: &[Attachment]) -> Result<Vec<Part>, String
         });
     }
     Ok(parts)
+}
+
+/// Whether `mime` is video or audio, which only generations take.
+pub fn is_clip(mime: &str) -> bool {
+    mime.starts_with("video/") || mime.starts_with("audio/")
+}
+
+/// What kind of generation input `attachment` is, if any.
+pub fn input_kind(attachment: &Attachment) -> Option<MediaKind> {
+    let mime = attachment.mime.as_str();
+    if mime.starts_with("video/") {
+        Some(MediaKind::Video)
+    } else if mime.starts_with("audio/") {
+        Some(MediaKind::Audio)
+    } else {
+        // The server takes the bitmap formats; not SVG.
+        matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp").then_some(MediaKind::Image)
+    }
+}
+
+/// Uploads `attachment` for a generation and returns its file id. The
+/// server measures clips itself, so nothing else goes with it.
+///
+/// # Errors
+/// The copy could not be read, is too large, or the server refused it.
+pub fn upload(client: &Client, attachment: &Attachment) -> Result<String, String> {
+    let fail = |e: &dyn std::fmt::Display| format!("{} could not be uploaded: {e}", attachment.name);
+    let size = fs::metadata(&attachment.path).map_err(|e| fail(&e))?.len();
+    if size > serechat::MAX_UPLOAD {
+        return Err(fail(&format!("it is {}; the limit is {}", human_size(size), human_size(serechat::MAX_UPLOAD))));
+    }
+    let bytes = fs::read(&attachment.path).map_err(|e| fail(&e))?;
+    client.upload_file(&attachment.name, &attachment.mime, &bytes).map_err(|e| fail(&e))
+}
+
+/// Deletes uploaded inputs from the server, where they count against the
+/// user's file limit. A job no longer needs them once it is accepted (the
+/// server has copied them). Best effort: a failure leaves files behind but
+/// breaks nothing.
+pub fn forget_uploads(client: &Client, ids: &[String]) {
+    if !ids.is_empty()
+        && let Err(e) = client.delete_files(ids)
+    {
+        eprintln!("serechat: could not delete uploaded inputs: {e}");
+    }
+}
+
+/// Why a generation request was refused, in words for the reply. Neither
+/// case below is charged.
+pub fn generation_error(error: &serechat::Error) -> String {
+    match error {
+        _ if error.code() == Some("media_unreadable") => "one of the clips couldn't be read. Try another file or format.".to_owned(),
+        // The server could not reach the service that measures clips.
+        serechat::Error::Api { status: 502, .. } => format!("{error} Retry may work in a moment."),
+        _ => error.to_string(),
+    }
 }
 
 /// Longest the app waits for one generation.
@@ -248,6 +319,27 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusals_read_well() {
+        let api = |status, code: &str| serechat::Error::Api { status, code: Some(code.into()), message: "Upstream failed.".into() };
+        assert!(generation_error(&api(422, "media_unreadable")).contains("couldn't be read"));
+        assert!(generation_error(&api(502, "api_error")).ends_with("Retry may work in a moment."));
+        assert_eq!(generation_error(&api(402, "insufficient_sparks")), "Upstream failed. (HTTP 402)");
+    }
+
+    #[test]
+    fn generation_inputs() {
+        let file = |mime: &str| Attachment { name: "f".into(), mime: mime.into(), size: 1, path: "f".into(), dimensions: None };
+        assert_eq!(input_kind(&file("image/png")), Some(MediaKind::Image));
+        assert_eq!(input_kind(&file("video/quicktime")), Some(MediaKind::Video));
+        assert_eq!(input_kind(&file("audio/wav")), Some(MediaKind::Audio));
+        assert_eq!(input_kind(&file("image/svg+xml")), None);
+        assert_eq!(input_kind(&file("application/pdf")), None);
+        // Chat models get a clip's name, not its bytes (the file needn't exist).
+        let parts = parts("hi", &[file("video/mp4")]).unwrap();
+        assert!(matches!(&parts[1], Part::Text(t) if t.contains("video/mp4")));
+    }
 
     #[test]
     fn import_classifies_and_copies() {

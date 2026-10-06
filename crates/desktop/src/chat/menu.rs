@@ -2,10 +2,12 @@
 //! slash commands (above the composer) and project (below the header's
 //! folder chip).
 
+use accesskit::Role;
 use winit::window::CursorIcon;
 
 use super::composer::capitalized;
 use super::{Chat, Menu, MenuItem, PRIMARY_KEY, Reasoning, display_path, price};
+use crate::a11y::Node;
 use crate::app::Action;
 use crate::paint::{Painter, Rect, fade};
 use crate::text::TextLayout;
@@ -186,6 +188,7 @@ impl Chat {
             let mut label = p.layout(&item.label, theme::SMALL, None);
             label.truncate(p.fonts, row.w - 50.0 - detail.width());
             p.text(&label, row.x + 24.0, centre(&label), t.text);
+            ui.describe(|| Node::new(Role::MenuItem, row, &format!("{}, {}", item.label, item.detail)));
 
             if hovered {
                 ui.cursor = CursorIcon::Pointer;

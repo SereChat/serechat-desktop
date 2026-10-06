@@ -4,12 +4,14 @@
 
 use std::sync::Arc;
 
-use serechat::{MediaKind, StoredMessage, ToolStatus};
+use serechat::{MediaKind, Role, StoredMessage, ToolStatus};
+use accesskit::Role as A11yRole;
 use winit::window::CursorIcon;
 
 use super::composer::{capitalized, file_badge, file_icon};
 use super::agent::MAX_RETRIES;
 use super::{Chat, Decision, Entry, Load, PRIMARY_KEY, ReasoningView, SelPos, StreamingCall, format_cost, label_of, usage_caption};
+use crate::a11y::Node;
 use crate::app::Action;
 use crate::attachments::human_size;
 use crate::diff::{self, Diff, Kind};
@@ -410,6 +412,8 @@ impl Chat {
         let retry = conversation.retry.as_ref().map(|r| format!("Retrying ({} of {MAX_RETRIES}): {}", r.attempt, r.error));
         let resumable = conversation.resumable();
         let busy = conversation.busy();
+        let editing = self.editing.as_ref().map(|e| e.entry);
+        let last = conversation.entries.len() - 1;
         // What the latest run of tool rounds has done and cost.
         let run = match conversation.run_stats() {
             (0, _) => None,
@@ -496,6 +500,12 @@ impl Chat {
             let height = entry.measure(p, width, live, reasoning_view);
             let area = Rect::new(x, y, width, height);
             y += height + MESSAGE_GAP;
+            // Every message, scrolled into view or not, so the whole
+            // conversation can be read without scrolling.
+            let message = &entry.message;
+            if !message.compaction && (message.media.is_some() || !message.content.is_empty() || !message.attachments.is_empty()) {
+                ui.describe(|| Node::new(A11yRole::Label, area, &spoken(message)));
+            }
             if area.bottom() < view.y || area.y > view.bottom() {
                 continue;
             }
@@ -503,6 +513,8 @@ impl Chat {
             if entry.boxed() {
                 let (fill, border, color) = if entry.message.failed {
                     (fade(t.danger, 0.08), fade(t.danger, 0.4), t.danger)
+                } else if editing == Some(entry.id) {
+                    (t.surface, t.accent, t.text)
                 } else {
                     (t.surface, t.border, t.text)
                 };
@@ -523,6 +535,14 @@ impl Chat {
                 if let Some(path) = draw_attachment_chips(p, ui, &entry.message.attachments, (origin.0, chips_y), width - 2.0 * BOX_PAD.0, in_view) {
                     effects.open_path = Some(path);
                 }
+                // Edit floats over the prompt's top right corner on hover.
+                let prompt = entry.message.role == Role::User && !entry.message.failed;
+                if prompt && !busy && editing != Some(entry.id) {
+                    let edit = Rect::new(area.right() - 62.0, area.y + 7.0, 56.0, 24.0);
+                    if hover_button(p, ui, edit, "Edit", ButtonStyle::Secondary, in_view && ui.hovered(area)) {
+                        effects.edit = Some(entry.id);
+                    }
+                }
                 continue;
             }
 
@@ -534,9 +554,22 @@ impl Chat {
                 if let Some(path) = draw_media(p, ui, entry, Rect::new(x, top, media_w, media_h), model, in_view) {
                     effects.open_path = Some(path);
                 }
+                // Once the server has the job, it can be called off while queued.
+                let queued = entry.message.media.as_ref().is_some_and(|j| !j.id.is_empty());
+                if entry.message.media_pending() && queued {
+                    let cancel = Rect::new(x + media_w - 104.0, top + 16.0, 92.0, 24.0);
+                    let label = if entry.cancelling { "Cancelling…" } else { "Cancel" };
+                    if button(p, ui, cancel, label, ButtonStyle::Secondary, in_view && !entry.cancelling) {
+                        effects.cancel = Some(entry.id);
+                    }
+                }
                 if !entry.message.media_pending() {
                     let caption = p.layout(&usage_caption(model, entry.message.usage, entry.message.cost), theme::TINY, None);
                     p.text(&caption, x, top + media_h + 6.0 + (24.0 - caption.height()) * 0.5, t.text_faint);
+                    let retry = Rect::new(area.right() - 72.0, top + media_h + 6.0, 72.0, 24.0);
+                    if index == last && !busy && hover_button(p, ui, retry, "Retry", ButtonStyle::Ghost, in_view && ui.hovered(area)) {
+                        effects.retry = true;
+                    }
                 }
                 continue;
             }
@@ -655,11 +688,18 @@ impl Chat {
                 p.text(&caption, x, meta_y + (24.0 - caption.height()) * 0.5, t.text_faint);
             }
             let is_copied = copied.is_some_and(|(id, code, _)| id == entry.id && code.is_none());
-            if !entry.message.content.is_empty() && ((in_view && ui.hovered(area)) || is_copied) {
+            let hovering = in_view && ui.hovered(area);
+            let mut right = area.right();
+            if !entry.message.content.is_empty() {
                 let label = if is_copied { "✓ Copied" } else { "Copy" };
-                if button(p, ui, Rect::new(area.right() - 72.0, meta_y, 72.0, 24.0), label, ButtonStyle::Ghost, true) {
+                if hover_button(p, ui, Rect::new(right - 72.0, meta_y, 72.0, 24.0), label, ButtonStyle::Ghost, hovering || is_copied) {
                     effects.copy = Some((entry.id, None, entry.message.content.clone()));
                 }
+                right -= 76.0;
+            }
+            // The last reply can be asked for again.
+            if index == last && !busy && hover_button(p, ui, Rect::new(right - 72.0, meta_y, 72.0, 24.0), "Retry", ButtonStyle::Ghost, hovering) {
+                effects.retry = true;
             }
         }
         if let Some(status) = &retry {
@@ -669,6 +709,7 @@ impl Chat {
             let mut text = p.layout(status, theme::SMALL, None);
             text.truncate(p.fonts, width - 16.0);
             p.text(&text, x + 16.0, y + 15.0 - text.height() * 0.5, t.text_muted);
+            ui.describe(|| Node::new(A11yRole::Label, Rect::new(x, y, width, 30.0), status));
             ui.animating = true;
         } else if resumable {
             let enabled = in_view || !ui.hovered(Rect::new(x, y, 96.0, 30.0));
@@ -679,11 +720,13 @@ impl Chat {
                 Some(stats) => format!("The run stopped before it finished  ·  {stats}"),
                 None => "The run stopped before it finished.".to_owned(),
             };
+            ui.describe(|| Node::new(A11yRole::Label, Rect::new(x + 110.0, y, width - 110.0, 30.0), &hint));
             let mut hint = p.layout(&hint, theme::SMALL, None);
             hint.truncate(p.fonts, width - 110.0);
             p.text(&hint, x + 110.0, y + (30.0 - hint.height()) * 0.5, t.text_faint);
         } else if let Some(stats) = &run {
             let text = if live_entry.is_some() || busy { format!("Working  ·  {stats} so far") } else { format!("Done  ·  {stats}") };
+            ui.describe(|| Node::new(A11yRole::Label, Rect::new(x, y, width, 30.0), &text));
             let text = p.layout(&text, theme::SMALL, None);
             p.text(&text, x, y + (30.0 - text.height()) * 0.5, t.text_faint);
         }
@@ -773,6 +816,15 @@ impl Chat {
         if effects.resume {
             self.resume(current, actions);
         }
+        if let Some(entry) = effects.edit {
+            self.edit(entry);
+        }
+        if effects.retry {
+            self.retry(actions);
+        }
+        if let Some(entry) = effects.cancel {
+            self.cancel_generation(entry, actions);
+        }
 
         if max_scroll > 0.0 {
             let thumb_y = view.y + travel * (self.scroll / max_scroll);
@@ -783,6 +835,31 @@ impl Chat {
             let hover = ui.anim(id("scrollbar"), f32::from(u8::from(active)));
             p.rect(Rect::new(view.right() - 9.0, thumb_y, 6.0, thumb_h), fade(t.text, 0.1 + 0.1 * hover), 3.0);
         }
+    }
+}
+
+/// A button shown only while `shown` (its message is hovered). Hidden, it
+/// is still described to screen readers: their click moves the mouse onto
+/// it, which shows it.
+fn hover_button(p: &mut Painter, ui: &mut Ui, rect: Rect, label: &str, style: ButtonStyle, shown: bool) -> bool {
+    if shown {
+        return button(p, ui, rect, label, style, true);
+    }
+    ui.describe(|| Node::new(A11yRole::Button, rect, label));
+    false
+}
+
+/// What a screen reader says for `message`: who wrote it, its text and
+/// its files.
+fn spoken(message: &StoredMessage) -> String {
+    let files: Vec<&str> = message.attachments.iter().map(|a| a.name.as_str()).collect();
+    let files = if files.is_empty() { String::new() } else { format!(" Files: {}.", files.join(", ")) };
+    match (&message.media, message.role) {
+        (Some(job), _) if message.media_pending() => format!("Generating the {}…", job.kind.noun()),
+        (Some(job), _) if !message.failed => format!("Generated {}.{files}", job.kind.noun()),
+        _ if message.failed => format!("Error: {}", message.content),
+        (_, Role::User) => format!("You: {}{files}", message.content),
+        (_, Role::Assistant) => format!("{}{files}", message.content),
     }
 }
 
@@ -810,6 +887,12 @@ struct Effects {
     decision: Option<(usize, usize, Decision)>,
     /// The Continue button was clicked.
     resume: bool,
+    /// Edit was clicked on this prompt (entry id).
+    edit: Option<u64>,
+    /// Retry was clicked under the last reply.
+    retry: bool,
+    /// Cancel was clicked on this waiting generation (entry id).
+    cancel: Option<u64>,
 }
 
 /// A row that opens and closes a block, like "Thought for 12s".
@@ -845,6 +928,7 @@ fn toggle_row(p: &mut Painter, ui: &mut Ui, origin: (f32, f32), row: &Toggle<'_>
         p.rect(Rect::new(toggle.x + 9.0, toggle.y + 10.0, 6.0, 6.0), color, 3.0);
     }
     p.text(&label, toggle.x + 24.0, toggle.y + (26.0 - label.height()) * 0.5, color);
+    ui.describe(|| Node::new(if row.expandable { A11yRole::Button } else { A11yRole::Label }, toggle, row.label));
     if hovered {
         ui.cursor = CursorIcon::Pointer;
         return ui.clicked(toggle);
@@ -903,6 +987,7 @@ fn draw_attachment_chips(p: &mut Painter, ui: &mut Ui, attachments: &[serechat::
             file_icon(p, attachment, Rect::new(rect.x + 4.0, rect.y + 4.0, 34.0, rect.h - 8.0));
             p.text(&name, rect.x + 46.0, rect.y + (rect.h - name.height()) * 0.5, t.text);
         }
+        ui.describe(|| Node::new(A11yRole::Button, rect, &format!("Open {}", attachment.name)));
         if hovered {
             ui.cursor = CursorIcon::Pointer;
             if ui.clicked(rect) {
@@ -961,6 +1046,19 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
     let mut target = p.layout(&view.target.replace('\n', " "), TOOL_STYLE, None);
     target.truncate(p.fonts, (rect.w - 46.0 - verb.width() - right).max(20.0));
     p.text(&target, header.x + 42.0 + verb.width(), header.y + (TOOL_ROW - target.height()) * 0.5, t.text_muted);
+    ui.describe(|| {
+        let state = match status {
+            ToolStatus::Pending if approval => "waiting for approval",
+            ToolStatus::Pending | ToolStatus::Running => "running",
+            ToolStatus::Done => "done",
+            ToolStatus::Failed => "failed",
+            ToolStatus::Denied => "skipped",
+        };
+        Node::new(if expandable { A11yRole::Button } else { A11yRole::Label }, header, &format!("{} {}, {state}", view.verb, view.target))
+    });
+    if entry.open_tools.contains(&index) {
+        ui.describe(|| Node::new(A11yRole::Label, rect, &record.output));
+    }
     if expandable && interactive && ui.hovered(header) {
         ui.cursor = CursorIcon::Pointer;
         if ui.clicked(header) && !entry.open_tools.remove(&index) {
@@ -1102,6 +1200,7 @@ fn draw_diff(p: &mut Painter, ui: &mut Ui, view: &DiffView, rect: Rect, interact
         let more = p.layout(&format!("{} more not shown", total - DIFF_MAX_ROWS), theme::TINY, None);
         p.text(&more, footer.right() - 12.0 - more.width(), footer.y + (DIFF_FOOTER - more.height()) * 0.5, t.text_faint);
     }
+    ui.describe(|| Node::new(A11yRole::Button, footer, if view.full { "Show fewer lines" } else { "Show all lines" }));
     if hovered {
         ui.cursor = CursorIcon::Pointer;
         return ui.clicked(footer);
@@ -1186,6 +1285,7 @@ fn draw_media(p: &mut Painter, ui: &mut Ui, entry: &Entry, rect: Rect, model: &s
         p.label(&detail, theme::TINY, rect.x + 64.0, rect.y + 33.0, t.text_faint);
         p.text(&open, rect.right() - 16.0 - open.width(), rect.y + (rect.h - open.height()) * 0.5, if hovered { t.text } else { t.text_muted });
     }
+    ui.describe(|| Node::new(A11yRole::Button, rect, &format!("Open {}", file.name)));
     if hovered {
         ui.cursor = CursorIcon::Pointer;
         if ui.clicked(rect) {

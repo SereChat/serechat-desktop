@@ -20,6 +20,8 @@ bytemuck.workspace = true
 arboard.workspace = true
 png.workspace = true
 zune-jpeg.workspace = true
+accesskit.workspace = true
+accesskit_winit.workspace = true
 serde_json.workspace = true
 # MCP servers over HTTP, and their sign-in.
 ureq.workspace = true

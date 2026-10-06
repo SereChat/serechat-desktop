@@ -1,8 +1,8 @@
 //! Text-editing state for input fields, independent of rendering.
 //!
-//! Positions are byte offsets that always sit on `char` boundaries.
-//! ponytail: movement is per `char`, not per grapheme cluster; combined
-//! emoji or accents need two presses. Add `unicode-segmentation` if it matters.
+//! Positions are byte offsets that always sit on `char` boundaries. The
+//! caret moves by user-perceived character (see [`cluster_end`]), so a
+//! combined emoji or an accented letter takes one press.
 
 use std::ops::Range;
 
@@ -91,7 +91,7 @@ impl Editor {
         self.delete_selection();
     }
 
-    /// Moves left by a char or word; collapses an unextended selection to its start.
+    /// Moves left by a character or word; collapses an unextended selection to its start.
     pub fn left(&mut self, word: bool, select: bool) {
         let target = if !select && !self.selection().is_empty() {
             self.selection().start
@@ -103,7 +103,7 @@ impl Editor {
         self.set_cursor(target, select);
     }
 
-    /// Moves right by a char or word; collapses an unextended selection to its end.
+    /// Moves right by a character or word; collapses an unextended selection to its end.
     pub fn right(&mut self, word: bool, select: bool) {
         let target = if !select && !self.selection().is_empty() {
             self.selection().end

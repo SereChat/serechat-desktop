@@ -23,6 +23,10 @@ arboard = { version = "3.6.1", default-features = false }
 # the risk; these two are fuzzed and pure Rust. zune-jpeg's features are SIMD only.
 png = "0.18.1"
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std", "x86", "neon"] }
+# Screen readers. accesskit_winit without its default features: no Linux
+# adapter (see a11y.rs), so no zbus or async executor.
+accesskit = "0.25.1"
+accesskit_winit = { version = "0.34.1", default-features = false, features = ["rwh_06"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

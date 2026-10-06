@@ -6,8 +6,10 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use arboard::Clipboard;
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use accesskit::Role;
 use winit::window::CursorIcon;
 
+use crate::a11y::Node;
 use crate::editor::Editor;
 use crate::paint::{Color, Painter, Rect, fade, mix};
 use crate::theme;
@@ -49,6 +51,10 @@ pub struct Ui {
     pub blocker: Option<Rect>,
     /// Set when something is mid-animation and needs another frame.
     pub animating: bool,
+    /// Widgets drawn this frame, while a screen reader listens.
+    pub access: Option<Vec<Node>>,
+    /// The real mouse position while a screen reader's click is replayed.
+    replayed: Option<(f32, f32)>,
     /// Animated values with the frame they were last used in.
     anims: HashMap<u64, (f32, u64)>,
     frame: u64,
@@ -84,6 +90,29 @@ impl Ui {
         self.released = false;
         self.scroll = 0.0;
         self.scroll_x = 0.0;
+        if let Some(mouse) = self.replayed.take() {
+            self.mouse = mouse;
+        }
+    }
+
+    /// Plays a screen reader's click at `at` (logical pixels) in the next
+    /// frame: a press and release there, as if the mouse had done it.
+    pub fn replay_click(&mut self, at: (f32, f32)) {
+        self.replayed.get_or_insert(self.mouse);
+        self.mouse = at;
+        self.press_pos = at;
+        self.pressed = true;
+        self.released = true;
+        self.down = false;
+        self.clicks = 1;
+    }
+
+    /// Describes a widget to screen readers. `node` runs only while one
+    /// listens, so describing costs nothing otherwise.
+    pub fn describe(&mut self, node: impl FnOnce() -> Node) {
+        if let Some(nodes) = &mut self.access {
+            nodes.push(node());
+        }
     }
 
     /// Whether the mouse is over `rect` and not over an overlay.
@@ -171,6 +200,7 @@ pub fn button(p: &mut Painter, ui: &mut Ui, rect: Rect, label: &str, style: Butt
     if hovered {
         ui.cursor = CursorIcon::Pointer;
     }
+    ui.describe(|| Node::new(Role::Button, rect, label));
     enabled && ui.clicked(rect)
 }
 
@@ -212,8 +242,9 @@ pub fn keycap(p: &mut Painter, keys: &str, right: f32, y: f32) -> f32 {
     cap.w
 }
 
-/// An on/off switch in `rect` (about 32×18). Returns whether it was clicked.
-pub fn switch(p: &mut Painter, ui: &mut Ui, rect: Rect, on: bool, key: u64) -> bool {
+/// An on/off switch in `rect` (about 32×18), named `label` for screen
+/// readers. Returns whether it was clicked.
+pub fn switch(p: &mut Painter, ui: &mut Ui, rect: Rect, on: bool, key: u64, label: &str) -> bool {
     let t = p.theme;
     let hovered = ui.hovered(rect);
     let at = ui.anim(key, f32::from(u8::from(on)));
@@ -225,6 +256,7 @@ pub fn switch(p: &mut Painter, ui: &mut Ui, rect: Rect, on: bool, key: u64) -> b
     if hovered {
         ui.cursor = CursorIcon::Pointer;
     }
+    ui.describe(|| Node::switch(rect, label, on));
     ui.clicked(rect)
 }
 
@@ -321,6 +353,7 @@ pub fn text_field(p: &mut Painter, ui: &mut Ui, rect: Rect, field: &mut TextFiel
         p.rect(caret, t.accent, 0.0);
     }
     p.set_clip(clip);
+    ui.describe(|| Node::input(rect, style.placeholder, field.editor.text(), style.multiline, focused));
     (pressed, focused.then_some(caret))
 }
 

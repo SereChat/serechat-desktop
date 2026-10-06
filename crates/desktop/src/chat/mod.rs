@@ -25,10 +25,13 @@ use serechat::{
     Attachment, Error, MediaJob, MediaKind, MediaModel, MediaTicket, Model, Project, Role, SPARK_USD, Session, SessionSummary, StoredMessage,
     ToolRecord, ToolStatus, Usage, new_session_id, unix_now,
 };
+use accesskit::Role as A11yRole;
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+use crate::a11y::Node;
 use crate::app::Action;
+use crate::attachments;
 use crate::doc::Doc;
 use crate::editor::Editor;
 use crate::paint::{Painter, Rect};
@@ -210,6 +213,8 @@ pub struct MediaRequest {
     pub mode: Option<String>,
     /// The prompt.
     pub prompt: String,
+    /// Input files, uploaded before the request.
+    pub files: Vec<Attachment>,
     /// A job already submitted (after a restart): only wait for it.
     pub job: Option<String>,
     /// Raised when nobody waits for the result any more.
@@ -238,6 +243,8 @@ struct Entry {
     diffs: HashMap<String, DiffView>,
     /// Since when this app has been waiting for the entry's generation.
     media_since: Option<Instant>,
+    /// The user asked to cancel its generation.
+    cancelling: bool,
 }
 
 /// A tool call still being written, shown as it streams in.
@@ -266,6 +273,7 @@ impl Entry {
             streaming_calls: Vec::new(),
             diffs: HashMap::new(),
             media_since: None,
+            cancelling: false,
         }
     }
 
@@ -422,6 +430,29 @@ impl Conversation {
     fn busy(&self) -> bool {
         self.stream.is_some() || self.retry.is_some() || self.running()
     }
+
+    /// Removes the entries from `index` on and returns what they cost and
+    /// used, for the caller to keep on record (totals count every message).
+    fn cut(&mut self, index: usize) -> (f64, Usage) {
+        let removed = self.entries.split_off(index.min(self.entries.len()));
+        removed.iter().map(|e| &e.message).fold((0.0, Usage::default()), |(cost, usage), m| {
+            (cost + m.cost, Usage::new(usage.input_tokens + m.usage.input_tokens, usage.output_tokens + m.usage.output_tokens))
+        })
+    }
+}
+
+/// Adds spend from removed entries to `message`.
+fn keep_spend(message: &mut StoredMessage, (cost, usage): (f64, Usage)) {
+    message.cost += cost;
+    message.usage.input_tokens += usage.input_tokens;
+    message.usage.output_tokens += usage.output_tokens;
+}
+
+/// A prompt being edited in the composer. Sending replaces it and every
+/// message after it; cancelling puts back the draft it replaced.
+struct Editing {
+    entry: u64,
+    draft: (String, Vec<Attachment>),
 }
 
 /// A position in the open conversation: entry, document (0 reasoning,
@@ -504,6 +535,8 @@ pub struct Chat {
     find: Option<find::Find>,
     /// A version installed by the updater, waiting for a restart.
     update_ready: Option<String>,
+    /// The prompt the composer is editing, if any.
+    editing: Option<Editing>,
 }
 
 impl Chat {
@@ -556,6 +589,7 @@ impl Chat {
             skills: skills::SkillCache::default(),
             find: None,
             update_ready: None,
+            editing: None,
         };
         for summary in sessions {
             let id = chat.next_id();
@@ -595,6 +629,9 @@ impl Chat {
     }
 
     fn select(&mut self, id: u64) {
+        if self.current != id {
+            self.cancel_edit();
+        }
         self.current = id;
         self.page = Page::Chat;
         self.menu = None;
@@ -811,6 +848,7 @@ impl Chat {
                     model: entry.message.model.clone().unwrap_or_default(),
                     mode: None,
                     prompt: String::new(),
+                    files: Vec::new(),
                     job: Some(job.id.clone()),
                     cancel: Arc::clone(&target.media_cancel),
                 }));
@@ -926,7 +964,8 @@ impl Chat {
                 self.notify(format!("Open a project folder first ({PRIMARY_KEY}+O), then run /init in it."));
                 return;
             }
-            Some((command, "")) if command != Command::Init => {
+            // A bare generation command with files attached generates from them.
+            Some((command, "")) if command != Command::Init && (self.pending.is_empty() || !matches!(command, Command::Media(_))) => {
                 self.run_command(command, actions);
                 return;
             }
@@ -943,12 +982,17 @@ impl Chat {
             self.notify("Wait for the attachments to finish loading.");
             return;
         }
-        if let (Some((kind, _)), false) = (&media, self.pending.is_empty()) {
-            self.notify(format!("/{} works from the text alone. Remove the attachments to generate.", kind.noun()));
+        if let Some((kind, _)) = &media {
+            if let Err(why) = self.media_mode(*kind, &self.pending) {
+                self.notify(why);
+                return;
+            }
+        } else if self.pending.iter().any(|a| attachments::is_clip(&a.mime)) {
+            self.notify("Video and audio files go into generations: start the message with /image, /video or /audio.");
             return;
         }
         let images = self.pending.iter().any(Attachment::is_image);
-        if images && self.models.iter().find(|m| m.id == self.model).is_some_and(|m| !m.accepts_images()) {
+        if media.is_none() && images&& self.models.iter().find(|m| m.id == self.model).is_some_and(|m| !m.accepts_images()) {
             let name = model_name(&self.models, &self.model).to_owned();
             self.notify(format!("{name} can't read images. Pick a model that can, or remove the image."));
             return;
@@ -956,7 +1000,21 @@ impl Chat {
         let text = self.composer.take().trim().to_owned();
         let attachments = std::mem::take(&mut self.pending);
         let user_id = self.next_id();
+        let editing = self.editing.take();
+        if let Some(Editing { draft: (draft, files), .. }) = &editing {
+            // The draft the edit set aside comes back.
+            self.composer.insert(draft);
+            self.pending.clone_from(files);
+        }
         let conversation = self.current();
+        // An edited prompt replaces itself and everything after it.
+        let mut spent = (0.0, Usage::default());
+        if let Some(index) = editing.and_then(|e| conversation.entries.iter().position(|x| x.id == e.entry)) {
+            spent = conversation.cut(index);
+            if index == 0 {
+                conversation.title.clear();
+            }
+        }
         // Tool calls still waiting for approval are answered by the new prompt.
         if let Some(calls) = conversation.tool_calls() {
             for record in calls.iter_mut().filter(|r| r.status == ToolStatus::Pending) {
@@ -971,6 +1029,7 @@ impl Chat {
         }
         let mut message = StoredMessage::new(Role::User, text);
         message.attachments = attachments;
+        keep_spend(&mut message, spent);
         conversation.entries.push(Entry::new(user_id, message));
         conversation.steps = 0;
         let id = conversation.id;
@@ -983,16 +1042,92 @@ impl Chat {
         self.composer_scroll = 0.0;
         self.selection = None;
         match media {
-            Some((kind, prompt)) => self.generate(id, kind, prompt, actions),
+            Some((kind, prompt)) => {
+                let files = self.current().entries.last().map(|e| e.message.attachments.clone()).unwrap_or_default();
+                self.generate(id, kind, prompt, files, actions);
+            }
             None => self.request_reply(id, actions),
         }
     }
 
-    /// The chosen generation model of `kind`, and the mode to ask for.
-    fn media_choice(&self, kind: MediaKind) -> (String, Option<String>) {
+    /// Loads prompt `entry` of the open conversation into the composer, to
+    /// be sent again in place of itself and everything after it.
+    fn edit(&mut self, entry: u64) {
+        let conversation = self.current();
+        if conversation.busy() {
+            self.notify("Stop the reply before editing a message.");
+            return;
+        }
+        let Some(message) = conversation.entries.iter().find(|e| e.id == entry).map(|e| e.message.clone()) else { return };
+        self.cancel_edit();
+        let draft = (self.composer.take(), std::mem::replace(&mut self.pending, message.attachments));
+        self.composer.insert(&message.content);
+        self.command_dismissed = Some(message.content);
+        self.selection = None;
+        self.editing = Some(Editing { entry, draft });
+    }
+
+    /// Stops editing and puts back the draft the edit set aside.
+    fn cancel_edit(&mut self) {
+        if let Some(Editing { draft: (text, files), .. }) = self.editing.take() {
+            self.composer.take();
+            self.composer.insert(&text);
+            self.pending = files;
+        }
+    }
+
+    /// Asks again for the reply to the open conversation's last prompt (or
+    /// makes its generation again), replacing everything after the prompt.
+    fn retry(&mut self, actions: &mut Vec<Action>) {
+        let conversation = self.current();
+        if conversation.load != Load::Loaded || conversation.busy() {
+            return;
+        }
+        let Some(index) = conversation.entries.iter().rposition(|e| e.message.role == Role::User && !e.message.failed) else { return };
+        let prompt = &conversation.entries[index].message;
+        let media = match Command::parse(&prompt.content) {
+            Some((Command::Media(kind), text)) if !text.is_empty() || !prompt.attachments.is_empty() => {
+                Some((kind, text.to_owned(), prompt.attachments.clone()))
+            }
+            _ => None,
+        };
+        // A generation the chosen model can't make leaves the old one be.
+        if let Some(Err(why)) = media.as_ref().map(|(kind, _, files)| self.media_mode(*kind, files)) {
+            self.notify(why);
+            return;
+        }
+        let conversation = self.current();
+        let spent = conversation.cut(index + 1);
+        keep_spend(&mut conversation.entries[index].message, spent);
+        conversation.steps = 0;
+        let id = conversation.id;
+        self.selection = None;
+        match media {
+            Some((kind, prompt, files)) => self.generate(id, kind, prompt, files, actions),
+            None => self.request_reply(id, actions),
+        }
+    }
+
+    /// The chosen generation model of `kind`, and the mode that makes it
+    /// from `files` (or from the prompt alone). The mode is `None` while the
+    /// model list is unknown, which means the server's default.
+    ///
+    /// # Errors
+    /// What to tell the user: a file no generation takes, or a model that
+    /// can't use these files (or needs one).
+    fn media_mode(&self, kind: MediaKind, files: &[Attachment]) -> Result<(String, Option<String>), String> {
+        let kinds: Vec<MediaKind> = files.iter().filter_map(attachments::input_kind).collect();
+        if kinds.len() < files.len() {
+            return Err("Only PNG, JPEG, GIF and WebP images, video and audio can go into a generation.".into());
+        }
         let id = &self.media_model[kind.index()];
-        let mode = self.media_models[kind.index()].iter().find(|m| &m.id == id).and_then(MediaModel::prompt_mode);
-        (id.clone(), mode.map(str::to_owned))
+        let Some(model) = self.media_models[kind.index()].iter().find(|m| &m.id == id) else { return Ok((id.clone(), None)) };
+        let mode = if files.is_empty() {
+            model.prompt_mode().ok_or_else(|| format!("{} needs a file to work from. Attach one, then send /{} again.", model.label(), kind.noun()))?
+        } else {
+            model.file_mode(&kinds).ok_or_else(|| format!("{} can't make {} from these files. Pick another model, or change the files.", model.label(), kind.noun()))?
+        };
+        Ok((id.clone(), Some(mode.to_owned())))
     }
 
     /// Display name of a text or generation model.
@@ -1000,10 +1135,11 @@ impl Chat {
         label_of(&self.models, &self.media_models, id)
     }
 
-    /// Adds the reply that waits for a generation of `kind` from `prompt` to
-    /// conversation `id`, and starts it.
-    fn generate(&mut self, id: u64, kind: MediaKind, prompt: String, actions: &mut Vec<Action>) {
-        let (model, mode) = self.media_choice(kind);
+    /// Adds the reply that waits for a generation of `kind` from `prompt` and
+    /// `files` to conversation `id`, and starts it. Callers check
+    /// [`Chat::media_mode`] first.
+    fn generate(&mut self, id: u64, kind: MediaKind, prompt: String, files: Vec<Attachment>, actions: &mut Vec<Action>) {
+        let (model, mode) = self.media_mode(kind, &files).unwrap_or_else(|_| (self.media_model[kind.index()].clone(), None));
         let entry_id = self.next_id();
         let Some(conversation) = self.find(id) else { return };
         let mut message = StoredMessage::new(Role::Assistant, String::new());
@@ -1015,7 +1151,7 @@ impl Chat {
         conversation.updated = unix_now();
         actions.push(Action::SaveSession(conversation.to_session()));
         let cancel = Arc::clone(&conversation.media_cancel);
-        actions.push(Action::Generate(MediaRequest { conversation: id, entry: entry_id, kind, model, mode, prompt, job: None, cancel }));
+        actions.push(Action::Generate(MediaRequest { conversation: id, entry: entry_id, kind, model, mode, prompt, files, job: None, cancel }));
         if id == self.current {
             self.stick_to_bottom = true;
         }
@@ -1044,7 +1180,11 @@ impl Chat {
             Ok(Some(file)) => message.attachments = vec![file],
             Err(error) => {
                 let noun = message.media.as_ref().map_or("file", |job| job.kind.noun());
-                message.content = format!("The {noun} could not be generated: {error}");
+                message.content = if found.cancelling {
+                    "Cancelled. The Sparks were refunded.".to_owned()
+                } else {
+                    format!("The {noun} could not be generated: {error}")
+                };
                 message.failed = true;
                 // The server refunds generations that fail.
                 message.cost = 0.0;
@@ -1056,10 +1196,32 @@ impl Chat {
         actions.push(Action::Attention);
     }
 
-    /// Stores the generation models of `kind` that work from a prompt,
-    /// keeping the choice valid.
+    /// Asks the server to cancel the generation that entry `entry` of the
+    /// open conversation waits for.
+    fn cancel_generation(&mut self, entry: u64, actions: &mut Vec<Action>) {
+        let conversation = self.current();
+        let id = conversation.id;
+        let Some(found) = conversation.entries.iter_mut().find(|e| e.id == entry) else { return };
+        let Some(job) = found.message.media.as_ref().filter(|j| !j.id.is_empty() && found.message.media_pending()) else { return };
+        actions.push(Action::CancelGeneration { conversation: id, entry, job: job.id.clone() });
+        found.cancelling = true;
+    }
+
+    /// The server answered a cancel request. A cancelled job ends as failed
+    /// through its status; one that could not be cancelled keeps going, and
+    /// the user hears why.
+    pub fn cancelled(&mut self, conversation: u64, entry: u64, result: Result<(), String>) {
+        let Err(why) = result else { return };
+        if let Some(found) = self.find(conversation).and_then(|c| c.entries.iter_mut().find(|e| e.id == entry)) {
+            found.cancelling = false;
+        }
+        self.notify(why);
+    }
+
+    /// Stores the generation models of `kind` that work from a prompt or
+    /// from files, keeping the choice valid.
     pub fn set_media_models(&mut self, kind: MediaKind, mut models: Vec<MediaModel>) {
-        models.retain(|m| m.prompt_mode().is_some());
+        models.retain(|m| m.prompt_mode().is_some() || m.takes_files());
         let chosen = &mut self.media_model[kind.index()];
         if !models.iter().any(|m| &m.id == chosen)
             && let Some(fallback) = models.iter().find(|m| m.id == DEFAULT_MEDIA[kind.index()]).or(models.first())
@@ -1281,6 +1443,7 @@ impl Chat {
             Key::Named(NamedKey::Enter) if mods.shift_key() => self.composer.insert("\n"),
             Key::Named(NamedKey::Enter) => self.send(actions),
             Key::Named(NamedKey::Escape) if self.selection.is_some() => self.selection = None,
+            Key::Named(NamedKey::Escape) if self.editing.is_some() => self.cancel_edit(),
             Key::Named(NamedKey::Escape) => self.stop(actions),
             Key::Named(key @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) => {
                 if let Some((layout, _)) = &self.composer_layout {
@@ -1439,6 +1602,7 @@ impl Chat {
         crate::ui::folder_icon(p, chip.x + 8.0, chip.y + (chip.h - 10.0) * 0.5, t.text_faint);
         p.text(&dir, chip.x + 24.0, chip.y + (chip.h - dir.height()) * 0.5, t.text_muted);
         crate::ui::chevron(p, chip.right() - 16.0, chip.y + chip.h * 0.5 - 2.0, true, t.text_faint);
+        ui.describe(|| Node::new(A11yRole::Button, chip, &format!("Project folder: {label}")));
         if hovered {
             ui.cursor = winit::window::CursorIcon::Pointer;
             if ui.clicked(chip) {
@@ -1450,6 +1614,7 @@ impl Chat {
         let mut layout = p.layout(&title, theme::LABEL, None);
         layout.truncate(p.fonts, (right - bar.x - 16.0).max(40.0));
         p.text(&layout, bar.x + 16.0, bar.y + (bar.h - layout.height()) * 0.5, t.text);
+        ui.describe(|| Node::new(A11yRole::Heading, bar, &title));
     }
 
     /// Hint shown while files are dragged over the window.
@@ -2131,11 +2296,89 @@ mod tests {
         assert!(!actions.iter().any(|a| matches!(a, Action::Generate(_))));
         assert!(chat.current().entries.last().is_some_and(|e| e.message.failed));
 
-        // Generating takes text only.
+        // A PDF can't go into a generation.
         let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
-        chat.pending.push(Attachment { name: "a.png".into(), mime: "image/png".into(), size: 1, path: "a".into(), dimensions: None });
+        chat.pending.push(attached("a.pdf", "application/pdf"));
         assert!(enter(&mut chat, "/image a fox").is_empty());
         assert!(chat.notice.is_some());
+    }
+
+    fn attached(name: &str, mime: &str) -> Attachment {
+        Attachment { name: name.into(), mime: mime.into(), size: 1, path: name.into(), dimensions: None }
+    }
+
+    /// An image model that generates from a prompt or edits one image.
+    fn image_models() -> Vec<MediaModel> {
+        let json = r#"[{"id":"banana","name":"Banana","default_mode":"generate","modes":[{"id":"generate"},{"id":"edit"}],"schemas":{
+            "generate":{"required":["prompt"],"required_files":[],"properties":{"prompt":{}}},
+            "edit":{"required":["image_urls","prompt"],"required_files":["image"],"properties":{"image_urls":{"media_type":"image"},"prompt":{}}}}},
+            {"id":"upscale","default_mode":"upscale","modes":[{"id":"upscale"}],"schemas":{
+            "upscale":{"required":["image_url"],"required_files":["image"],"properties":{"image_url":{"media_type":"image"}}}}}]"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn generations_take_files_in_a_mode_that_fits() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        chat.set_media_models(MediaKind::Image, image_models());
+        assert_eq!(chat.media_models[0].len(), 2, "a model that only takes files is offered too");
+        chat.set_media_choice(MediaKind::Image, Some("banana".into()));
+
+        chat.pending.push(attached("cat.png", "image/png"));
+        let actions = enter(&mut chat, "/image make it blue");
+        let Some(Action::Generate(request)) = actions.iter().find(|a| matches!(a, Action::Generate(_))) else { panic!("no generation") };
+        assert_eq!((request.mode.as_deref(), request.files.len()), (Some("edit"), 1));
+        assert_eq!(chat.pending.len(), 0);
+
+        // Retrying sends the files again.
+        let mut actions = Vec::new();
+        chat.retry(&mut actions);
+        assert!(actions.iter().any(|a| matches!(a, Action::Generate(r) if r.files.len() == 1 && r.prompt == "make it blue")));
+
+        // A bare command with a file works from the file alone.
+        chat.set_media_choice(MediaKind::Image, Some("upscale".into()));
+        chat.pending.push(attached("small.jpg", "image/jpeg"));
+        let actions = enter(&mut chat, "/image");
+        assert!(actions.iter().any(|a| matches!(a, Action::Generate(r) if r.mode.as_deref() == Some("upscale") && r.prompt.is_empty())));
+
+        // A model that needs a file says so, and so does one that can't use it.
+        assert!(enter(&mut chat, "/image a fox").is_empty());
+        assert!(chat.notice.take().is_some_and(|(n, _)| n.contains("needs a file")));
+        chat.pending.push(attached("song.mp3", "audio/mpeg"));
+        assert!(enter(&mut chat, "/image a fox").is_empty());
+        assert!(chat.notice.take().is_some_and(|(n, _)| n.contains("can't make image")));
+
+        // Clips go to generations, not to chat models.
+        chat.composer.take();
+        assert!(enter(&mut chat, "what is this?").is_empty());
+        assert!(chat.notice.take().is_some_and(|(n, _)| n.contains("/video")));
+    }
+
+    #[test]
+    fn queued_generations_can_be_cancelled() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        let actions = enter(&mut chat, "/image a fox");
+        let Some(Action::Generate(request)) = actions.iter().find(|a| matches!(a, Action::Generate(_))) else { panic!("no generation") };
+        let (id, entry) = (request.conversation, request.entry);
+
+        // Not before the server has the job.
+        let mut actions = Vec::new();
+        chat.cancel_generation(entry, &mut actions);
+        assert!(actions.is_empty());
+        chat.media_started(id, entry, MediaTicket { id: "job-1".into(), sparks: 4.0 }, &mut Vec::new());
+
+        chat.cancel_generation(entry, &mut actions);
+        assert!(matches!(&actions[..], [Action::CancelGeneration { job, .. }] if job == "job-1"));
+        // Too late: it keeps going and the user hears why.
+        chat.cancelled(id, entry, Err("This generation has already started.".into()));
+        assert!(chat.notice.take().is_some());
+        assert!(!chat.current().entries.last().unwrap().cancelling);
+
+        chat.cancel_generation(entry, &mut Vec::new());
+        chat.cancelled(id, entry, Ok(()));
+        chat.media_done(id, entry, Err("Cancelled by user".into()), &mut Vec::new());
+        let reply = &chat.current().entries.last().unwrap().message;
+        assert!(reply.failed && reply.content.starts_with("Cancelled") && reply.cost == 0.0);
     }
 
     #[test]
@@ -2213,5 +2456,74 @@ mod tests {
         chat.diff_ready(job.conversation, "w", diff);
         let entry = chat.current().entries.iter().find(|e| e.diffs.contains_key("w")).expect("stored with its call");
         assert_eq!(entry.message.tool_calls[0].call.call_id, "w");
+    }
+
+    /// Sends `prompt` and finishes its reply with `answer`, costing $1.
+    fn exchange(chat: &mut Chat, prompt: &str, answer: &str) {
+        let job = start(chat, prompt);
+        chat.stream_event(job.conversation, job.stream, StreamEvent::Text(answer.into()));
+        finish(chat, &job, Completion { usage: Usage::new(10, 5), ..Completion::default() });
+        if let Some(reply) = chat.current().entries.last_mut() {
+            reply.message.cost = 1.0;
+        }
+    }
+
+    #[test]
+    fn retry_asks_again_and_keeps_the_spend() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        exchange(&mut chat, "first", "one");
+        exchange(&mut chat, "second", "two");
+        let mut actions = Vec::new();
+        chat.retry(&mut actions);
+        let job = next_send(actions).expect("asked again");
+        let texts: Vec<&str> = job.history.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(texts, ["first", "one", "second"], "the old reply is gone");
+        let c = chat.current();
+        assert!((c.cost() - 2.0).abs() < 1e-9 && c.tokens() == 30, "what the dropped reply cost stays counted");
+
+        // A busy chat is left alone.
+        assert!(next_send({ let mut a = Vec::new(); chat.retry(&mut a); a }).is_none());
+
+        // Retrying a generation makes it again.
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        enter(&mut chat, "/image a fox");
+        let mut actions = Vec::new();
+        chat.retry(&mut actions);
+        assert!(actions.iter().any(|a| matches!(a, Action::Generate(r) if r.prompt == "a fox")));
+        assert_eq!(chat.current().entries.len(), 2);
+    }
+
+    #[test]
+    fn editing_a_prompt_replaces_it_and_what_followed() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new(), Vec::new(), None);
+        exchange(&mut chat, "first", "one");
+        exchange(&mut chat, "second", "two");
+        chat.composer.insert("a draft");
+        let second = chat.current().entries[2].id;
+        chat.edit(second);
+        assert_eq!(chat.composer.text(), "second");
+
+        // Cancelling puts the draft back and changes nothing.
+        chat.cancel_edit();
+        assert_eq!(chat.composer.text(), "a draft");
+        assert_eq!(chat.current().entries.len(), 4);
+
+        chat.edit(second);
+        chat.composer.take();
+        let job = start(&mut chat, "second, better");
+        let texts: Vec<&str> = job.history.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(texts, ["first", "one", "second, better"]);
+        assert_eq!(chat.composer.text(), "a draft", "the draft comes back after sending");
+        assert!((chat.current().cost() - 2.0).abs() < 1e-9);
+
+        // Editing the first prompt retitles the chat.
+        chat.stop(&mut Vec::new());
+        chat.composer.take();
+        let first = chat.current().entries[0].id;
+        chat.edit(first);
+        chat.composer.take();
+        start(&mut chat, "brand new");
+        assert_eq!(chat.current().title, "brand new");
+        assert_eq!(chat.current().entries.len(), 2);
     }
 }

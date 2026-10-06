@@ -21,7 +21,7 @@ mod sse;
 pub use client::{AccessToken, BASE_URL, Client, Model};
 pub use config::{Config, write_private};
 pub use error::{Error, Result};
-pub use media::{MediaJob, MediaKind, MediaModel, MediaStatus, MediaTicket, SPARK_USD};
+pub use media::{MAX_UPLOAD, MediaJob, MediaKind, MediaModel, MediaStatus, MediaTicket, SPARK_USD};
 pub use projects::{Project, Projects};
 pub use responses::{Completion, InputItem, Part, ResponseRequest, Role, StreamEvent, ToolCall, ToolSpec, Usage, base64, data_url};
 pub use session::{

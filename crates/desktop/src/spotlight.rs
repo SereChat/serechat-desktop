@@ -2,12 +2,14 @@
 //! sessions, models and themes), plus full-text search of every saved
 //! message on a worker thread.
 
+use accesskit::Role;
 use arboard::Clipboard;
 use serechat::{Model, Project, SearchHit};
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::CursorIcon;
 
+use crate::a11y::Node;
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::paint::{Painter, Rect, hexa};
@@ -292,6 +294,7 @@ impl Spotlight {
             p.rect(Rect::new(origin.0 + caret - 1.0, origin.1 + 3.0, 2.0, text.height() - 6.0), t.accent, 0.0);
         }
         p.rect(Rect::new(modal.x, field.bottom(), modal.w, 1.0), t.border, 0.0);
+        ui.describe(|| Node::input(field, "Search sessions, projects, models and commands", self.input.text(), false, true));
 
         // Results, grouped.
         let list = Rect::new(modal.x, field.bottom() + 1.0, modal.w, list_h);
@@ -333,6 +336,7 @@ impl Spotlight {
             title.truncate(p.fonts, item.w - detail.width() - 44.0);
             p.text(&title, item.x + 14.0, item.y + (ROW_H - title.height()) * 0.5, t.text);
             p.text(&detail, item.right() - 14.0 - detail.width(), item.y + (ROW_H - detail.height()) * 0.5, t.text_faint);
+            ui.describe(|| Node::new(Role::MenuItem, item, &format!("{}, {}", row.title, row.detail)));
             if hovered {
                 ui.cursor = CursorIcon::Pointer;
                 if ui.clicked(item) {

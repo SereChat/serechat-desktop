@@ -2,17 +2,19 @@
 //! preedit), the toolbar with attach, model, reasoning and send, and the
 //! slash commands it completes.
 
+use accesskit::Role;
 use serechat::MediaKind;
 use winit::window::CursorIcon;
 
 use super::{Chat, Menu, model_name};
+use crate::a11y::Node;
 use crate::app::Action;
 use crate::attachments::human_size;
 use crate::image::{self, Lookup};
 use crate::paint::{Painter, Rect, fade, mix};
 use crate::text::{Style, TextLayout};
 use crate::theme;
-use crate::ui::{Ui, chevron, id};
+use crate::ui::{ButtonStyle, Ui, button, chevron, id};
 
 /// Composer grows up to this many lines, then scrolls.
 const MAX_LINES: usize = 8;
@@ -160,7 +162,19 @@ impl Chat {
             }
         }
 
-        let notice_top = self.draw_notice(p, ui, x, width, card.y);
+        let mut notice_bottom = card.y;
+        if self.editing.is_some() {
+            // Over the card: what Enter will do, and a way out.
+            let bar = Rect::new(x, card.y - 32.0, width, 28.0);
+            let note = p.layout("Editing a message. Sending replaces it and everything after it.", theme::SMALL, None);
+            p.text(&note, bar.x + 4.0, bar.y + (bar.h - note.height()) * 0.5, t.text_muted);
+            ui.describe(|| Node::new(Role::Label, bar, "Editing a message. Sending replaces it and everything after it."));
+            if button(p, ui, Rect::new(bar.right() - 72.0, bar.y + 2.0, 72.0, 24.0), "Cancel", ButtonStyle::Ghost, true) {
+                self.cancel_edit();
+            }
+            notice_bottom = bar.y;
+        }
+        let notice_top = self.draw_notice(p, ui, x, width, notice_bottom);
 
         // Typing goes elsewhere while Spotlight or the find bar has it.
         let typing_here = self.spotlight.is_none() && !self.find.as_ref().is_some_and(|f| f.focused);
@@ -206,6 +220,7 @@ impl Chat {
             p.rect(Rect::new(origin.0 + caret_x - 1.0, origin.1 + caret_y + 3.0, 2.0, line_h - 6.0), t.accent, 0.0);
         }
         p.set_clip(clip);
+        ui.describe(|| Node::input(text_area, "Message", self.composer.text(), true, typing_here));
 
         // Toolbar: attach, model and reasoning on the left; send/stop on the right.
         let item_y = card.bottom() - 10.0 - 26.0;
@@ -213,6 +228,7 @@ impl Chat {
         let attach_hover = ui.anim(id("attach"), f32::from(u8::from(ui.hovered(attach))));
         p.rect(attach, fade(t.hover, attach_hover), theme::RADIUS_SM);
         p.label_centered("+", Style::regular(18.0), attach, mix(t.text_muted, t.text, attach_hover));
+        ui.describe(|| Node::new(Role::Button, attach, "Attach files"));
         if ui.hovered(attach) {
             ui.cursor = CursorIcon::Pointer;
             if ui.clicked(attach) {
@@ -246,6 +262,7 @@ impl Chat {
             p.rect(send, t.hover, theme::RADIUS_SM);
             p.label_centered("↑", Style::semibold(15.0), send, t.text_faint);
         }
+        ui.describe(|| Node::new(Role::Button, send, if busy { "Stop" } else { "Send" }));
         if hovered {
             ui.cursor = CursorIcon::Pointer;
             if ui.clicked(send) {
@@ -306,6 +323,7 @@ impl Chat {
             let size = p.layout(&human_size(attachment.size), theme::TINY, None);
             p.text(&size, chip.x + 51.0 + name.width(), chip.y + (CHIP_H - size.height()) * 0.5, t.text_faint);
             let close = Rect::new(chip.right() - 26.0, chip.y + 5.0, 20.0, 20.0);
+            ui.describe(|| Node::new(Role::Button, close, &format!("Remove {}", attachment.name)));
             let over = ui.hovered(close);
             if over {
                 p.rect(close, t.hover, theme::RADIUS_SM);
@@ -337,6 +355,7 @@ impl Chat {
         p.text(&layout, rect.x + 14.0, rect.y + 8.0, fade(t.text, fade_out));
         let close = Rect::new(rect.right() - 28.0, rect.y + 4.0, 22.0, 22.0);
         p.label_centered("×", Style::regular(15.0), close, fade(t.text_faint, fade_out));
+        ui.describe(|| Node::new(Role::Alert, rect, text));
         if ui.hovered(rect) {
             ui.cursor = CursorIcon::Pointer;
             if ui.clicked(rect) {
@@ -358,6 +377,7 @@ impl Chat {
         let color = mix(t.text_muted, t.text, hover);
         p.text(&text, rect.x + 8.0, y + (26.0 - text.height()) * 0.5, color);
         chevron(p, rect.right() - 17.0, y + 11.0, true, color);
+        ui.describe(|| Node::new(Role::Button, rect, label));
         if hovered {
             ui.cursor = CursorIcon::Pointer;
             if ui.clicked(rect) {

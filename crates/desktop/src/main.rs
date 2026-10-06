@@ -8,6 +8,7 @@
 // Release builds are GUI apps on Windows: no console window.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod a11y;
 mod app;
 mod atlas;
 mod attachments;
