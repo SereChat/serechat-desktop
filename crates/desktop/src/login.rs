@@ -1,41 +1,88 @@
-//! First-run sign-in screen driving the device-code flow:
-//! request -> approve in browser -> type the 6-digit code -> exchange.
+//! First-run sign-in screen. Signing in is OAuth 2.1 with PKCE for native
+//! apps (RFC 8252): the system browser shows SereChat's consent page and
+//! sends its answer to a one-off listener on `127.0.0.1`, and the code it
+//! carries is traded for tokens.
 
-use arboard::Clipboard;
-use serechat::{AccessToken, Error};
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use accesskit::Role;
+use serechat::{BASE_URL, CLIENT_ID, Client, RESOURCE, SCOPES, Tokens};
 use winit::event::KeyEvent;
-use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::CursorIcon;
+use winit::keyboard::{Key, NamedKey};
 
 use crate::a11y::Node;
 use crate::app::Action;
-use crate::editor::Editor;
-use crate::paint::{Painter, Rect, mix};
+use crate::mcp::oauth::{encode, random_string, receive_redirect};
+use crate::paint::{Painter, Rect};
+use crate::sha256;
 use crate::text::{Align, Style};
 use crate::theme;
-use crate::ui::{ButtonStyle, Ui, button, edit_key, logo};
+use crate::ui::{ButtonStyle, Ui, button, logo};
 
-/// Number of digits in a SereChat authorization code.
-const CODE_LEN: usize = 6;
+/// A sign-in waiting for the browser.
+pub struct Flow {
+    /// SereChat's consent page, to open in the browser.
+    pub url: String,
+    listener: TcpListener,
+    redirect_uri: String,
+    verifier: String,
+    state: String,
+}
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Phase {
-    /// Nothing started yet.
-    Idle,
-    /// Waiting for `request_authorization`.
-    Requesting,
-    /// Browser opened; waiting for the user to type the code.
-    AwaitingCode,
-    /// Waiting for `exchange_code`.
-    Verifying,
+impl Flow {
+    /// Listens on a free loopback port and builds the consent page's URL,
+    /// with a fresh PKCE verifier and `state`.
+    ///
+    /// # Errors
+    /// No loopback port could be opened.
+    pub fn new() -> std::io::Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let redirect_uri = format!("http://127.0.0.1:{}/callback", listener.local_addr()?.port());
+        let (verifier, state) = (random_string(64), random_string(32));
+        let challenge = serechat::base64(&sha256::digest(verifier.as_bytes()), true);
+        let url = format!(
+            "{BASE_URL}/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri={}&code_challenge={challenge}&code_challenge_method=S256&state={state}&scope={}&resource={}",
+            encode(&redirect_uri),
+            encode(SCOPES),
+            encode(RESOURCE),
+        );
+        Ok(Self { url, listener, redirect_uri, verifier, state })
+    }
+
+    /// Waits for the browser's answer, checks it came from SereChat, and
+    /// trades its code for tokens. Blocks until then (ten minutes at most)
+    /// or until `cancel` is raised.
+    ///
+    /// # Errors
+    /// A message for the user.
+    pub fn finish(self, client: &Client, cancel: &AtomicBool) -> Result<Tokens, String> {
+        let params = receive_redirect(&self.listener, &self.state, cancel)?;
+        // RFC 9207: only SereChat's own answer counts.
+        if params.get("iss").map(String::as_str) != Some(BASE_URL) {
+            return Err("The sign-in answer did not come from SereChat, so it was ignored. Please try again.".into());
+        }
+        if let Some(error) = params.get("error") {
+            return Err(match (error.as_str(), params.get("error_description")) {
+                ("access_denied", _) => "Sign-in was declined in the browser.".into(),
+                (_, Some(detail)) => format!("Sign-in failed: {detail}"),
+                (error, None) => format!("Sign-in failed ({error})."),
+            });
+        }
+        let code = params.get("code").ok_or("The sign-in answer had no authorization code.")?;
+        client.exchange_code(code, &self.redirect_uri, &self.verifier).map_err(|e| e.to_string())
+    }
 }
 
 /// State of the sign-in screen.
 pub struct Login {
-    phase: Phase,
-    code: Editor,
-    request_id: Option<String>,
+    /// The consent page, while a sign-in waits for the browser.
+    waiting: Option<String>,
+    /// Raised to give up on the sign-in that is waiting.
+    cancel: Arc<AtomicBool>,
+    /// Numbers sign-ins, so the answer to one given up on is ignored.
+    flow: u64,
     error: Option<String>,
     /// Informational note, e.g. "link copied".
     notice: Option<String>,
@@ -45,55 +92,37 @@ impl Login {
     /// A fresh screen, optionally explaining why the user landed here.
     #[must_use]
     pub fn new(error: Option<String>) -> Self {
-        Self {
-            phase: Phase::Idle,
-            code: Editor::restricted(CODE_LEN, |c| c.is_ascii_digit()),
-            request_id: None,
-            error,
-            notice: None,
-        }
+        Self { waiting: None, cancel: Arc::default(), flow: 0, error, notice: None }
     }
 
-    /// Handles the result of step 1. Returns the request id whose approval
-    /// page should now be opened.
-    pub fn requested(&mut self, result: Result<String, Error>) -> Option<String> {
+    /// A sign-in started with consent page `url`. Returns its number and
+    /// the flag that gives up on it.
+    pub fn waiting(&mut self, url: String) -> (u64, Arc<AtomicBool>) {
+        self.stop();
+        self.cancel = Arc::default();
+        self.flow += 1;
+        self.waiting = Some(url);
+        (self.flow, Arc::clone(&self.cancel))
+    }
+
+    /// Handles the end of sign-in `flow`. Returns the tokens on success.
+    pub fn finished(&mut self, flow: u64, result: Result<Tokens, String>) -> Option<Tokens> {
+        if flow != self.flow || self.waiting.take().is_none() {
+            return None;
+        }
         match result {
-            // The id ends up in a URL handed to the OS; accept only UUID-ish text.
-            Ok(id) if !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') => {
-                self.phase = Phase::AwaitingCode;
-                self.request_id = Some(id.clone());
-                Some(id)
-            }
-            Ok(_) => {
-                self.fail("The server returned an invalid sign-in request.".into());
-                None
-            }
+            Ok(tokens) => Some(tokens),
             Err(e) => {
-                self.fail(e.to_string());
+                self.error = Some(e);
                 None
             }
         }
     }
 
-    /// Handles the result of step 2. Returns the token on success.
-    pub fn exchanged(&mut self, result: Result<AccessToken, Error>) -> Option<AccessToken> {
-        let error = match result {
-            Ok(token) => return Some(token),
-            Err(e) => e,
-        };
-        self.phase = Phase::AwaitingCode;
-        self.code.take();
-        self.error = Some(match error.code() {
-            Some("invalid_code") => "That code is incorrect. Check your browser and try again.".into(),
-            Some("authorization_pending") => "Approve the request in your browser first, then enter the code.".into(),
-            Some("request_not_found" | "request_invalidated") => {
-                self.phase = Phase::Idle;
-                self.request_id = None;
-                "This sign-in request has expired. Please start again.".into()
-            }
-            _ => error.to_string(),
-        });
-        None
+    /// Shows why a sign-in could not start or finish.
+    pub fn fail(&mut self, message: String) {
+        self.stop();
+        self.error = Some(message);
     }
 
     /// Records that the browser could not be opened and the link was copied instead.
@@ -101,71 +130,32 @@ impl Login {
         self.notice = Some("Couldn't open your browser. The sign-in link was copied; paste it into a browser.".into());
     }
 
-    fn fail(&mut self, message: String) {
-        self.phase = Phase::Idle;
-        self.request_id = None;
-        self.error = Some(message);
+    /// Gives up on the sign-in that is waiting.
+    fn stop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.waiting = None;
     }
 
     fn start(&mut self, actions: &mut Vec<Action>) {
-        self.phase = Phase::Requesting;
         self.error = None;
         self.notice = None;
-        self.code.take();
         actions.push(Action::StartLogin);
     }
 
-    fn verify(&mut self, actions: &mut Vec<Action>) {
-        if self.phase != Phase::AwaitingCode || self.code.text().len() != CODE_LEN {
-            return;
-        }
-        if let Some(request_id) = self.request_id.clone() {
-            self.phase = Phase::Verifying;
-            self.error = None;
-            actions.push(Action::VerifyCode { request_id, code: self.code.text().to_owned() });
-        }
-    }
-
-    /// Text committed by an input method (e.g. full-width digits typed with
-    /// a CJK IME). Only ASCII digits are kept.
-    pub fn commit(&mut self, text: &str, actions: &mut Vec<Action>) {
-        if self.phase == Phase::AwaitingCode {
-            // Map full-width digits (０-９) to ASCII.
-            let digits: String = text
-                .chars()
-                .map(|c| if ('０'..='９').contains(&c) { char::from_u32(c as u32 - 0xFF10 + u32::from(b'0')).unwrap_or(c) } else { c })
-                .collect();
-            self.code.insert(&digits);
-            if self.code.text().len() == CODE_LEN {
-                self.verify(actions);
-            }
-        }
-    }
-
     /// Keyboard input.
-    pub fn key(&mut self, event: &KeyEvent, mods: ModifiersState, cb: &mut Option<Clipboard>, actions: &mut Vec<Action>) {
-        match (&event.logical_key, self.phase) {
-            (Key::Named(NamedKey::Enter), Phase::Idle) => self.start(actions),
-            (Key::Named(NamedKey::Enter), _) => self.verify(actions),
-            (_, Phase::AwaitingCode) => {
-                edit_key(&mut self.code, event, mods, cb);
-                // Submit as soon as the last digit lands.
-                if self.code.text().len() == CODE_LEN {
-                    self.verify(actions);
-                }
-            }
-            _ => {}
+    pub fn key(&mut self, event: &KeyEvent, actions: &mut Vec<Action>) {
+        if event.logical_key == Key::Named(NamedKey::Enter) && self.waiting.is_none() {
+            self.start(actions);
         }
     }
 
     /// Draws the screen.
     pub fn draw(&mut self, p: &mut Painter, ui: &mut Ui, view: Rect, actions: &mut Vec<Action>) {
         let t = p.theme;
-        let awaiting = matches!(self.phase, Phase::AwaitingCode | Phase::Verifying);
         let width = 400.0;
         let inner = width - 64.0;
-        let subtitle_text = if awaiting {
-            "Approve SereChat Desktop in your browser, then enter the 6-digit code shown there."
+        let subtitle_text = if self.waiting.is_some() {
+            "Approve SereChat Desktop in your browser. You'll continue here once you do."
         } else {
             "Sign in with your SereChat account to start chatting."
         };
@@ -174,8 +164,8 @@ impl Login {
         let message = message.map(|(text, color)| (p.layout(text, theme::SMALL, Some(inner)), color));
 
         let mut height = 32.0 + 40.0 + 20.0 + 30.0 + 6.0 + subtitle.height() + 24.0 + 36.0 + 32.0;
-        if awaiting {
-            height += 52.0 + 16.0 + 36.0;
+        if self.waiting.is_some() {
+            height += 8.0 + 28.0;
         }
         if let Some((layout, _)) = &message {
             height += layout.height() + 16.0;
@@ -197,36 +187,20 @@ impl Login {
         ui.describe(|| Node::new(Role::Label, Rect::new(x, y, inner, subtitle.height()), subtitle_text));
         y += subtitle.height() + 24.0;
 
-        if awaiting {
-            self.draw_code(p, ui, Rect::new(x, y, inner, 52.0));
-            y += 52.0 + 16.0;
-        }
-
-        let (label, enabled) = match self.phase {
-            Phase::Idle => ("Continue in browser  →", true),
-            Phase::Requesting => ("Opening browser…", false),
-            Phase::AwaitingCode => ("Verify code", self.code.text().len() == CODE_LEN),
-            Phase::Verifying => ("Verifying…", false),
-        };
+        let (label, enabled) = if self.waiting.is_some() { ("Waiting for your browser…", false) } else { ("Continue in browser  →", true) };
         if button(p, ui, Rect::new(x, y, inner, 36.0), label, ButtonStyle::Primary, enabled) {
-            if self.phase == Phase::Idle {
-                self.start(actions);
-            } else {
-                self.verify(actions);
-            }
+            self.start(actions);
         }
         y += 36.0;
 
-        if awaiting {
+        if let Some(url) = self.waiting.clone() {
             y += 8.0;
             let half = (inner - 8.0) * 0.5;
-            if button(p, ui, Rect::new(x, y, half, 28.0), "Reopen browser", ButtonStyle::Ghost, true)
-                && let Some(request_id) = self.request_id.clone()
-            {
-                actions.push(Action::OpenAuthPage(request_id));
+            if button(p, ui, Rect::new(x, y, half, 28.0), "Reopen browser", ButtonStyle::Ghost, true) {
+                actions.push(Action::OpenAuthPage(url));
             }
-            if button(p, ui, Rect::new(x + half + 8.0, y, half, 28.0), "Start over", ButtonStyle::Ghost, true) {
-                self.start(actions);
+            if button(p, ui, Rect::new(x + half + 8.0, y, half, 28.0), "Cancel", ButtonStyle::Ghost, true) {
+                self.stop();
             }
             y += 28.0;
         }
@@ -239,31 +213,55 @@ impl Login {
             }
         }
     }
+}
 
-    /// The six digit boxes.
-    fn draw_code(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect) {
-        let t = p.theme;
-        let gap = 8.0;
-        let size = ((area.w - gap * (CODE_LEN as f32 - 1.0)) / CODE_LEN as f32).min(48.0);
-        let start = area.x + (area.w - (size * CODE_LEN as f32 + gap * (CODE_LEN as f32 - 1.0))) * 0.5;
-        let digits = self.code.text().as_bytes();
-        let active = digits.len().min(CODE_LEN - 1);
-        let editable = self.phase == Phase::AwaitingCode;
-        ui.describe(|| Node::input(area, "6-digit code", self.code.text(), false, editable));
-        for i in 0..CODE_LEN {
-            let cell = Rect::new(start + i as f32 * (size + gap), area.y, size, area.h);
-            let focus = ui.anim(crate::ui::id(("code", i)), f32::from(u8::from(editable && i == active)));
-            p.bordered(cell, t.bg, theme::RADIUS, 1.0, mix(t.border_strong, t.accent, focus));
-            if let Some(&digit) = digits.get(i) {
-                let s = [digit];
-                let text = std::str::from_utf8(&s).unwrap_or_default();
-                p.label_centered(text, Style::semibold(22.0), cell, t.text);
-            } else if editable && i == active && ui.caret_visible() {
-                p.rect(Rect::new(cell.x + cell.w * 0.5 - 0.75, cell.y + 15.0, 1.5, cell.h - 30.0), t.accent, 0.5);
-            }
-            if editable && ui.hovered(cell) {
-                ui.cursor = CursorIcon::Text;
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Plays the browser: comes back to `flow`'s redirect with `query` and its state.
+    fn answer(flow: &Flow, query: &str) -> std::thread::JoinHandle<()> {
+        let target = format!("/callback?{query}&state={}", flow.state);
+        let port = flow.listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream.write_all(format!("GET {target} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
+            let _ = stream.read_to_string(&mut String::new());
+        })
+    }
+
+    #[test]
+    fn consent_url_and_answers() {
+        let flow = Flow::new().unwrap();
+        let challenge = serechat::base64(&sha256::digest(flow.verifier.as_bytes()), true);
+        assert!(flow.url.starts_with("https://serechat.com/oauth/authorize?response_type=code&client_id=serechat-desktop&redirect_uri=http%3A%2F%2F127.0.0.1%3A"));
+        assert!(flow.url.contains("%2Fcallback&") && flow.url.contains(&format!("&code_challenge={challenge}&code_challenge_method=S256&state={}&", flow.state)));
+        assert!(flow.url.ends_with("&scope=chat%20media%20files&resource=https%3A%2F%2Fserechat.com%2Fv1"));
+
+        // An answer naming another issuer is refused before any code is used.
+        let browser = answer(&flow, "code=c&iss=https%3A%2F%2Fevil.example");
+        let Err(error) = flow.finish(&Client::new(), &AtomicBool::new(false)) else { panic!("a foreign answer was accepted") };
+        browser.join().unwrap();
+        assert!(error.contains("did not come from SereChat"), "{error}");
+
+        let flow = Flow::new().unwrap();
+        let browser = answer(&flow, "error=access_denied&iss=https%3A%2F%2Fserechat.com");
+        let Err(error) = flow.finish(&Client::new(), &AtomicBool::new(false)) else { panic!("a refusal was accepted") };
+        assert_eq!(error, "Sign-in was declined in the browser.");
+        browser.join().unwrap();
+    }
+
+    #[test]
+    fn only_the_latest_sign_in_counts() {
+        let mut login = Login::new(None);
+        let (first, cancel_first) = login.waiting("https://serechat.com/a".into());
+        let (second, _) = login.waiting("https://serechat.com/b".into());
+        assert!(cancel_first.load(Ordering::Relaxed), "starting again gives up on the first");
+        assert!(login.finished(first, Err("Sign-in was cancelled.".into())).is_none());
+        assert!(login.error.is_none() && login.waiting.is_some(), "the first one's end is ignored");
+        assert!(login.finished(second, Err("Sign-in was declined in the browser.".into())).is_none());
+        assert_eq!(login.error.as_deref(), Some("Sign-in was declined in the browser."));
+        assert!(login.finished(second, Err("again".into())).is_none() && login.error.as_deref() != Some("again"), "each ends once");
     }
 }

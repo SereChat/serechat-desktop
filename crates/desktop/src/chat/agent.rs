@@ -427,16 +427,15 @@ impl Chat {
     }
 
     /// Finishes a stream: saves the reply and moves the run on, retries, or
-    /// shows why it failed. Returns `true` if the server rejected our token.
-    pub fn stream_end(&mut self, conversation: u64, stream: u64, result: Result<bool, Error>, actions: &mut Vec<Action>) -> bool {
-        let unauthorized = result.as_ref().is_err_and(Error::is_unauthorized);
+    /// shows why it failed. (A refused sign-in is the client's to report.)
+    pub fn stream_end(&mut self, conversation: u64, stream: u64, result: Result<bool, Error>, actions: &mut Vec<Action>) {
         let id = conversation;
         let note_id = self.next_id();
         // A stream the user stopped is already detached and ends up here.
-        let Some(target) = Self::stream_target(&mut self.conversations, id, stream) else { return false };
-        let Some(active) = target.stream.take() else { return false };
+        let Some(target) = Self::stream_target(&mut self.conversations, id, stream) else { return };
+        let Some(active) = target.stream.take() else { return };
         target.updated = unix_now();
-        let Some(index) = target.entries.iter().position(|e| e.id == active.entry) else { return false };
+        let Some(index) = target.entries.iter().position(|e| e.id == active.entry) else { return };
         let message = &target.entries[index].message;
         // `server_error` and a missing code are retried; `incomplete` is not.
         let failure = |code: &str, message: &str| Err(Error::Response { code: Some(code.to_owned()), message: message.to_owned() });
@@ -468,7 +467,6 @@ impl Chat {
             }
         }
         self.attention_if_waiting(id, actions);
-        unauthorized
     }
 
     /// A reply stopped early for `reason`: its calls never run, and a reply

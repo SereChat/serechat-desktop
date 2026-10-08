@@ -1,6 +1,6 @@
 [package]
 name = "serechat"
-description = "SereChat API client: device-code auth, Responses API streaming and user config."
+description = "SereChat API client: OAuth tokens, Responses API streaming and user config."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

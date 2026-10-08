@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn statuses() {
-        let client = Client::new(None);
+        let client = Client::new();
         let status = |json: &str| client.parse_status(&serde_json::from_str(json).unwrap());
         assert_eq!(status(r#"{"status":"processing","output":null}"#), MediaStatus::Pending);
         assert_eq!(status(r#"{"status":"queued"}"#), MediaStatus::Pending);
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn tokens_stay_home() {
-        let client = Client::new(Some("t".into()));
+        let client = Client::new();
         assert!(client.owns(&client.url("/api/files/x")));
         assert!(!client.owns(&format!("{}.evil.com/x", client.url(""))), "a look-alike host never gets the token");
         assert!(!client.owns("https://cdn.example.com/a.png"));

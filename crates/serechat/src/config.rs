@@ -23,8 +23,6 @@ const FILE_NAME: &str = "config.toml";
 /// Persistent user settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
-    /// Bearer token obtained through the device-code flow.
-    pub token: Option<String>,
     /// Identifier of the model used for new messages.
     pub model: Option<String>,
     /// Reasoning effort for new messages (`none`, `low`, `medium`, `high`);
@@ -98,8 +96,8 @@ impl Config {
 
     /// Writes the configuration atomically to an explicit path.
     ///
-    /// The file holds a credential, so on Unix it is created with mode `0600`
-    /// inside a `0700` directory. On Windows the user profile ACLs apply.
+    /// On Unix it is created with mode `0600` inside a `0700` directory. On
+    /// Windows the user profile ACLs apply.
     ///
     /// # Errors
     /// See [`Config::save`].
@@ -123,7 +121,6 @@ impl Config {
             let key = key.trim();
             let value = parse_string(rest.trim()).map_err(err)?;
             match key {
-                "token" => config.token = Some(value),
                 "model" => config.model = Some(value),
                 "reasoning" => config.reasoning = Some(value),
                 "theme" => config.theme = Some(value),
@@ -145,7 +142,6 @@ impl Config {
     pub fn serialize(&self) -> String {
         let mut out = String::from("# SereChat desktop configuration.\n");
         let fields = [
-            ("token", &self.token),
             ("model", &self.model),
             ("reasoning", &self.reasoning),
             ("theme", &self.theme),
@@ -288,8 +284,7 @@ mod tests {
     #[test]
     fn round_trip_with_escapes() {
         let config = Config {
-            token: Some("tok\"en\\\n\u{1}é".into()),
-            model: Some("claude-sonnet-5.5".into()),
+            model: Some("claude\"sonnet\\\n\u{1}é".into()),
             reasoning: Some("high".into()),
             theme: Some("light".into()),
             project: Some(r"C:\work\café".into()),
@@ -305,15 +300,17 @@ mod tests {
 
     #[test]
     fn parses_comments_literals_and_unknown_keys() {
-        let text = "# hi\n\ntoken = 'raw\\n' # trailing\nfuture = \"x\"\nmodel=\"a\\u00e9\"\n";
+        // `token` is what builds before OAuth kept; it is ignored now.
+        let text = "# hi\n\ntheme = 'raw\\n' # trailing\nfuture = \"x\"\ntoken = \"apk_live_x\"\nmodel=\"a\\u00e9\"\n";
         let config = Config::parse(text).unwrap();
-        assert_eq!(config.token.as_deref(), Some("raw\\n"));
+        assert_eq!(config.theme.as_deref(), Some("raw\\n"));
         assert_eq!(config.model.as_deref(), Some("aé"));
+        assert!(!config.serialize().contains("token"));
     }
 
     #[test]
     fn rejects_garbage() {
-        for bad in ["token", "token = x", "token = \"open", "token = \"a\" b", "token = \"\\q\""] {
+        for bad in ["model", "model = x", "model = \"open", "model = \"a\" b", "model = \"\\q\""] {
             assert!(matches!(Config::parse(bad), Err(Error::Config { line: 1, .. })), "{bad}");
         }
     }
@@ -322,7 +319,7 @@ mod tests {
     fn save_and_load_file() {
         let dir = std::env::temp_dir().join(format!("serechat-config-test-{}", std::process::id()));
         let path = dir.join("config.toml");
-        let config = Config { token: Some("abc".into()), ..Config::default() };
+        let config = Config { model: Some("abc".into()), ..Config::default() };
         config.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path).unwrap(), config);
         fs::remove_dir_all(&dir).unwrap();

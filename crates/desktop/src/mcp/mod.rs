@@ -24,7 +24,7 @@
 pub mod config;
 #[cfg(test)]
 mod fake;
-mod oauth;
+pub mod oauth;
 mod transport;
 
 use std::fmt::Write as _;

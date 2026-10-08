@@ -883,7 +883,7 @@ mod tests {
     }
 
     fn exec(root: &Path, name: &str, arguments: &Value) -> Result<String, String> {
-        run(Some(root), 0, &Client::new(None), &call(name, arguments), &AtomicBool::new(false)).map(|output| output.text)
+        run(Some(root), 0, &Client::new(), &call(name, arguments), &AtomicBool::new(false)).map(|output| output.text)
     }
 
     #[test]
@@ -941,7 +941,7 @@ mod tests {
         assert!(out.starts_with("exit code: 0") && out.contains("hi"), "{out}");
         let cancelled = AtomicBool::new(true);
         let slow = if cfg!(target_os = "windows") { "Start-Sleep 30" } else { "sleep 30" };
-        let out = run(Some(&root), 0, &Client::new(None), &call("run_command", &json!({ "command": slow })), &cancelled).unwrap().text;
+        let out = run(Some(&root), 0, &Client::new(), &call("run_command", &json!({ "command": slow })), &cancelled).unwrap().text;
         assert!(out.starts_with("stopped by the user"), "{out}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -963,7 +963,7 @@ mod tests {
         let root = std::env::temp_dir();
         assert!(exec(&root, "browser_click", &json!({ "element": "x" })).unwrap_err().contains("'ref'"));
         // Without a project, the web tools run and the rest refuse.
-        let bare = |name, arguments: &Value| run(None, 0, &Client::new(None), &call(name, arguments), &AtomicBool::new(false)).map(|o| o.text);
+        let bare = |name, arguments: &Value| run(None, 0, &Client::new(), &call(name, arguments), &AtomicBool::new(false)).map(|o| o.text);
         assert!(bare("browser_click", &json!({ "element": "x" })).unwrap_err().contains("'ref'"));
         assert!(bare("fetch_url", &json!({})).unwrap_err().contains("'url'"));
         assert_eq!(bare("write_file", &json!({ "path": "a", "content": "" })).unwrap_err(), NEEDS_PROJECT);

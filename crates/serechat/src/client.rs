@@ -3,42 +3,36 @@
 //! Every call blocks the calling thread; the desktop app runs them on worker
 //! threads so the render loop never waits on the network.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use ureq::http::Response;
 
+use crate::auth::{Auth, Tokens};
 use crate::error::{Error, Result};
 
 /// Production API origin.
 pub const BASE_URL: &str = "https://serechat.com";
 
-/// A cheaply clonable handle to the API. Clones share one connection pool.
+/// A cheaply clonable handle to the API. Clones share one connection pool
+/// and, once signed in, one set of tokens.
 #[derive(Clone)]
 pub struct Client {
-    agent: ureq::Agent,
+    pub(crate) agent: ureq::Agent,
     base: String,
-    token: Option<String>,
+    pub(crate) auth: Option<Arc<Auth>>,
 }
 
 impl std::fmt::Debug for Client {
-    // Hand-written so the bearer token never ends up in logs.
+    // Hand-written so the tokens never end up in logs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
             .field("base", &self.base)
-            .field("authenticated", &self.token.is_some())
+            .field("authenticated", &self.auth.is_some())
             .finish_non_exhaustive()
     }
-}
-
-/// Result of a successful device-code exchange.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AccessToken {
-    /// Bearer token for inference requests.
-    pub access_token: String,
-    /// Lifetime in seconds (currently one year).
-    pub expires_in: u64,
 }
 
 /// A chat model offered by the API.
@@ -97,9 +91,9 @@ impl Model {
 }
 
 impl Client {
-    /// Creates a client against [`BASE_URL`], optionally authenticated.
+    /// Creates a signed-out client against [`BASE_URL`]; see [`Client::signed_in`].
     #[must_use]
-    pub fn new(token: Option<String>) -> Self {
+    pub fn new() -> Self {
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(15)))
@@ -109,43 +103,7 @@ impl Client {
             .user_agent(concat!("serechat-desktop/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Self { agent, base: BASE_URL.to_owned(), token }
-    }
-
-    /// Returns a copy of this client using `token` for authentication.
-    #[must_use]
-    pub fn with_token(&self, token: String) -> Self {
-        Self { token: Some(token), ..self.clone() }
-    }
-
-    /// The browser URL where the user approves a device-code request.
-    #[must_use]
-    pub fn authorize_url(&self, request_id: &str) -> String {
-        format!("{}/authorize-app?request_id={request_id}", self.base)
-    }
-
-    /// Step 1 of the device-code flow: registers an authorization request and
-    /// returns its `request_id` (valid for 10 minutes).
-    ///
-    /// # Errors
-    /// Network failure or a non-success response.
-    pub fn request_authorization(&self, app_name: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Body {
-            request_id: String,
-        }
-        let body: Body = self.post_json("/api/auth/app/request", &json!({ "app_name": app_name }), false)?;
-        Ok(body.request_id)
-    }
-
-    /// Step 2 of the device-code flow: trades the 6-digit code the user saw in
-    /// the browser for a bearer token.
-    ///
-    /// # Errors
-    /// Network failure or an API error; notable codes are `invalid_code`,
-    /// `authorization_pending`, `request_not_found` and `request_invalidated`.
-    pub fn exchange_code(&self, request_id: &str, code: &str) -> Result<AccessToken> {
-        self.post_json("/api/auth/app/exchange", &json!({ "request_id": request_id, "code": code }), false)
+        Self { agent, base: BASE_URL.to_owned(), auth: None }
     }
 
     /// Lists the available chat models.
@@ -184,34 +142,19 @@ impl Client {
     /// POSTs `body` as JSON and returns the raw response after checking the
     /// status. Used by streaming calls that consume the body incrementally.
     pub(crate) fn post(&self, path: &str, body: &Value, auth: bool) -> Result<Response<ureq::Body>> {
-        let mut request = self
-            .agent
-            .post(format!("{}{path}", self.base))
-            .content_type("application/json");
-        if auth {
-            let token = self.token.as_deref().unwrap_or_default();
-            request = request.header("Authorization", format!("Bearer {token}"));
-        }
-        let response = request.send(serde_json::to_vec(body)?)?;
-        check_status(response)
+        let body = serde_json::to_vec(body)?;
+        self.call(auth, |token| bearer(self.agent.post(self.url(path)), token).content_type("application/json").send(&body[..]))
     }
 
     /// POSTs a raw `body` of `content_type` with the token and returns the
     /// response after checking the status.
     pub(crate) fn post_bytes(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Response<ureq::Body>> {
-        self.send_authed(self.agent.post(self.url(path)), content_type, body)
+        self.call(true, |token| bearer(self.agent.post(self.url(path)), token).content_type(content_type).send(body))
     }
 
     /// DELETE with a body (`DELETE /api/user/files` takes its ids as JSON).
     pub(crate) fn delete_bytes(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Response<ureq::Body>> {
-        self.send_authed(self.agent.delete(self.url(path)).force_send_body(), content_type, body)
-    }
-
-    /// Sends `request` with `body` and the token, and checks the status.
-    fn send_authed(&self, request: ureq::RequestBuilder<ureq::typestate::WithBody>, content_type: &str, body: &[u8]) -> Result<Response<ureq::Body>> {
-        let token = self.token.as_deref().unwrap_or_default();
-        let request = request.content_type(content_type).header("Authorization", format!("Bearer {token}"));
-        check_status(request.send(body)?)
+        self.call(true, |token| bearer(self.agent.delete(self.url(path)).force_send_body(), token).content_type(content_type).send(body))
     }
 
     pub(crate) fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: &Value, auth: bool) -> Result<T> {
@@ -221,12 +164,40 @@ impl Client {
     /// GETs an absolute `url` and returns the response after checking the
     /// status. The token is only ever sent to the API's own origin.
     pub(crate) fn get(&self, url: &str, auth: bool) -> Result<Response<ureq::Body>> {
-        let mut request = self.agent.get(url);
-        if auth && self.owns(url) {
-            let token = self.token.as_deref().unwrap_or_default();
-            request = request.header("Authorization", format!("Bearer {token}"));
+        self.call(auth && self.owns(url), |token| bearer(self.agent.get(url), token).call())
+    }
+
+    /// Sends a request through `send`, which gets the access token when
+    /// `auth` and the client is signed in, and checks the status.
+    fn call(&self, auth: bool, send: impl Fn(Option<&str>) -> Result<Response<ureq::Body>, ureq::Error>) -> Result<Response<ureq::Body>> {
+        self.call_with(auth, send, &|token| self.refresh(token))
+    }
+
+    /// [`Client::call`], refreshing tokens through `refresh`. A refused
+    /// token is refreshed and the request sent once more; a token refused
+    /// even then, or one missing a scope, is reported to the app.
+    pub(crate) fn call_with(
+        &self,
+        auth: bool,
+        send: impl Fn(Option<&str>) -> Result<Response<ureq::Body>, ureq::Error>,
+        refresh: &dyn Fn(&str) -> Result<Tokens>,
+    ) -> Result<Response<ureq::Body>> {
+        let Some(grant) = self.auth.as_deref().filter(|_| auth) else { return check_status(send(None)?) };
+        let token = grant.access_token(refresh)?;
+        let mut response = send(Some(&token))?;
+        if response.status() == 401 {
+            // Revoked or expired early: refresh once and try again.
+            let token = grant.replace(&token, refresh)?;
+            response = send(Some(&token))?;
+            if response.status() == 401 {
+                grant.expire();
+            }
         }
-        check_status(request.call()?)
+        let result = check_status(response);
+        if result.as_ref().is_err_and(|e| e.code() == Some("insufficient_scope")) {
+            grant.missing_scope();
+        }
+        result
     }
 
     /// `path` on the API's origin.
@@ -237,6 +208,20 @@ impl Client {
     /// Whether `url` is on the API's own origin, where the token may go.
     pub(crate) fn owns(&self, url: &str) -> bool {
         url.strip_prefix(&self.base).is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `request` with `token` as its bearer credential, if there is one.
+fn bearer<B>(request: ureq::RequestBuilder<B>, token: Option<&str>) -> ureq::RequestBuilder<B> {
+    match token {
+        Some(token) => request.header("Authorization", format!("Bearer {token}")),
+        None => request,
     }
 }
 
@@ -265,7 +250,8 @@ fn check_status(mut response: Response<ureq::Body>) -> Result<Response<ureq::Bod
 
 /// Extracts `(code, message)` from an error body. Accepts
 /// `{"error": {"code", "message"}}`, flat `{"error": "code", "message"}`,
-/// and the web routes' `{"error": "Message."}` and `{"detail": "Message."}`.
+/// OAuth's `{"error": "code", "error_description"}`, and the web routes'
+/// `{"error": "Message.", "code"}` and `{"detail": "Message."}`.
 pub(crate) fn parse_error_body(text: &str) -> (Option<String>, Option<String>) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return (None, None);
@@ -277,8 +263,12 @@ pub(crate) fn parse_error_body(text: &str) -> (Option<String>, Option<String>) {
         Some(s) if s.contains(' ') => (None, Some(s.to_owned())),
         bare => (bare.map(str::to_owned), None),
     };
-    let code = field(error, "code").or(code);
-    let message = field(error, "message").or_else(|| field(&value, "message")).or(sentence).or_else(|| field(&value, "detail"));
+    let code = field(error, "code").or_else(|| field(&value, "code")).or(code);
+    let message = field(error, "message")
+        .or_else(|| field(&value, "message"))
+        .or(sentence)
+        .or_else(|| field(&value, "error_description"))
+        .or_else(|| field(&value, "detail"));
     (code, message)
 }
 
@@ -317,5 +307,9 @@ mod tests {
         assert_eq!(parse_error_body(sentence), (None, Some("This generation has already started.".into())));
         let detail = r#"{"detail":"File too large. Maximum size is 25MB."}"#;
         assert_eq!(parse_error_body(detail), (None, Some("File too large. Maximum size is 25MB.".into())));
+        let oauth = r#"{"error":"invalid_grant","error_description":"Refresh token is invalid"}"#;
+        assert_eq!(parse_error_body(oauth), (Some("invalid_grant".into()), Some("Refresh token is invalid".into())));
+        let scope = r#"{"error":"This token was not granted the 'files' scope.","code":"insufficient_scope","scope":"files"}"#;
+        assert_eq!(parse_error_body(scope), (Some("insufficient_scope".into()), Some("This token was not granted the 'files' scope.".into())));
     }
 }

@@ -1,14 +1,15 @@
 //! Client library for [SereChat](https://serechat.com).
 //!
-//! * [`Client`]: device-code sign-in, model listing, streaming responses
-//!   with attachments and function tools, and image, video and audio
-//!   generation jobs.
+//! * [`Client`]: OAuth tokens (code exchange, refresh, revocation), model
+//!   listing, streaming responses with attachments and function tools, and
+//!   image, video and audio generation jobs.
 //! * [`Config`]: the user's settings in `~/.serechat/config.toml`.
 //! * [`SessionStore`]: saved conversations in `~/.serechat/sessions/`.
 //! * [`Projects`]: project folders in `~/.serechat/projects.json`.
 //!
 //! All network calls are blocking; run them off the UI thread.
 
+mod auth;
 mod client;
 mod config;
 mod error;
@@ -18,7 +19,8 @@ mod responses;
 mod session;
 mod sse;
 
-pub use client::{AccessToken, BASE_URL, Client, Model};
+pub use auth::{CLIENT_ID, GrantEvent, RESOURCE, SCOPES, Tokens};
+pub use client::{BASE_URL, Client, Model};
 pub use config::{Config, write_private};
 pub use error::{Error, Result};
 pub use media::{MAX_UPLOAD, MediaJob, MediaKind, MediaModel, MediaStatus, MediaTicket, SPARK_USD};

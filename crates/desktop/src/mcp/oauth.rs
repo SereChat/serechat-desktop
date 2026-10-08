@@ -565,7 +565,10 @@ fn query_params(target: &str) -> BTreeMap<String, String> {
 
 /// Waits for the browser to come back to `/callback` with the right
 /// `state`, answering it with a page saying how it went.
-fn receive_redirect(listener: &TcpListener, state: &str, cancel: &AtomicBool) -> Result<BTreeMap<String, String>, String> {
+///
+/// # Errors
+/// A message for the user: cancelled, timed out, or the listener failed.
+pub fn receive_redirect(listener: &TcpListener, state: &str, cancel: &AtomicBool) -> Result<BTreeMap<String, String>, String> {
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let deadline = Instant::now() + SIGN_IN_TIMEOUT;
     loop {
@@ -636,7 +639,8 @@ fn respond(stream: &mut TcpStream, status: &str, message: &str) {
 /// The randomness comes from std's `RandomState`, whose `SipHash` keys are
 /// seeded from the operating system's secure generator; hashing a counter
 /// under those keys gives unpredictable output without another dependency.
-fn random_string(len: usize) -> String {
+#[must_use]
+pub fn random_string(len: usize) -> String {
     use std::hash::{BuildHasher, Hasher};
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
     let mut out = String::with_capacity(len);

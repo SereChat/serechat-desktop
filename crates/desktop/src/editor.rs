@@ -14,19 +14,9 @@ pub struct Editor {
     cursor: usize,
     /// Other end of the selection; equal to `cursor` when nothing is selected.
     anchor: usize,
-    /// Maximum number of chars, if limited.
-    max_chars: Option<usize>,
-    /// Only chars passing this filter are inserted.
-    filter: Option<fn(char) -> bool>,
 }
 
 impl Editor {
-    /// An editor limited to `max_chars` chars that pass `filter`.
-    #[must_use]
-    pub fn restricted(max_chars: usize, filter: fn(char) -> bool) -> Self {
-        Self { max_chars: Some(max_chars), filter: Some(filter), ..Self::default() }
-    }
-
     /// Current contents.
     #[must_use]
     pub fn text(&self) -> &str {
@@ -58,17 +48,15 @@ impl Editor {
         std::mem::take(&mut self.text)
     }
 
-    /// Replaces the selection with `input`, honouring the filter and limit.
+    /// Replaces the selection with `input`. Line breaks become `\n`; other
+    /// control characters but tabs are dropped.
     pub fn insert(&mut self, input: &str) {
         self.delete_selection();
-        let budget = self.max_chars.map_or(usize::MAX, |max| max.saturating_sub(self.text.chars().count()));
-        let allowed = |c: char| self.filter.map_or(c == '\n' || c == '\t' || !c.is_control(), |f| f(c));
         let filtered: String = input
             .replace("\r\n", "\n")
             .chars()
             .map(|c| if c == '\r' { '\n' } else { c })
-            .filter(|&c| allowed(c))
-            .take(budget)
+            .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
             .collect();
         self.text.insert_str(self.cursor, &filtered);
         self.cursor += filtered.len();
@@ -282,15 +270,6 @@ mod tests {
         assert_eq!(e.selected_text(), "one");
         assert_eq!(e.take(), "one two\n3");
         assert_eq!(e.cursor(), 0);
-    }
-
-    #[test]
-    fn restricted_input() {
-        let mut e = Editor::restricted(6, |c| c.is_ascii_digit());
-        e.insert("12a3-45 678");
-        assert_eq!(e.text(), "123456");
-        e.insert("9");
-        assert_eq!(e.text(), "123456");
     }
 
     #[test]

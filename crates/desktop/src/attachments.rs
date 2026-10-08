@@ -377,7 +377,7 @@ mod tests {
         assert_eq!((extension("image/svg+xml"), extension("audio/x-wav"), extension("text/html")), ("svg", "wav", "bin"));
         let cancelled = AtomicBool::new(true);
         let store = std::env::temp_dir();
-        assert_eq!(fetch_generated(&Client::new(None), MediaKind::Image, "j", "p", &store, &cancelled), Ok(None), "a cancelled wait ends at once");
+        assert_eq!(fetch_generated(&Client::new(), MediaKind::Image, "j", "p", &store, &cancelled), Ok(None), "a cancelled wait ends at once");
     }
 
     #[test]

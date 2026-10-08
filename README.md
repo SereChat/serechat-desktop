@@ -105,7 +105,7 @@ cargo clippy --workspace --all-targets
 
 | Crate             | Purpose                                                                          |
 |-------------------|----------------------------------------------------------------------------------|
-| `crates/serechat` | API client: sign-in, models, streaming Responses API with attachments and tools, image/video/audio generation jobs, config, sessions, projects |
+| `crates/serechat` | API client: OAuth tokens (exchange, refresh, revoke), models, streaming Responses API with attachments and tools, image/video/audio generation jobs, config, sessions, projects |
 | `crates/desktop`  | The app: winit window, wgpu renderer, text engine, immediate-mode UI, agent tools |
 
 `crates/desktop/src`:
@@ -131,7 +131,8 @@ cargo clippy --workspace --all-targets
   the connections and offers their tools.
 - `update.rs`: checks GitHub releases and swaps in new versions; `sha256.rs` for PKCE and
   checking downloads.
-- `spotlight.rs`, `settings.rs`, `login.rs`: the other surfaces.
+- `spotlight.rs`, `settings.rs`, `login.rs`: the other surfaces (`login.rs` also runs the
+  browser sign-in). `keychain.rs` keeps the refresh token in the OS credential store.
 - `process.rs`: background processes the agent starts, reads and stops.
 - `browser.rs`, `browser.js`, `websocket.rs`: the agent's browser, driven over the
   DevTools protocol through a minimal WebSocket client; `browser.js` outlines a page.
@@ -157,11 +158,15 @@ a `v*` tag attaches release builds to a GitHub release: `serechat.exe` (icon emb
 
 ## Sign-in and storage
 
-The first time the app starts, it runs SereChat's device-code flow. The browser opens the
-approval page, and the user types the 6-digit code into the app. Everything lives in
-`~/.serechat/`:
+The first time the app starts, it signs in with OAuth 2.1: the browser opens SereChat's consent
+page, and its answer comes back to the app on `127.0.0.1` (authorization code with PKCE). The
+app asks for the `chat`, `media` and `files` scopes. Access tokens last an hour and are refreshed
+as needed; the refresh token, which changes on every refresh, is kept in the OS keychain
+(Credential Manager on Windows, the login keychain on macOS, the Secret Service through
+`secret-tool` on Linux, or `~/.serechat/serechat-desktop.token` with mode `0600` where there is
+none). Everything else lives in `~/.serechat/`:
 
-- `config.toml`: token, model, reasoning effort and display, colour scheme, current project, and
+- `config.toml`: model, reasoning effort and display, colour scheme, current project, and
   the image, video and audio models.
 - `sessions/<id>.json`: one file per conversation, with each reply's tokens and cost at the
   prices of the time, attachments and tool calls. `.index.json` next to them holds titles and
@@ -176,8 +181,9 @@ approval page, and the user types the 6-digit code into the app. Everything live
   window regains focus.
 - `mcp-auth.json`: MCP sign-in tokens, and the OAuth clients registered per authorization server.
 
-On Unix these files have mode `0600`, and they are written atomically. Signing out (or a `401`
-from the API) removes the token but keeps sessions.
+On Unix these files have mode `0600`, and they are written atomically. Signing out revokes the
+grant and removes the refresh token but keeps sessions; a grant that is revoked, unused for 60
+days or missing a scope the app needs sends the user back to sign in.
 
 ## Known limits (deliberate, for now)
 

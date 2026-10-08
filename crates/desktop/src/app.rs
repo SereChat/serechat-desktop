@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use serechat::{
-    AccessToken, Attachment, Client, Config, Error, MediaKind, MediaModel, MediaTicket, Model, Projects, ResponseRequest, SearchHit,
-    Session, SessionStore, SessionSummary, StreamEvent, ToolCall, ToolSpec,
+    Attachment, Client, Config, Error, GrantEvent, MediaKind, MediaModel, MediaTicket, Model, Projects, ResponseRequest, SearchHit,
+    Session, SessionStore, SessionSummary, StreamEvent, ToolCall, ToolSpec, Tokens,
 };
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -26,7 +26,7 @@ use crate::chat::{self, Chat, MediaRequest, Reasoning, ReasoningView, SendJob, T
 use crate::diff::{self, Diff};
 use crate::gpu::{GpuError, Instance, Renderer};
 use crate::image::{self, ImageAtlas, ImageKey};
-use crate::login::Login;
+use crate::login::{Flow, Login};
 use crate::mcp::{self, ServerConfig};
 use crate::paint::{Painter, Rect};
 use crate::text::{Fonts, GlyphAtlas};
@@ -34,20 +34,22 @@ use crate::theme::{Palette, Scheme};
 use crate::a11y::Access;
 use crate::ui::{Ui, copy, paste};
 use crate::update::{self, Updater};
-use crate::{attachments, platform, skills, tools};
+use crate::{attachments, keychain, platform, skills, tools};
 
 /// Length of the cross-fade when the colour scheme changes.
 const THEME_FADE_SECS: f32 = 0.25;
 
-/// Name shown on the SereChat approval page.
-const APP_NAME: &str = "SereChat Desktop";
-
 /// Results delivered from worker threads.
 pub enum WorkerEvent {
-    /// Step 1 of sign-in finished.
-    AuthRequested(Result<String, Error>),
-    /// Step 2 of sign-in finished.
-    AuthExchanged(Result<AccessToken, Error>),
+    /// A sign-in in the browser ended.
+    SignedIn {
+        /// Which sign-in.
+        flow: u64,
+        /// The tokens, or why there are none.
+        result: Result<Tokens, String>,
+    },
+    /// News about grant number `.0` (see `App::grant`).
+    Grant(u64, GrantEvent),
     /// The model list arrived.
     Models(Result<Vec<Model>, Error>),
     /// A session's messages were read from disk.
@@ -193,17 +195,10 @@ pub enum McpAction {
 
 /// Something a screen wants done that needs app-level resources.
 pub enum Action {
-    /// Begin the device-code flow.
+    /// Sign in through the browser.
     StartLogin,
-    /// Open the approval page for a request id.
+    /// Open the consent page at this URL again.
     OpenAuthPage(String),
-    /// Exchange a code for a token.
-    VerifyCode {
-        /// Request being approved.
-        request_id: String,
-        /// Six-digit code typed by the user.
-        code: String,
-    },
     /// Stream a reply.
     Send(SendJob),
     /// Run a tool call.
@@ -350,6 +345,9 @@ pub struct App {
     last_frame: Instant,
     config: Config,
     client: Client,
+    /// Numbers grants as the user signs in, so news about an earlier one is
+    /// ignored.
+    grant: u64,
     /// Where sessions are saved; `None` when there is no home directory.
     sessions_dir: Option<PathBuf>,
     /// Performs every file write, in order, off the UI thread.
@@ -388,6 +386,8 @@ impl App {
     /// # Errors
     /// See [`StartupError`].
     pub fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<WorkerEvent>) -> Result<Self, StartupError> {
+        // Read while the window and GPU start: the keychain may take a moment.
+        let saved = std::thread::Builder::new().name("serechat-keychain".into()).spawn(keychain::load);
         let config = Config::load().unwrap_or_else(|e| {
             eprintln!("serechat: ignoring unreadable config: {e}");
             Config::default()
@@ -418,7 +418,7 @@ impl App {
         window.set_ime_allowed(true);
         let renderer = block_on(Renderer::new(Arc::clone(&window), event_loop.owned_display_handle())).map_err(StartupError::Gpu)?;
 
-        let client = Client::new(config.token.clone());
+        let client = Client::new();
         let sessions_dir = SessionStore::open()
             .inspect_err(|e| eprintln!("serechat: sessions will not be saved: {e}"))
             .ok()
@@ -444,7 +444,7 @@ impl App {
         crate::browser::set_choice(config.browser.clone());
         let auto_update = config.auto_update.as_deref() != Some("off");
         let update_proxy = proxy.clone();
-        let updater = Updater::start(Client::new(None), auto_update, move |status| {
+        let updater = Updater::start(Client::new(), auto_update, move |status| {
             let _ = update_proxy.send_event(WorkerEvent::Update(status));
         });
         let now = Instant::now();
@@ -463,6 +463,7 @@ impl App {
             screen: Screen::Login(Login::new(None)),
             config,
             client,
+            grant: 0,
             writer: Writer::start(sessions_dir.clone()),
             sessions_dir,
             projects,
@@ -480,7 +481,12 @@ impl App {
             access,
         };
         app.ui.focused = true;
-        if app.config.token.is_some() {
+        let saved = match saved {
+            Ok(thread) => thread.join().ok().flatten(),
+            Err(_) => keychain::load(),
+        };
+        if let Some(refresh_token) = saved {
+            app.use_grant(Tokens::stored(refresh_token));
             app.enter_chat();
         }
         // Draw the first frame directly: hidden windows never receive
@@ -524,13 +530,28 @@ impl App {
         self.save_config();
     }
 
+    /// Sends `tokens` with every request from now on. Their rotations are
+    /// stored in the keychain, and their end returns to sign-in.
+    fn use_grant(&mut self, tokens: Tokens) {
+        self.grant += 1;
+        let grant = self.grant;
+        let proxy = std::sync::Mutex::new(self.proxy.clone());
+        self.client = self.client.signed_in(tokens, keychain::load, move |event| {
+            // Fails only if the event loop is gone, i.e. the app is exiting.
+            let _ = proxy.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send_event(WorkerEvent::Grant(grant, event));
+        });
+    }
+
     fn sign_out(&mut self, reason: Option<String>) {
         if let Screen::Chat(chat) = &mut self.screen {
             chat.cancel_all();
         }
-        self.config.token = None;
-        self.save_config();
-        self.client = Client::new(None);
+        // News about the old grant is ignored from here on.
+        self.grant += 1;
+        self.writer.send(Job::Keychain(None));
+        let client = std::mem::take(&mut self.client);
+        // Revoking the grant reaches the network, so off the UI thread.
+        std::mem::drop(std::thread::Builder::new().name("serechat-sign-out".into()).spawn(move || client.sign_out()));
         self.screen = Screen::Login(Login::new(reason));
     }
 
@@ -613,7 +634,7 @@ impl App {
             }
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if event.state == ElementState::Pressed => {
                 match &mut self.screen {
-                    Screen::Login(login) => login.key(&event, self.ui.mods, &mut self.clipboard, &mut actions),
+                    Screen::Login(login) => login.key(&event, &mut actions),
                     Screen::Chat(chat) => chat.key(&event, self.ui.mods, &mut self.clipboard, &mut actions),
                 }
                 self.ui.last_edit = self.ui.time;
@@ -621,7 +642,6 @@ impl App {
             WindowEvent::Ime(ime) => {
                 match (ime, &mut self.screen) {
                     (Ime::Commit(text), Screen::Chat(chat)) => chat.ime_commit(&text),
-                    (Ime::Commit(text), Screen::Login(login)) => login.commit(&text, &mut actions),
                     (Ime::Preedit(text, cursor), Screen::Chat(chat)) => chat.ime_preedit(text, cursor),
                     (Ime::Disabled, Screen::Chat(chat)) => chat.ime_preedit(String::new(), None),
                     _ => return,
@@ -682,33 +702,30 @@ impl App {
                     chat.set_update(self.update_status.clone(), auto);
                 }
             }
-            (WorkerEvent::AuthRequested(result), Screen::Login(login)) => {
-                if let Some(request_id) = login.requested(result) {
-                    self.open_auth_page(&request_id);
-                }
-            }
-            (WorkerEvent::AuthExchanged(result), Screen::Login(login)) => {
-                if let Some(token) = login.exchanged(result) {
-                    self.client = self.client.with_token(token.access_token.clone());
-                    self.config.token = Some(token.access_token);
-                    self.save_config();
+            (WorkerEvent::SignedIn { flow, result }, Screen::Login(login)) => {
+                if let Some(tokens) = login.finished(flow, result) {
+                    self.writer.send(Job::Keychain(Some(tokens.refresh_token.clone())));
+                    self.use_grant(tokens);
                     self.enter_chat();
                 }
             }
+            (WorkerEvent::Grant(grant, event), _) if grant == self.grant => match event {
+                GrantEvent::Rotated(refresh_token) => {
+                    self.writer.send(Job::Keychain(Some(refresh_token)));
+                    return;
+                }
+                GrantEvent::Expired => self.sign_out(Some("Your sign-in has expired. Please sign in again.".into())),
+                GrantEvent::MissingScope => {
+                    self.sign_out(Some("SereChat Desktop needs permissions you haven't granted yet. Sign in again to allow them.".into()));
+                }
+            },
             (WorkerEvent::Models(Ok(models)), Screen::Chat(chat)) => chat.set_models(models),
             (WorkerEvent::Models(Err(e)), _) => eprintln!("serechat: could not load models: {e}"),
             (WorkerEvent::SessionLoaded { conversation, result }, Screen::Chat(chat)) => chat.session_loaded(conversation, result, &mut actions),
             (WorkerEvent::Stream { conversation, stream, event }, Screen::Chat(chat)) => {
                 chat.stream_event(conversation, stream, event);
             }
-            (WorkerEvent::StreamEnded { conversation, stream, result }, Screen::Chat(chat)) => {
-                if chat.stream_end(conversation, stream, result, &mut actions) {
-                    self.apply(actions);
-                    self.sign_out(Some("Your session has expired. Please sign in again.".into()));
-                    self.window.request_redraw();
-                    return;
-                }
-            }
+            (WorkerEvent::StreamEnded { conversation, stream, result }, Screen::Chat(chat)) => chat.stream_end(conversation, stream, result, &mut actions),
             (WorkerEvent::ToolDone { conversation, call_id, result, image }, Screen::Chat(chat)) => {
                 chat.tool_done(conversation, &call_id, result, image, &mut actions);
             }
@@ -748,13 +765,8 @@ impl App {
 
     fn run(&mut self, action: Action) {
         match action {
-            Action::StartLogin => {
-                self.spawn(|client, _| WorkerEvent::AuthRequested(client.request_authorization(APP_NAME)));
-            }
-            Action::OpenAuthPage(request_id) => self.open_auth_page(&request_id),
-            Action::VerifyCode { request_id, code } => {
-                self.spawn(move |client, _| WorkerEvent::AuthExchanged(client.exchange_code(&request_id, &code)));
-            }
+            Action::StartLogin => self.start_login(),
+            Action::OpenAuthPage(url) => self.open_auth_page(&url),
             Action::Send(job) => self.spawn(move |client, proxy| {
                 let (conversation, stream) = (job.conversation, job.stream);
                 let result = match chat::input_items(&job.history) {
@@ -1075,11 +1087,23 @@ impl App {
         }
     }
 
-    fn open_auth_page(&mut self, request_id: &str) {
-        let url = self.client.authorize_url(request_id);
-        if let Err(e) = platform::open_url(&url) {
+    /// Opens SereChat's consent page and waits, on a worker, for the
+    /// browser to come back with a code.
+    fn start_login(&mut self) {
+        let Screen::Login(login) = &mut self.screen else { return };
+        let flow = match Flow::new() {
+            Ok(flow) => flow,
+            Err(e) => return login.fail(format!("Sign-in could not start: {e}")),
+        };
+        let (id, cancel) = login.waiting(flow.url.clone());
+        self.open_auth_page(&flow.url);
+        self.spawn(move |client, _| WorkerEvent::SignedIn { flow: id, result: flow.finish(client, &cancel) });
+    }
+
+    fn open_auth_page(&mut self, url: &str) {
+        if let Err(e) = platform::open_url(url) {
             eprintln!("serechat: cannot open browser: {e}");
-            copy(&mut self.clipboard, &url);
+            copy(&mut self.clipboard, url);
             if let Screen::Login(login) = &mut self.screen {
                 login.browser_failed();
             }
@@ -1222,6 +1246,8 @@ enum Job {
     ListSessions(mpsc::Sender<Vec<SessionSummary>>),
     /// Write a file readable only by the user (`mcp.json`, `mcp-auth.json`).
     WritePrivate(PathBuf, String),
+    /// Store the sign-in's refresh token in the keychain, or (`None`) remove it.
+    Keychain(Option<String>),
     /// Open a file in its default app, once the writes before it are done.
     Open(PathBuf),
     /// Read `mcp.json` (after the writes before it) and post it back.
@@ -1238,6 +1264,8 @@ impl Job {
             (Self::SaveConfig(config), _) => config.save().map_err(|e| ("save the config", e)),
             (Self::SaveProjects(projects), _) => projects.save().map_err(|e| ("save the projects", e)),
             (Self::WritePrivate(path, text), _) => serechat::write_private(&path, text.as_bytes()).map_err(|e| ("save MCP settings", e)),
+            (Self::Keychain(Some(token)), _) => keychain::save(&token).map_err(|e| ("store the sign-in", Error::Io(e))),
+            (Self::Keychain(None), _) => keychain::delete().map_err(|e| ("forget the sign-in", Error::Io(e))),
             (Self::Open(path), _) => platform::open_folder(&path).map_err(|e| ("open the file", Error::Io(e))),
             (Self::ReloadMcp(proxy), _) => {
                 let _ = proxy.send_event(WorkerEvent::McpConfig(read_mcp_config()));

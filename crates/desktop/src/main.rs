@@ -21,6 +21,7 @@ mod font;
 mod gpu;
 mod highlight;
 mod image;
+mod keychain;
 mod login;
 mod markdown;
 mod mcp;

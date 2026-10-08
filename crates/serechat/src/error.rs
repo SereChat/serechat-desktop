@@ -47,13 +47,6 @@ pub enum Error {
 }
 
 impl Error {
-    /// Returns `true` when the server rejected our credentials, meaning the
-    /// user has to sign in again.
-    #[must_use]
-    pub fn is_unauthorized(&self) -> bool {
-        matches!(self, Self::Api { status: 401, .. })
-    }
-
     /// The machine-readable API error code, if any.
     #[must_use]
     pub fn code(&self) -> Option<&str> {
