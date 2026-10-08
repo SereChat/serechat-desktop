@@ -101,6 +101,8 @@ cargo clippy --workspace --all-targets
 - **Screen readers** (Windows and macOS): the window describes itself through AccessKit:
   messages, buttons, menus, fields and switches, with the focused field and clicks from the
   screen reader. Nothing is collected while no screen reader is running.
+- **Zoom** (Ctrl/Cmd + and -, Ctrl/Cmd+0 resets): everything grows or shrinks, from 50% to 200%,
+  in steps of 10%; kept for the next start.
 - **Emoji and CJK**: colour emoji (Twemoji), and Chinese, Japanese and Korean text through the
   operating system's fonts, with input-method (IME) support for typing them.
 - **Settings**, in tabs: General (Dark, One Dark and Light schemes, reasoning display, the agent's browser), Skills,
@@ -173,7 +175,7 @@ as needed; the refresh token, which changes on every refresh, is kept in the OS 
 none). Everything else lives in `~/.serechat/`:
 
 - `config.toml`: model, reasoning effort and display, colour scheme, current project, and
-  the image, video and audio models, and the window's size and whether it was maximized.
+  the image, video and audio models, the window's size and whether it was maximized, and the zoom.
 - `sessions/<id>.json`: one file per conversation, with each reply's tokens and cost at the
   prices of the time, attachments and tool calls (with each file the agent changed as it was
   before, to revert the change). `.index.json` next to them holds titles and

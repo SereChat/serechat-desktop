@@ -47,6 +47,9 @@ pub struct Config {
     /// The window as last closed, e.g. `1200x800` or `1200x800 maximized`
     /// (logical pixels), interpreted by the app.
     pub window: Option<String>,
+    /// How far the interface is zoomed, in percent (e.g. `120`),
+    /// interpreted by the app; absent means 100.
+    pub zoom: Option<String>,
 }
 
 impl Config {
@@ -135,6 +138,7 @@ impl Config {
                 "auto_update" => config.auto_update = Some(value),
                 "browser" => config.browser = Some(value),
                 "window" => config.window = Some(value),
+                "zoom" => config.zoom = Some(value),
                 _ => {}
             }
         }
@@ -157,6 +161,7 @@ impl Config {
             ("auto_update", &self.auto_update),
             ("browser", &self.browser),
             ("window", &self.window),
+            ("zoom", &self.zoom),
         ];
         for (key, value) in fields {
             if let Some(value) = value {
@@ -300,6 +305,7 @@ mod tests {
             auto_update: Some("off".into()),
             browser: Some("brave".into()),
             window: Some("1200x800 maximized".into()),
+            zoom: Some("120".into()),
         };
         assert_eq!(Config::parse(&config.serialize()).unwrap(), config);
     }

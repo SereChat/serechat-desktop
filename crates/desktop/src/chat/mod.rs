@@ -254,8 +254,9 @@ struct StreamingCall {
     name: String,
     /// The JSON arguments so far.
     arguments: String,
-    /// How the card reads, laid out for this many bytes of arguments.
-    shown: Option<(usize, tools::CallView, Option<TextLayout>)>,
+    /// How the card reads, laid out for this many bytes of arguments and
+    /// this scale.
+    shown: Option<((usize, u32), tools::CallView, Option<TextLayout>)>,
 }
 
 impl Entry {
@@ -288,9 +289,9 @@ impl Entry {
     }
 }
 
-/// A tool card body layout with the (text length, status, width) it shows,
-/// and how far it is scrolled when taller than the card.
-type ToolBody = Option<((usize, ToolStatus, u32), TextLayout, f32)>;
+/// A tool card body layout with the (text length, status, width, scale) it
+/// shows, and how far it is scrolled when taller than the card.
+type ToolBody = Option<((usize, ToolStatus, u32, u32), TextLayout, f32)>;
 
 /// Whether a conversation's messages are in memory.
 #[derive(Clone, Debug, PartialEq)]

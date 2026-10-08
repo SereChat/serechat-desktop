@@ -314,7 +314,7 @@ impl Entry {
         let slot = &mut self.tool_bodies[index];
         let mut height = TOOL_ROW + screenshot.map_or(0.0, |(_, h)| h + 12.0);
         if let Some(body) = body {
-            let key = (body.len(), status, (width - 24.0).to_bits());
+            let key = (body.len(), status, (width - 24.0).to_bits(), p.scale.to_bits());
             if slot.as_ref().is_none_or(|(k, ..)| *k != key) {
                 let scroll = slot.as_ref().map_or(0.0, |(.., s)| *s);
                 *slot = Some((key, TextLayout::new(p.fonts, &body, TOOL_STYLE, Some(width - 24.0), p.scale), scroll));
@@ -334,14 +334,15 @@ impl StreamingCall {
     /// Refreshes the card for the arguments so far and returns its height.
     /// The body shows the end of what is being written.
     fn measure(&mut self, p: &Painter, width: f32) -> f32 {
-        if self.shown.as_ref().is_none_or(|(len, ..)| *len != self.arguments.len()) {
+        let key = (self.arguments.len(), p.scale.to_bits());
+        if self.shown.as_ref().is_none_or(|(k, ..)| *k != key) {
             let view = tools::view_partial(&self.name, &self.arguments);
             let body = view.preview.as_deref().filter(|text| !text.is_empty()).map(|text| {
                 let lines: Vec<&str> = text.lines().collect();
                 let tail = lines[lines.len().saturating_sub(STREAM_LINES)..].join("\n");
                 TextLayout::new(p.fonts, &tail, TOOL_STYLE, Some(width - 24.0), p.scale)
             });
-            self.shown = Some((self.arguments.len(), view, body));
+            self.shown = Some((key, view, body));
         }
         let body = self.shown.as_ref().and_then(|(_, _, body)| body.as_ref());
         TOOL_ROW + body.map_or(0.0, |b| b.height().min(TOOL_BODY_MAX) + 14.0)

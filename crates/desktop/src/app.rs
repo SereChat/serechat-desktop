@@ -20,6 +20,7 @@ use serechat::{
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
+use winit::keyboard::Key;
 use winit::window::{CursorIcon, Theme, UserAttentionType, Window};
 
 use crate::chat::{self, Chat, MediaRequest, Reasoning, ReasoningView, SendJob, ToolJob};
@@ -42,6 +43,10 @@ const THEME_FADE_SECS: f32 = 0.25;
 const WINDOW_SIZE: (u32, u32) = (1200, 800);
 /// Smallest window size, in logical pixels.
 const MIN_WINDOW_SIZE: (u32, u32) = (760, 520);
+/// Interface zoom limits, in percent.
+const ZOOM: (u16, u16) = (50, 200);
+/// How far one press of Ctrl/Cmd + or - zooms, in percent.
+const ZOOM_STEP: u16 = 10;
 
 /// Results delivered from worker threads.
 pub enum WorkerEvent {
@@ -395,6 +400,8 @@ pub struct App {
     cursor: CursorIcon,
     /// Input-method candidate area last sent to the window.
     ime_area: Option<Rect>,
+    /// Interface zoom in percent, on top of the display's scale.
+    zoom: u16,
     /// The MCP servers as configured in `mcp.json`.
     mcp_servers: Vec<ServerConfig>,
     /// The latest MCP message for settings: text and whether it is an error.
@@ -422,6 +429,7 @@ impl App {
             Config::default()
         });
         let scheme = Scheme::from_key(config.theme.as_deref());
+        let zoom = config.zoom.as_deref().and_then(|z| z.parse().ok()).map_or(100, |z: u16| z.clamp(ZOOM.0, ZOOM.1));
         let ((width, height), maximized) = window_state(config.window.as_deref());
         let attributes = Window::default_attributes()
             .with_title("SereChat")
@@ -506,6 +514,7 @@ impl App {
             shown: false,
             cursor: CursorIcon::Default,
             ime_area: None,
+            zoom,
             mcp_servers,
             mcp_note,
             updater,
@@ -589,6 +598,11 @@ impl App {
         self.screen = Screen::Login(Login::new(reason));
     }
 
+    /// Physical pixels per logical pixel: the display's scale, zoomed.
+    fn scale(&self) -> f32 {
+        self.window.scale_factor() as f32 * f32::from(self.zoom) / 100.0
+    }
+
     fn save_config(&mut self) {
         self.writer.send(Job::SaveConfig(self.config.clone()));
     }
@@ -622,7 +636,7 @@ impl App {
     /// Routes a window event.
     pub fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         self.access.window_event(&self.window, &event);
-        let scale = self.window.scale_factor() as f32;
+        let scale = self.scale();
         let mut actions = Vec::new();
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -667,6 +681,18 @@ impl App {
                 self.ui.scroll_x -= dx;
             }
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if event.state == ElementState::Pressed => {
+                let primary = if cfg!(target_os = "macos") { self.ui.mods.super_key() } else { self.ui.mods.control_key() };
+                if primary && let Some(zoom) = zoomed(self.zoom, &event.logical_key) {
+                    if zoom != self.zoom {
+                        self.zoom = zoom;
+                        // Resent next frame at the new zoom.
+                        self.ime_area = None;
+                        self.config.zoom = (zoom != 100).then(|| zoom.to_string());
+                        self.save_config();
+                    }
+                    self.window.request_redraw();
+                    return;
+                }
                 match &mut self.screen {
                     Screen::Login(login) => login.key(&event, &mut actions),
                     Screen::Chat(chat) => chat.key(&event, self.ui.mods, &mut self.clipboard, &mut actions),
@@ -1184,7 +1210,7 @@ impl App {
             }
         };
 
-        let scale = self.window.scale_factor() as f32;
+        let scale = self.scale();
         let size = self.window.inner_size();
         let view = Rect::new(0.0, 0.0, size.width as f32 / scale, size.height as f32 / scale);
         let mut actions = Vec::new();
@@ -1236,7 +1262,8 @@ impl App {
         if area != self.ime_area {
             self.ime_area = area;
             if let Some(r) = area {
-                self.window.set_ime_cursor_area(LogicalPosition::new(r.x, r.y), LogicalSize::new(r.w, r.h));
+                let z = f32::from(self.zoom) / 100.0;
+                self.window.set_ime_cursor_area(LogicalPosition::new(r.x * z, r.y * z), LogicalSize::new(r.w * z, r.h * z));
             }
         }
         let busy = matches!(&self.screen, Screen::Chat(chat) if chat.is_busy());
@@ -1426,6 +1453,20 @@ impl Drop for App {
     }
 }
 
+/// The zoom after the primary modifier plus `key`, or `None` if it is not
+/// a zoom key: `+` (or `=`, unshifted on many layouts) in, `-` out, `0` back
+/// to 100%.
+fn zoomed(zoom: u16, key: &Key) -> Option<u16> {
+    let Key::Character(c) = key else { return None };
+    let zoom = match c.as_str() {
+        "+" | "=" => zoom.saturating_add(ZOOM_STEP),
+        "-" => zoom.saturating_sub(ZOOM_STEP),
+        "0" => 100,
+        _ => return None,
+    };
+    Some(zoom.clamp(ZOOM.0, ZOOM.1))
+}
+
 /// Logical size and maximized state of the window from the config's
 /// `window` (`1200x800`, `1200x800 maximized`); the first-start size when
 /// absent or unreadable.
@@ -1512,6 +1553,19 @@ fn block_on<F: Future>(future: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_keys_step_and_clamp() {
+        let key = |c: &str| Key::Character(c.into());
+        assert_eq!(zoomed(100, &key("=")), Some(110));
+        assert_eq!(zoomed(100, &key("+")), Some(110));
+        assert_eq!(zoomed(100, &key("-")), Some(90));
+        assert_eq!(zoomed(150, &key("0")), Some(100));
+        assert_eq!(zoomed(ZOOM.1, &key("+")), Some(ZOOM.1), "clamped");
+        assert_eq!(zoomed(ZOOM.0, &key("-")), Some(ZOOM.0), "clamped");
+        assert_eq!(zoomed(100, &key("k")), None);
+        assert_eq!(zoomed(100, &Key::Named(winit::keyboard::NamedKey::Enter)), None);
+    }
 
     #[test]
     fn window_state_survives_odd_input() {
