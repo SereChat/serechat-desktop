@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 use arboard::Clipboard;
 use accesskit::Role;
+use serechat::Balance;
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::CursorIcon;
@@ -196,6 +197,7 @@ impl SettingsView {
         scheme: Scheme,
         reasoning: ReasoningView,
         totals: Totals,
+        balance: Option<&Result<Balance, String>>,
         actions: &mut Vec<Action>,
     ) {
         let t = p.theme;
@@ -256,6 +258,24 @@ impl SettingsView {
             Tab::Skills => y = self.draw_skills(p, x, y, width),
             Tab::Mcp => y = self.draw_mcp(p, ui, x, y, width, actions),
             Tab::Usage => {
+                let note = match balance {
+                    Some(Err(error)) => format!("It could not be loaded: {error}"),
+                    _ => "What your SereChat account has left to spend.".to_owned(),
+                };
+                ui.describe(|| Node::new(Role::Label, Rect::new(x, y + 24.0, width, 20.0), &note));
+                y = section(p, x, y, "Balance", &note);
+                let (sparks, allowance) = match balance {
+                    Some(Ok(balance)) => {
+                        let of = if balance.usage_max > 0.0 { format!(" of {}", format_cost(balance.usage_max)) } else { String::new() };
+                        (group_digits(balance.sparks.max(0.0) as u64), (format!("Model allowance left{of}"), format_cost(balance.usage)))
+                    }
+                    Some(Err(_)) => ("—".to_owned(), ("Model allowance left".to_owned(), "—".to_owned())),
+                    None => ("…".to_owned(), ("Model allowance left".to_owned(), "…".to_owned())),
+                };
+                stat(p, ui, Rect::new(x, y, card_w, 84.0), "Sparks", &sparks);
+                stat(p, ui, Rect::new(x + card_w + 12.0, y, card_w, 84.0), &allowance.0, &allowance.1);
+                y += 84.0 + SECTION_GAP;
+
                 y = section(p, x, y, "Usage", "Totals across every session saved on this device.");
                 let stats = [
                     ("Total spent", format_cost(totals.cost)),
@@ -263,10 +283,7 @@ impl SettingsView {
                     ("Sessions", group_digits(totals.sessions as u64)),
                 ];
                 for (i, (label, value)) in stats.iter().enumerate() {
-                    let stat = Rect::new(x + i as f32 * (card_w + 12.0), y, card_w, 84.0);
-                    p.bordered(stat, t.surface, theme::RADIUS, 1.0, t.border);
-                    p.label(label, theme::CAPTION, stat.x + 16.0, stat.y + 16.0, t.text_faint);
-                    p.label(value, Style::semibold(24.0), stat.x + 16.0, stat.y + 38.0, t.text);
+                    stat(p, ui, Rect::new(x + i as f32 * (card_w + 12.0), y, card_w, 84.0), label, value);
                 }
                 y += 84.0;
             }
@@ -713,6 +730,15 @@ fn section(p: &mut Painter, x: f32, y: f32, title: &str, description: &str) -> f
     p.label(title, Style::semibold(15.0), x, y, t.text);
     p.label(description, theme::SMALL, x, y + 24.0, t.text_muted);
     y + 58.0
+}
+
+/// A card with a caption over a large value.
+fn stat(p: &mut Painter, ui: &mut Ui, rect: Rect, label: &str, value: &str) {
+    let t = p.theme;
+    p.bordered(rect, t.surface, theme::RADIUS, 1.0, t.border);
+    p.label(label, theme::CAPTION, rect.x + 16.0, rect.y + 16.0, t.text_faint);
+    p.label(value, Style::semibold(24.0), rect.x + 16.0, rect.y + 38.0, t.text);
+    ui.describe(|| Node::new(Role::Label, rect, &format!("{label}: {value}")));
 }
 
 /// A bordered group holding one row; returns the row's rect.

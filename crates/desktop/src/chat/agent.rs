@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serechat::{
-    Attachment, Completion, Error, InputItem, Part, Role, StoredMessage, StreamEvent, ToolCall, ToolRecord, ToolStatus, Usage, data_url, unix_now,
+    Attachment, Backup, Completion, Error, InputItem, Part, Role, StoredMessage, StreamEvent, ToolCall, ToolRecord, ToolStatus, Usage, data_url, unix_now,
 };
 
 use super::composer::Command;
@@ -419,7 +419,7 @@ impl Chat {
                 message.cost = self.models.iter().find(|m| m.id == stream.model).map_or(0.0, |m| m.cost(usage)) + std::mem::take(carried_cost);
                 message.model = Some(stream.model.clone());
                 message.usage = usage;
-                message.tool_calls = tool_calls.into_iter().map(|call| ToolRecord { call, status: ToolStatus::Pending, output: String::new(), image: None }).collect();
+                message.tool_calls = tool_calls.into_iter().map(|call| ToolRecord { call, status: ToolStatus::Pending, output: String::new(), image: None, backup: None }).collect();
                 entry.streaming_calls.clear();
                 stream.incomplete = incomplete;
             }
@@ -636,9 +636,17 @@ impl Chat {
         self.request_reply(id, actions);
     }
 
-    /// Stores a finished tool call's result (and the image it returned, if
-    /// any) and moves the agent on.
-    pub fn tool_done(&mut self, conversation: u64, call_id: &str, result: Result<String, String>, image: Option<Attachment>, actions: &mut Vec<Action>) {
+    /// Stores a finished tool call's result (and the image it returned, or
+    /// the file it changed, if any) and moves the agent on.
+    pub fn tool_done(
+        &mut self,
+        conversation: u64,
+        call_id: &str,
+        result: Result<String, String>,
+        image: Option<Attachment>,
+        backup: Option<Backup>,
+        actions: &mut Vec<Action>,
+    ) {
         let Some(target) = self.find(conversation) else { return };
         let Some(record) = target
             .entries
@@ -654,6 +662,7 @@ impl Chat {
             Err(error) => (ToolStatus::Failed, error),
         };
         record.image = image;
+        record.backup = backup;
         let call = record.call.clone();
         let project = target.project.clone();
         actions.push(Action::SaveSession(target.to_session()));
@@ -663,15 +672,18 @@ impl Chat {
         self.attention_if_waiting(conversation, actions);
     }
 
-    /// Answers an approval prompt for tool call `index` of entry `entry`.
+    /// Answers an approval prompt for tool call `index` of entry `entry`,
+    /// or reverts its change.
     pub(super) fn decide(&mut self, entry: usize, index: usize, decision: Decision, actions: &mut Vec<Action>) {
         let id = self.current;
         let conversation = self.current();
         let Some(record) = conversation.entries.get_mut(entry).and_then(|e| e.message.tool_calls.get_mut(index)) else { return };
-        if record.status != ToolStatus::Pending {
-            return;
-        }
         match decision {
+            Decision::Revert => {
+                self.revert(&[(entry, index)], actions);
+                return;
+            }
+            _ if record.status != ToolStatus::Pending => return,
             Decision::Deny => {
                 record.status = ToolStatus::Denied;
                 "The user declined this tool call.".clone_into(&mut record.output);
@@ -698,6 +710,76 @@ impl Chat {
         }
         actions.push(Action::SaveSession(self.current().to_session()));
         self.advance(id, actions);
+    }
+
+    /// Reverts the newest `count` file changes of the open conversation that
+    /// can still be reverted, newest first (`/undo`, `/undo 3`).
+    pub(super) fn undo(&mut self, count: usize, actions: &mut Vec<Action>) {
+        let entries = &self.current().entries;
+        let calls = entries.iter().enumerate().rev().flat_map(|(e, entry)| entry.message.tool_calls.iter().enumerate().rev().map(move |(t, r)| (e, t, r)));
+        let picked: Vec<(usize, usize)> = calls.filter(|(.., r)| revertible(r)).map(|(e, t, _)| (e, t)).take(count).collect();
+        self.revert(&picked, actions);
+    }
+
+    /// Reverts the file changes at `picked` (entry and call indexes) of the
+    /// open conversation, in that order, on a worker.
+    pub(super) fn revert(&mut self, picked: &[(usize, usize)], actions: &mut Vec<Action>) {
+        let conversation = self.current();
+        if conversation.busy() {
+            self.notify("Stop the run before reverting changes.");
+            return;
+        }
+        let changes: Vec<(ToolCall, Backup)> = picked
+            .iter()
+            .filter_map(|&(e, t)| conversation.entries.get(e)?.message.tool_calls.get(t))
+            .filter(|r| revertible(r))
+            .filter_map(|r| Some((r.call.clone(), r.backup.clone()?)))
+            .collect();
+        let id = conversation.id;
+        match (conversation.project.clone(), changes.is_empty()) {
+            (_, true) => self.notify("There are no file changes to revert in this chat."),
+            (None, false) => self.notify("Open this chat's project folder to revert its changes."),
+            (Some(root), false) => actions.push(Action::Revert { conversation: id, root: PathBuf::from(root), changes }),
+        }
+    }
+
+    /// Marks the changes a worker reverted (`done`, by call id); `error` is
+    /// why it stopped before the rest.
+    pub fn reverted(&mut self, conversation: u64, done: &[String], error: Option<String>, actions: &mut Vec<Action>) {
+        let Some(target) = self.find(conversation) else { return };
+        // The model sees the conversation from the latest summary on, so it
+        // hears of changes from before that through the summary.
+        let summary = target.entries.iter().rposition(|e| is_summary(&e.message));
+        let mut summarised = Vec::new();
+        for (index, entry) in target.entries.iter_mut().enumerate() {
+            for record in entry.message.tool_calls.iter_mut().filter(|r| done.contains(&r.call.call_id)) {
+                if let Some(backup) = &mut record.backup {
+                    backup.reverted = true;
+                }
+                record.output.push_str("\n\n(The user has since reverted this change: the file is as it was before this call.)");
+                if summary.is_some_and(|s| index < s) {
+                    summarised.push(format!("`{}`", tools::view(&record.call).target));
+                }
+            }
+        }
+        summarised.sort();
+        summarised.dedup();
+        if let Some(index) = summary.filter(|_| !summarised.is_empty()) {
+            let note = format!(
+                "\n\n(After this summary, the user reverted earlier changes to {}: read them again rather than trust what it says about them.)",
+                summarised.join(", ")
+            );
+            target.entries[index].message.content.push_str(&note);
+        }
+        if !done.is_empty() {
+            actions.push(Action::SaveSession(target.to_session()));
+        }
+        let count = match done.len() {
+            0 => String::new(),
+            1 => "Reverted 1 change. ".to_owned(),
+            n => format!("Reverted {n} changes. "),
+        };
+        self.notify(format!("{count}{}", error.unwrap_or_default()).trim_end());
     }
 
     /// Continues a run that failed, paused or was interrupted.
@@ -775,6 +857,11 @@ impl Chat {
     }
 }
 
+/// Whether `record` is a finished file change that can still be reverted.
+pub(super) fn revertible(record: &ToolRecord) -> bool {
+    record.status == ToolStatus::Done && record.backup.as_ref().is_some_and(|b| !b.reverted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +899,7 @@ mod tests {
             status: ToolStatus::Done,
             output: "Took a screenshot.".into(),
             image: Some(Attachment { name: "screenshot.jpg".into(), mime: "image/jpeg".into(), size: 2, path: path.to_string_lossy().into_owned(), dimensions: None }),
+            backup: None,
         };
         let mut first = StoredMessage::new(Role::Assistant, String::new());
         first.tool_calls = vec![shot("a", &file), shot("b", &file)];

@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use arboard::Clipboard;
 use serechat::{
-    Attachment, Error, MediaJob, MediaKind, MediaModel, MediaTicket, Model, Project, Role, SPARK_USD, Session, SessionSummary, StoredMessage,
+    Attachment, Balance, Error, MediaJob, MediaKind, MediaModel, MediaTicket, Model, Project, Role, SPARK_USD, Session, SessionSummary, StoredMessage,
     ToolRecord, ToolStatus, Usage, new_session_id, unix_now,
 };
 use accesskit::Role as A11yRole;
@@ -537,6 +537,8 @@ pub struct Chat {
     update_ready: Option<String>,
     /// The prompt the composer is editing, if any.
     editing: Option<Editing>,
+    /// The account's balances as last looked up, or why they could not be.
+    balance: Option<Result<Balance, String>>,
 }
 
 impl Chat {
@@ -590,6 +592,7 @@ impl Chat {
             find: None,
             update_ready: None,
             editing: None,
+            balance: None,
         };
         for summary in sessions {
             let id = chat.next_id();
@@ -788,6 +791,7 @@ impl Chat {
                 self.composer.insert("/init");
                 self.send(actions);
             }
+            Command::Undo => self.undo(1, actions),
         }
     }
 
@@ -962,6 +966,17 @@ impl Chat {
             // `/init` is sent as a message; other bare commands just run.
             Some((Command::Init, "")) if self.current().project.is_none() => {
                 self.notify(format!("Open a project folder first ({PRIMARY_KEY}+O), then run /init in it."));
+                return;
+            }
+            // `/undo 3` reverts the last three changes.
+            Some((Command::Undo, count)) if !count.is_empty() => {
+                match count.parse::<usize>() {
+                    Ok(count) if count > 0 => {
+                        self.composer.take();
+                        self.undo(count, actions);
+                    }
+                    _ => self.notify("Say how many changes to revert, e.g. /undo 3."),
+                }
                 return;
             }
             // A bare generation command with files attached generates from them.
@@ -1166,6 +1181,8 @@ impl Chat {
             job.id = ticket.id;
         }
         message.cost = ticket.sparks * SPARK_USD;
+        // The Sparks are taken as the server accepts the job.
+        actions.push(Action::FetchBalance);
         actions.push(Action::SaveSession(target.to_session()));
     }
 
@@ -1189,11 +1206,19 @@ impl Chat {
                 // The server refunds generations that fail.
                 message.cost = 0.0;
                 found.doc = None;
+                actions.push(Action::FetchBalance);
             }
         }
         found.media_since = None;
         actions.push(Action::SaveSession(target.to_session()));
         actions.push(Action::Attention);
+    }
+
+    /// Stores the account's balances. A failed refresh keeps the last ones known.
+    pub fn set_balance(&mut self, balance: Result<Balance, String>) {
+        if balance.is_ok() || !matches!(self.balance, Some(Ok(_))) {
+            self.balance = Some(balance);
+        }
     }
 
     /// Asks the server to cancel the generation that entry `entry` of the
@@ -1254,6 +1279,7 @@ impl Chat {
         self.page = Page::Settings;
         self.show_skills();
         self.refresh_skills(true, actions);
+        actions.push(Action::FetchBalance);
     }
 
     /// Text of the message selection, if any.
@@ -1509,7 +1535,7 @@ impl Chat {
         self.draw_sidebar(p, ui, sidebar, actions);
         let toolbar = if self.page == Page::Settings {
             let totals = self.totals();
-            self.settings.draw(p, ui, main, scheme, self.reasoning_view, totals, actions);
+            self.settings.draw(p, ui, main, scheme, self.reasoning_view, totals, self.balance.as_ref(), actions);
             [Rect::default(); 3]
         } else {
             self.draw_header(p, ui, main);
@@ -1635,12 +1661,14 @@ impl Chat {
     }
 }
 
-/// An answer to a tool approval prompt.
+/// What the user chose on a tool card: an answer to its approval prompt,
+/// or reverting its finished file change.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Decision {
     Allow,
     Always,
     Deny,
+    Revert,
 }
 
 /// The action computing the diff of `call` against its file in `root`, if
@@ -1837,7 +1865,7 @@ mod tests {
         let mut reply = StoredMessage::new(Role::Assistant, "Let me look.".into());
         reply.tool_calls = calls
             .iter()
-            .map(|(id, name)| ToolRecord { call: ToolCall { call_id: (*id).into(), name: (*name).into(), arguments: "{}".into() }, status: ToolStatus::Pending, output: String::new(), image: None })
+            .map(|(id, name)| ToolRecord { call: ToolCall { call_id: (*id).into(), name: (*name).into(), arguments: "{}".into() }, status: ToolStatus::Pending, output: String::new(), image: None, backup: None })
             .collect();
         reply
     }
@@ -1903,7 +1931,7 @@ mod tests {
         assert_eq!(runs, ["read_file"], "reads run at once, writes wait");
 
         let mut actions = Vec::new();
-        chat.tool_done(job.conversation, "r", Ok("contents".into()), None, &mut actions);
+        chat.tool_done(job.conversation, "r", Ok("contents".into()), None, None, &mut actions);
         assert!(!actions.iter().any(|a| matches!(a, Action::Send(_))), "still waiting for approval");
 
         let entry = chat.current().entries.len() - 1;
@@ -2070,10 +2098,10 @@ mod tests {
         let completion = Completion { usage: Usage::new(120_000, 1_000), tool_calls: vec![plan, skill, skill_file], ..Completion::default() };
         let actions = finish(&mut chat, &job, completion);
         assert_eq!(actions.iter().filter(|a| matches!(a, Action::RunTool(_))).count(), 3, "none of them needs approval");
-        chat.tool_done(job.conversation, "p", Ok("Plan updated: 2 steps.".into()), None, &mut Vec::new());
-        chat.tool_done(job.conversation, "f", Ok("The guide.".into()), None, &mut Vec::new());
+        chat.tool_done(job.conversation, "p", Ok("Plan updated: 2 steps.".into()), None, None, &mut Vec::new());
+        chat.tool_done(job.conversation, "f", Ok("The guide.".into()), None, None, &mut Vec::new());
         let mut actions = Vec::new();
-        chat.tool_done(job.conversation, "s", Ok("<skill_content name=\"review\">Check everything.</skill_content>".into()), None, &mut actions);
+        chat.tool_done(job.conversation, "s", Ok("<skill_content name=\"review\">Check everything.</skill_content>".into()), None, None, &mut actions);
 
         let summary = next_send(actions).expect("a summary request");
         assert_eq!(summary.tool_choice, Some("none"));
@@ -2232,7 +2260,7 @@ mod tests {
         let actions = finish(&mut chat, &job, Completion { tool_calls: vec![call("r", "read_file", "{}")], ..Completion::default() });
         assert!(next_send(actions).is_none());
         let mut actions = Vec::new();
-        chat.tool_done(job.conversation, "r", Ok("x".into()), None, &mut actions);
+        chat.tool_done(job.conversation, "r", Ok("x".into()), None, None, &mut actions);
         assert!(next_send(actions).is_none(), "paused");
         assert!(chat.current().resumable());
         let mut actions = Vec::new();
@@ -2441,6 +2469,61 @@ mod tests {
         chat.decide(entry, 0, Decision::Allow, &mut actions);
         let runs: Vec<&ToolJob> = actions.iter().filter_map(|a| if let Action::RunTool(t) = a { Some(t) } else { None }).collect();
         assert!(runs.len() == 1 && runs[0].root.is_none() && runs[0].call.name == "mcp__tracker__create_issue");
+    }
+
+    #[test]
+    fn undo_reverts_the_newest_changes_first() {
+        let mut chat = project_chat();
+        let change = |id: &str| ToolRecord {
+            call: ToolCall { call_id: id.into(), name: "edit_file".into(), arguments: format!(r#"{{"path":"{id}.txt"}}"#) },
+            status: ToolStatus::Done,
+            output: "Edited.".into(),
+            image: None,
+            backup: Some(serechat::Backup { content: Some(String::new()), new_folders: 0, reverted: false }),
+        };
+        let mut first = reply_with(&[]);
+        first.tool_calls = vec![change("a"), change("b")];
+        let mut second = reply_with(&[("r", "read_file")]);
+        second.tool_calls[0].status = ToolStatus::Done;
+        second.tool_calls.push(change("c"));
+        let mut summary = StoredMessage::new(Role::Assistant, "Edited a and b.".into());
+        summary.compaction = true;
+        let prompt = StoredMessage::new(Role::User, "fix it".into());
+        chat.current().entries = vec![Entry::new(1, prompt), Entry::new(2, first), Entry::new(3, summary), Entry::new(4, second)];
+        let id = chat.current().id;
+        let reverts = |actions: Vec<Action>| -> Vec<Vec<String>> {
+            let changes = actions.into_iter().filter_map(|a| if let Action::Revert { changes, .. } = a { Some(changes) } else { None });
+            changes.map(|c| c.into_iter().map(|(call, _)| call.call_id).collect()).collect()
+        };
+
+        assert_eq!(reverts(enter(&mut chat, "/undo 2")), [["c", "b"]]);
+        assert!(enter(&mut chat, "/undo two").is_empty());
+        assert_eq!(chat.composer.take(), "/undo two", "a bad count keeps the text to fix");
+
+        // The worker reverted `c`, then found `b` changed since.
+        let mut actions = Vec::new();
+        chat.reverted(id, &["c".to_owned()], Some("x.txt has changed since.".into()), &mut actions);
+        assert!(matches!(actions[..], [Action::SaveSession(_)]));
+        assert_eq!(chat.notice.as_ref().map(|n| n.0.as_str()), Some("Reverted 1 change. x.txt has changed since."));
+        let c = &chat.current().entries[3].message.tool_calls[1];
+        assert!(c.backup.as_ref().is_some_and(|b| b.reverted) && c.output.ends_with("as it was before this call.)"), "the model is told");
+        assert_eq!(chat.current().entries[2].message.content, "Edited a and b.", "the summary is about earlier changes only");
+
+        assert_eq!(reverts(enter(&mut chat, "/undo")), [["b"]]);
+        // A card's Revert takes just its own change, and only once.
+        let mut actions = Vec::new();
+        chat.decide(1, 0, Decision::Revert, &mut actions);
+        assert_eq!(reverts(actions), [["a"]]);
+        let mut actions = Vec::new();
+        chat.decide(3, 1, Decision::Revert, &mut actions);
+        assert!(actions.is_empty());
+
+        // Changes from before the summary are news to the model through it.
+        chat.reverted(id, &["b".to_owned(), "a".to_owned()], None, &mut Vec::new());
+        let summary = &chat.current().entries[2].message.content;
+        assert!(summary.ends_with("reverted earlier changes to `a.txt`, `b.txt`: read them again rather than trust what it says about them.)"), "{summary}");
+        let items = input_items(&chat.current().to_session().messages).unwrap();
+        assert!(matches!(&items[0], InputItem::Message { parts, .. } if matches!(&parts[0], Part::Text(t) if t.contains("`a.txt`, `b.txt`"))));
     }
 
     #[test]

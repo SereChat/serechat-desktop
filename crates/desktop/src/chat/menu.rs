@@ -6,7 +6,7 @@ use accesskit::Role;
 use winit::window::CursorIcon;
 
 use super::composer::capitalized;
-use super::{Chat, Menu, MenuItem, PRIMARY_KEY, Reasoning, display_path, price};
+use super::{Chat, Menu, MenuItem, PRIMARY_KEY, Reasoning, display_path, group_digits, price};
 use crate::a11y::Node;
 use crate::app::Action;
 use crate::paint::{Painter, Rect, fade};
@@ -22,7 +22,7 @@ impl Chat {
             self.menu_rect = None;
             return;
         };
-        let media_title;
+        let (media_title, price_title);
         let (anchor, width, below, header, items) = match menu {
             Menu::Media(kind) => {
                 let chosen = &self.media_model[kind.index()];
@@ -31,7 +31,11 @@ impl Chat {
                     .map(|m| MenuItem { label: m.label().to_owned(), detail: m.pricing.clone(), selected: &m.id == chosen })
                     .collect();
                 media_title = format!("{} model", capitalized(kind.noun()));
-                (anchors[0], 380.0, false, (media_title.as_str(), "Price"), items)
+                price_title = match &self.balance {
+                    Some(Ok(balance)) => format!("Price  ·  {} Sparks left", group_digits(balance.sparks.max(0.0) as u64)),
+                    _ => "Price".to_owned(),
+                };
+                (anchors[0], 380.0, false, (media_title.as_str(), price_title.as_str()), items)
             }
             Menu::Model => {
                 let items = self

@@ -236,6 +236,24 @@ pub struct ToolRecord {
     /// session's attachments and shown to the model after `output`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<Attachment>,
+    /// The file a finished `write_file` or `edit_file` call changed, as it
+    /// was before, so the change can be reverted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<Backup>,
+}
+
+/// A file as it was before a tool call changed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Backup {
+    /// Its content; `None` when the call created the file.
+    pub content: Option<String>,
+    /// How many folders above the file the call created for it, to remove
+    /// again with the file while they are empty.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub new_folders: u32,
+    /// The change has been reverted.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub reverted: bool,
 }
 
 /// A message matching a content search.
@@ -641,10 +659,17 @@ mod tests {
             status: ToolStatus::Done,
             output: "ok".into(),
             image: None,
+            backup: None,
         });
         let json = serde_json::to_string(&reply).unwrap();
-        assert!(json.contains(r#""call_id":"c1""#) && json.contains(r#""status":"done""#));
+        assert!(json.contains(r#""call_id":"c1""#) && json.contains(r#""status":"done""#) && !json.contains("backup"));
         assert_eq!(serde_json::from_str::<StoredMessage>(&json).unwrap(), reply);
+        // A file the call created comes back as created, not as empty.
+        for content in [None, Some(String::new())] {
+            let mut write = reply.clone();
+            write.tool_calls[0].backup = Some(Backup { content, new_folders: 2, reverted: true });
+            assert_eq!(serde_json::from_str::<StoredMessage>(&serde_json::to_string(&write).unwrap()).unwrap(), write);
+        }
     }
 
     #[test]

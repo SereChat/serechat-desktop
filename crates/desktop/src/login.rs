@@ -237,7 +237,7 @@ mod tests {
         let challenge = serechat::base64(&sha256::digest(flow.verifier.as_bytes()), true);
         assert!(flow.url.starts_with("https://serechat.com/oauth/authorize?response_type=code&client_id=serechat-desktop&redirect_uri=http%3A%2F%2F127.0.0.1%3A"));
         assert!(flow.url.contains("%2Fcallback&") && flow.url.contains(&format!("&code_challenge={challenge}&code_challenge_method=S256&state={}&", flow.state)));
-        assert!(flow.url.ends_with("&scope=chat%20media%20files&resource=https%3A%2F%2Fserechat.com%2Fv1"));
+        assert!(flow.url.ends_with("&scope=chat%20media%20files%20account&resource=https%3A%2F%2Fserechat.com%2Fv1"));
 
         // An answer naming another issuer is refused before any code is used.
         let browser = answer(&flow, "code=c&iss=https%3A%2F%2Fevil.example");

@@ -90,6 +90,19 @@ impl Model {
     }
 }
 
+/// What the signed-in account has left to spend (`account.balances` of
+/// `GET /api/user/me`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Balance {
+    /// Sparks for generations (see [`crate::SPARK_USD`]).
+    pub sparks: f64,
+    /// USD left of the plan's allowance for language models this period.
+    pub usage: f64,
+    /// USD the allowance refills to; `0` without a plan.
+    pub usage_max: f64,
+}
+
 impl Client {
     /// Creates a signed-out client against [`BASE_URL`]; see [`Client::signed_in`].
     #[must_use]
@@ -118,6 +131,23 @@ impl Client {
         let response = self.agent.get(format!("{}/v1/models", self.base)).call()?;
         let body: Body = read_json(response)?;
         Ok(body.data)
+    }
+
+    /// The signed-in account's balances. Needs the `account` scope.
+    ///
+    /// # Errors
+    /// Network failure or a non-success response.
+    pub fn balance(&self) -> Result<Balance> {
+        #[derive(Deserialize)]
+        struct Account {
+            balances: Balance,
+        }
+        #[derive(Deserialize)]
+        struct Body {
+            account: Account,
+        }
+        let body: Body = read_json(self.get(&self.url("/api/user/me"), true)?)?;
+        Ok(body.account.balances)
     }
 
     /// Downloads a web page or text resource (no credentials are sent),
@@ -274,7 +304,7 @@ pub(crate) fn parse_error_body(text: &str) -> (Option<String>, Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Model, parse_error_body};
+    use super::{Balance, Model, parse_error_body};
     use crate::Usage;
 
     #[test]
@@ -294,6 +324,14 @@ mod tests {
         let usage = Usage { input_tokens: 1_000_000, output_tokens: 0, cached_tokens: 600_000, cache_write_tokens: 100_000 };
         assert!((cached.cost(usage) - (0.6 + 0.12 + 0.25)).abs() < 1e-9);
         assert_eq!(cached.context_window, 1_000_000);
+    }
+
+    #[test]
+    fn balances() {
+        let json = r#"{"usage":3.2,"usageMax":10,"grace":0,"sparks":1234,"bonus":0,"nextRefillAt":"2026-11-01T00:00:00Z"}"#;
+        let balance: Balance = serde_json::from_str(json).unwrap();
+        assert_eq!(balance, Balance { sparks: 1234.0, usage: 3.2, usage_max: 10.0 });
+        assert_eq!(serde_json::from_str::<Balance>("{}").unwrap(), Balance::default());
     }
 
     #[test]

@@ -19,9 +19,10 @@ use crate::error::{Error, Result};
 
 /// SereChat Desktop's OAuth client id.
 pub const CLIENT_ID: &str = "serechat-desktop";
-/// What the app asks to be allowed: language models, media generation, and
-/// the file library its media inputs and outputs go through.
-pub const SCOPES: &str = "chat media files";
+/// What the app asks to be allowed: language models, media generation, the
+/// file library its media inputs and outputs go through, and reading the
+/// account's balances.
+pub const SCOPES: &str = "chat media files account";
 /// The resource tokens are issued for: the REST API.
 pub const RESOURCE: &str = "https://serechat.com/v1";
 /// How long before it expires an access token is refreshed.

@@ -44,6 +44,9 @@ pub struct Config {
     pub auto_update: Option<String>,
     /// Browser the agent drives, interpreted by the app; absent means Auto.
     pub browser: Option<String>,
+    /// The window as last closed, e.g. `1200x800` or `1200x800 maximized`
+    /// (logical pixels), interpreted by the app.
+    pub window: Option<String>,
 }
 
 impl Config {
@@ -131,6 +134,7 @@ impl Config {
                 "audio_model" => config.audio_model = Some(value),
                 "auto_update" => config.auto_update = Some(value),
                 "browser" => config.browser = Some(value),
+                "window" => config.window = Some(value),
                 _ => {}
             }
         }
@@ -152,6 +156,7 @@ impl Config {
             ("audio_model", &self.audio_model),
             ("auto_update", &self.auto_update),
             ("browser", &self.browser),
+            ("window", &self.window),
         ];
         for (key, value) in fields {
             if let Some(value) = value {
@@ -294,6 +299,7 @@ mod tests {
             audio_model: None,
             auto_update: Some("off".into()),
             browser: Some("brave".into()),
+            window: Some("1200x800 maximized".into()),
         };
         assert_eq!(Config::parse(&config.serialize()).unwrap(), config);
     }

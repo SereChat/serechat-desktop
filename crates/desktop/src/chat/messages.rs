@@ -9,7 +9,7 @@ use accesskit::Role as A11yRole;
 use winit::window::CursorIcon;
 
 use super::composer::{capitalized, file_badge, file_icon};
-use super::agent::MAX_RETRIES;
+use super::agent::{MAX_RETRIES, revertible};
 use super::{Chat, Decision, Entry, Load, PRIMARY_KEY, ReasoningView, SelPos, StreamingCall, format_cost, label_of, usage_caption};
 use crate::a11y::Node;
 use crate::app::Action;
@@ -998,7 +998,8 @@ fn draw_attachment_chips(p: &mut Painter, ui: &mut Ui, attachments: &[serechat::
     clicked
 }
 
-/// Draws tool card `index` of `entry` into `rect`; returns an approval decision.
+/// Draws tool card `index` of `entry` into `rect`; returns an approval
+/// decision, or Revert.
 fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize, rect: Rect, interactive: bool) -> Option<Decision> {
     let t = p.theme;
     let record = &entry.message.tool_calls[index];
@@ -1043,6 +1044,22 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
         }
         right += 6.0;
     }
+    // A finished change can be reverted (the button shows while the card is
+    // hovered), and says so once it is.
+    let reverted = record.backup.as_ref().is_some_and(|b| b.reverted);
+    let mut decision = None;
+    if reverted {
+        let label = p.layout("Reverted", theme::TINY, None);
+        right += label.width();
+        p.text(&label, header.right() - right, header.y + (TOOL_ROW - label.height()) * 0.5, t.text_faint);
+        right += 10.0;
+    } else if revertible(record) {
+        let revert = Rect::new(header.right() - right - 64.0, header.y + (TOOL_ROW - 24.0) * 0.5, 64.0, 24.0);
+        if hover_button(p, ui, revert, "Revert", ButtonStyle::Ghost, interactive && ui.hovered(rect)) {
+            decision = Some(Decision::Revert);
+        }
+        right += 68.0;
+    }
     let mut target = p.layout(&view.target.replace('\n', " "), TOOL_STYLE, None);
     target.truncate(p.fonts, (rect.w - 46.0 - verb.width() - right).max(20.0));
     p.text(&target, header.x + 42.0 + verb.width(), header.y + (TOOL_ROW - target.height()) * 0.5, t.text_muted);
@@ -1050,6 +1067,7 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
         let state = match status {
             ToolStatus::Pending if approval => "waiting for approval",
             ToolStatus::Pending | ToolStatus::Running => "running",
+            ToolStatus::Done if reverted => "reverted",
             ToolStatus::Done => "done",
             ToolStatus::Failed => "failed",
             ToolStatus::Denied => "skipped",
@@ -1061,7 +1079,7 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
     }
     if expandable && interactive && ui.hovered(header) {
         ui.cursor = CursorIcon::Pointer;
-        if ui.clicked(header) && !entry.open_tools.remove(&index) {
+        if decision.is_none() && ui.clicked(header) && !entry.open_tools.remove(&index) {
             entry.open_tools.insert(index);
         }
     }
@@ -1129,7 +1147,7 @@ fn draw_tool_card(p: &mut Painter, ui: &mut Ui, entry: &mut Entry, index: usize,
             return Some(Decision::Deny);
         }
     }
-    None
+    decision
 }
 
 /// Draws a diff into `rect` (its rows laid out by [`DiffView::layout`]):

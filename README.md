@@ -30,7 +30,11 @@ cargo clippy --workspace --all-targets
 - **Diffs**: a file edit or write waiting for approval shows as a diff against the file on
   disk, with line numbers, three lines of context, the changed words picked out, and its
   `+added −removed` count in the card's header. Long diffs fold after 16 rows ("Show all").
-  A finished change opens to the same diff.
+  A finished change opens to the same diff, and hovering it shows **Revert**, which puts the
+  file back as it was before (or deletes the file the change created, and the folders it made
+  for it) and tells the model, through the conversation's summary if the change came before it.
+  A file changed again since is left alone: revert the later changes first. `/undo` reverts
+  the latest change; `/undo 3` the last three.
 - **Long tasks**: the agent keeps a plan (shown as a checklist) and works until it is done, up
   to 100 tool rounds before it pauses. Dropped connections, rate limits and server errors are
   retried automatically; when a conversation outgrows the model's context, the model
@@ -83,7 +87,8 @@ cargo clippy --workspace --all-targets
 - **Slash commands** in the composer, completed as you type (Tab completes, Enter runs, Esc
   dismisses): `/new` starts a chat in the same folder, `/clear` deletes the open chat and
   starts an empty one there, `/compact` summarises the chat to free up context, `/model`
-  opens the model menu, and `/init` asks the agent to write the project's `AGENTS.md`.
+  opens the model menu, `/init` asks the agent to write the project's `AGENTS.md`, and `/undo`
+  reverts the agent's last file change (`/undo 3`: the last three).
 - **Image, video and audio generation**: `/image`, `/video` and `/audio` followed by a prompt.
   While the composer holds one, the model button picks that kind's model (with its price).
   The chat stays usable while it runs; images show inline at their own aspect ratio, videos
@@ -99,7 +104,8 @@ cargo clippy --workspace --all-targets
 - **Emoji and CJK**: colour emoji (Twemoji), and Chinese, Japanese and Korean text through the
   operating system's fonts, with input-method (IME) support for typing them.
 - **Settings**, in tabs: General (Dark, One Dark and Light schemes, reasoning display, the agent's browser), Skills,
-  MCP servers, Usage totals, and Account (updates, data folder, sign out).
+  MCP servers, Usage (the account's Sparks and model allowance, and totals), and Account
+  (updates, data folder, sign out). The media model menu shows the Sparks left too.
 
 ## Layout
 
@@ -160,16 +166,17 @@ a `v*` tag attaches release builds to a GitHub release: `serechat.exe` (icon emb
 
 The first time the app starts, it signs in with OAuth 2.1: the browser opens SereChat's consent
 page, and its answer comes back to the app on `127.0.0.1` (authorization code with PKCE). The
-app asks for the `chat`, `media` and `files` scopes. Access tokens last an hour and are refreshed
+app asks for the `chat`, `media`, `files` and `account` (balances) scopes. Access tokens last an hour and are refreshed
 as needed; the refresh token, which changes on every refresh, is kept in the OS keychain
 (Credential Manager on Windows, the login keychain on macOS, the Secret Service through
 `secret-tool` on Linux, or `~/.serechat/serechat-desktop.token` with mode `0600` where there is
 none). Everything else lives in `~/.serechat/`:
 
 - `config.toml`: model, reasoning effort and display, colour scheme, current project, and
-  the image, video and audio models.
+  the image, video and audio models, and the window's size and whether it was maximized.
 - `sessions/<id>.json`: one file per conversation, with each reply's tokens and cost at the
-  prices of the time, attachments and tool calls. `.index.json` next to them holds titles and
+  prices of the time, attachments and tool calls (with each file the agent changed as it was
+  before, to revert the change). `.index.json` next to them holds titles and
   totals, so startup reads only the index; a session's messages load when it is opened.
 - `attachments/`: the app's copies of attached files, and generated files (deleted with their
   session).

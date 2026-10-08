@@ -38,10 +38,12 @@ pub(super) enum Command {
     Model,
     /// Asks the agent to write the project's `AGENTS.md`.
     Init,
+    /// Reverts the agent's last file change (`/undo 3`: the last three).
+    Undo,
 }
 
 impl Command {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Media(MediaKind::Image),
         Self::Media(MediaKind::Video),
         Self::Media(MediaKind::Audio),
@@ -50,6 +52,7 @@ impl Command {
         Self::Compact,
         Self::Model,
         Self::Init,
+        Self::Undo,
     ];
 
     /// What follows the slash.
@@ -61,6 +64,7 @@ impl Command {
             Self::Compact => "compact",
             Self::Model => "model",
             Self::Init => "init",
+            Self::Undo => "undo",
         }
     }
 
@@ -75,6 +79,7 @@ impl Command {
             Self::Compact => "Summarise the chat to free up context",
             Self::Model => "Choose the model",
             Self::Init => "Write an AGENTS.md for this project",
+            Self::Undo => "Revert the agent's last file change (/undo 3: last three)",
         }
     }
 
@@ -440,6 +445,7 @@ mod tests {
         assert_eq!(Command::parse("/image  a red fox \n"), Some((Command::Media(MediaKind::Image), "a red fox")));
         assert_eq!(Command::parse("/video\nwaves"), Some((Command::Media(MediaKind::Video), "waves")));
         assert_eq!(Command::parse("/new"), Some((Command::New, "")));
+        assert_eq!(Command::parse("/undo 3"), Some((Command::Undo, "3")));
         assert_eq!(Command::parse("/images of cats"), None);
         assert_eq!(Command::parse("/etc/hosts"), None);
         assert_eq!(Command::parse("image"), None);

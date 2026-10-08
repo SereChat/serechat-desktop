@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use serechat::{
-    Attachment, Client, Config, Error, GrantEvent, MediaKind, MediaModel, MediaTicket, Model, Projects, ResponseRequest, SearchHit,
+    Attachment, Backup, Balance, Client, Config, Error, GrantEvent, MediaKind, MediaModel, MediaTicket, Model, Projects, ResponseRequest, SearchHit,
     Session, SessionStore, SessionSummary, StreamEvent, ToolCall, ToolSpec, Tokens,
 };
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -38,6 +38,10 @@ use crate::{attachments, keychain, platform, skills, tools};
 
 /// Length of the cross-fade when the colour scheme changes.
 const THEME_FADE_SECS: f32 = 0.25;
+/// Window size on first start, in logical pixels.
+const WINDOW_SIZE: (u32, u32) = (1200, 800);
+/// Smallest window size, in logical pixels.
+const MIN_WINDOW_SIZE: (u32, u32) = (760, 520);
 
 /// Results delivered from worker threads.
 pub enum WorkerEvent {
@@ -87,7 +91,20 @@ pub enum WorkerEvent {
         result: Result<String, String>,
         /// The image it returned (a screenshot), saved as an attachment.
         image: Option<Attachment>,
+        /// The file a successful file change replaced, to revert it with.
+        backup: Option<Backup>,
     },
+    /// File changes were reverted, newest first.
+    Reverted {
+        /// Conversation that made them.
+        conversation: u64,
+        /// Call ids of the changes reverted.
+        done: Vec<String>,
+        /// Why the next one could not be, which stopped the rest.
+        error: Option<String>,
+    },
+    /// The account's balances arrived.
+    Balance(Result<Balance, String>),
     /// Files were copied in as attachments (or failed to).
     Imported(Vec<Result<Attachment, String>>),
     /// The file picker closed.
@@ -212,6 +229,18 @@ pub enum Action {
         /// The `write_file` or `edit_file` call.
         call: ToolCall,
     },
+    /// Revert finished file changes, newest first, stopping at the first
+    /// that cannot be.
+    Revert {
+        /// Conversation that made them.
+        conversation: u64,
+        /// Project folder the calls were confined to.
+        root: PathBuf,
+        /// Each `write_file` or `edit_file` call and the file it replaced.
+        changes: Vec<(ToolCall, Backup)>,
+    },
+    /// Look up the account's balances.
+    FetchBalance,
     /// Run a generation and download its file.
     Generate(MediaRequest),
     /// Cancel the queued generation `job` of entry `entry`.
@@ -393,10 +422,14 @@ impl App {
             Config::default()
         });
         let scheme = Scheme::from_key(config.theme.as_deref());
+        let ((width, height), maximized) = window_state(config.window.as_deref());
         let attributes = Window::default_attributes()
             .with_title("SereChat")
-            .with_inner_size(LogicalSize::new(1200.0, 800.0))
-            .with_min_inner_size(LogicalSize::new(760.0, 520.0))
+            .with_inner_size(LogicalSize::new(width, height))
+            .with_min_inner_size(LogicalSize::new(MIN_WINDOW_SIZE.0, MIN_WINDOW_SIZE.1))
+            // Windows shows a window as it maximizes it, so there it waits
+            // for the first frame (see `frame`).
+            .with_maximized(maximized && !cfg!(windows))
             .with_theme(Some(window_theme(scheme)))
             // Shown after the first frame so the user never sees a blank window.
             .with_visible(false);
@@ -518,6 +551,7 @@ impl App {
             self.spawn(move |client, _| WorkerEvent::MediaModels(kind, client.media_models(kind)));
         }
         self.spawn(|_, _| WorkerEvent::Browsers(crate::browser::installed()));
+        actions.push(Action::FetchBalance);
         self.apply(actions);
     }
 
@@ -726,9 +760,11 @@ impl App {
                 chat.stream_event(conversation, stream, event);
             }
             (WorkerEvent::StreamEnded { conversation, stream, result }, Screen::Chat(chat)) => chat.stream_end(conversation, stream, result, &mut actions),
-            (WorkerEvent::ToolDone { conversation, call_id, result, image }, Screen::Chat(chat)) => {
-                chat.tool_done(conversation, &call_id, result, image, &mut actions);
+            (WorkerEvent::ToolDone { conversation, call_id, result, image, backup }, Screen::Chat(chat)) => {
+                chat.tool_done(conversation, &call_id, result, image, backup, &mut actions);
             }
+            (WorkerEvent::Reverted { conversation, done, error }, Screen::Chat(chat)) => chat.reverted(conversation, &done, error, &mut actions),
+            (WorkerEvent::Balance(balance), Screen::Chat(chat)) => chat.set_balance(balance),
             (WorkerEvent::MediaModels(kind, Ok(models)), Screen::Chat(chat)) => chat.set_media_models(kind, models),
             (WorkerEvent::MediaModels(kind, Err(e)), _) => eprintln!("serechat: could not load {} models: {e}", kind.noun()),
             (WorkerEvent::MediaStarted { conversation, entry, ticket }, Screen::Chat(chat)) => chat.media_started(conversation, entry, ticket, &mut actions),
@@ -815,8 +851,11 @@ impl App {
             Action::RunTool(job) => {
                 let dir = self.reader().map_or_else(|| std::env::temp_dir().join("serechat-attachments"), |store| store.attachments_dir());
                 self.spawn(move |client, proxy| {
-                    // A file change is diffed against the file as it was just before.
-                    let change = job.root.as_deref().filter(|_| tools::changes_file(&job.call.name)).and_then(|root| tools::file_change(root, &job.call));
+                    // A file change is diffed against the file as it was just
+                    // before, which is kept to revert it.
+                    let root = job.root.as_deref().filter(|_| tools::changes_file(&job.call.name));
+                    let change = root.and_then(|root| tools::file_change(root, &job.call));
+                    let backup = root.and_then(|root| tools::backup(root, &job.call));
                     let result = match job.call.name.as_str() {
                         "use_skill" => skills::run(&job.skills, &job.call.arguments).map(tools::Output::text),
                         name if mcp::is_mcp(name) => mcp::call(name, &job.call.arguments, &job.cancel),
@@ -835,9 +874,21 @@ impl App {
                         Ok(output) => (Ok(output.text), None),
                         Err(e) => (Err(e), None),
                     };
-                    WorkerEvent::ToolDone { conversation: job.conversation, call_id: job.call.call_id, result, image }
+                    let backup = backup.filter(|_| result.is_ok());
+                    WorkerEvent::ToolDone { conversation: job.conversation, call_id: job.call.call_id, result, image, backup }
                 });
             }
+            Action::Revert { conversation, root, changes } => self.spawn(move |_, _| {
+                let mut done = Vec::new();
+                for (call, backup) in changes {
+                    if let Err(e) = tools::revert(&root, &call, &backup) {
+                        return WorkerEvent::Reverted { conversation, done, error: Some(e) };
+                    }
+                    done.push(call.call_id);
+                }
+                WorkerEvent::Reverted { conversation, done, error: None }
+            }),
+            Action::FetchBalance => self.spawn(|client, _| WorkerEvent::Balance(client.balance().map_err(|e| e.to_string()))),
             Action::PreviewChange { conversation, root, call } => self.spawn(move |_, _| {
                 let (before, after, whole) = tools::file_change(&root, &call).unwrap_or_default();
                 WorkerEvent::DiffReady { conversation, call_id: call.call_id, diff: Arc::new(diff::diff(&before, &after, whole)) }
@@ -1164,6 +1215,10 @@ impl App {
         self.ui.end();
         if !self.shown {
             self.shown = true;
+            // Windows shows a window as it maximizes it: only now, drawn.
+            if cfg!(windows) && window_state(self.config.window.as_deref()).1 {
+                self.window.set_maximized(true);
+            }
             self.window.set_visible(true);
             // Some platforms refuse to present to a hidden surface; draw
             // again now that the window is visible.
@@ -1348,6 +1403,41 @@ impl Writer {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // The next start opens the window as it was closed. A minimized
+        // window tells nothing, and a maximized one keeps its normal size.
+        if self.window.is_minimized() == Some(true) {
+            return;
+        }
+        // macOS's green button makes it fullscreen: as good as maximized.
+        let maximized = self.window.is_maximized() || self.window.fullscreen().is_some();
+        let (mut size, _) = window_state(self.config.window.as_deref());
+        if !maximized {
+            let logical = self.window.inner_size().to_logical::<u32>(self.window.scale_factor());
+            size = (logical.width, logical.height);
+        }
+        let state = format!("{}x{}{}", size.0, size.1, if maximized { " maximized" } else { "" });
+        if self.config.window.as_deref() != Some(state.as_str()) {
+            self.config.window = Some(state);
+            // The writer, dropped after this, finishes the write.
+            self.save_config();
+        }
+    }
+}
+
+/// Logical size and maximized state of the window from the config's
+/// `window` (`1200x800`, `1200x800 maximized`); the first-start size when
+/// absent or unreadable.
+fn window_state(saved: Option<&str>) -> ((u32, u32), bool) {
+    let saved = saved.unwrap_or_default();
+    let (size, state) = saved.split_once(' ').unwrap_or((saved, ""));
+    let size = size.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
+    let (w, h) = size.unwrap_or(WINDOW_SIZE);
+    // Never smaller than allowed, nor absurdly large from an edited file.
+    ((w.clamp(MIN_WINDOW_SIZE.0, 16_384), h.clamp(MIN_WINDOW_SIZE.1, 16_384)), state == "maximized")
+}
+
 impl Drop for Writer {
     fn drop(&mut self) {
         // Closing the queue ends the thread once everything is written.
@@ -1422,6 +1512,16 @@ fn block_on<F: Future>(future: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_state_survives_odd_input() {
+        assert_eq!(window_state(None), (WINDOW_SIZE, false));
+        assert_eq!(window_state(Some("1440x900")), ((1440, 900), false));
+        assert_eq!(window_state(Some("1440x900 maximized")), ((1440, 900), true));
+        assert_eq!(window_state(Some("10x99999")), ((MIN_WINDOW_SIZE.0, 16_384), false), "clamped");
+        assert_eq!(window_state(Some("NaNxinf maximized")), (WINDOW_SIZE, true));
+        assert_eq!(window_state(Some("")), (WINDOW_SIZE, false));
+    }
 
     #[test]
     fn writer_keeps_order_and_flushes_on_drop() {

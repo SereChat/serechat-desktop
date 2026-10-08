@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use serechat::{Client, ToolCall};
+use serechat::{Backup, Client, ToolCall};
 
 use crate::{browser, process};
 
@@ -493,27 +493,67 @@ pub fn changes_file(name: &str) -> bool {
 /// call it off the UI thread.
 #[must_use]
 pub fn file_change(root: &Path, call: &ToolCall) -> Option<(String, String, bool)> {
-    let a = args(call);
-    let path = resolve(root, arg(&a, "path")?).ok()?;
-    let current = match fs::metadata(&path) {
-        Ok(meta) if meta.is_file() && meta.len() <= 2 << 20 => fs::read_to_string(&path).ok(),
-        // A file that does not exist yet is created from nothing.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
-        _ => None,
-    };
-    match (call.name.as_str(), current) {
-        ("write_file", Some(text)) => Some((text, arg(&a, "content")?.to_owned(), true)),
-        ("edit_file", Some(text)) => {
-            let (old, new) = (arg(&a, "old_string")?, arg(&a, "new_string")?);
-            if !old.is_empty() && text.matches(old).count() == 1 {
-                let after = text.replacen(old, new, 1);
-                Some((text, after, true))
-            } else {
-                snippet_change(call)
-            }
-        }
-        _ => snippet_change(call),
+    resolve(root, arg(&args(call), "path")?).ok()?;
+    // A file that does not exist yet is created from nothing.
+    let before = backup(root, call).map(|b| b.content.unwrap_or_default());
+    match before.and_then(|before| Some((applied(call, &before)?, before))) {
+        Some((after, before)) => Some((before, after, true)),
+        None => snippet_change(call),
     }
+}
+
+/// The file a `write_file` or `edit_file` call is about to change, as it is
+/// now, to revert the change with later. `None` when it cannot be kept: no
+/// path, outside the project, not UTF-8 text, or over 2 MB.
+#[must_use]
+pub fn backup(root: &Path, call: &ToolCall) -> Option<Backup> {
+    let path = resolve(root, arg(&args(call), "path")?).ok()?;
+    let (content, new_folders) = match fs::metadata(&path) {
+        Ok(meta) if meta.is_file() && meta.len() <= 2 << 20 => (Some(fs::read_to_string(&path).ok()?), 0),
+        // `write_file` creates the folders the file needs.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, path.ancestors().skip(1).take_while(|dir| !dir.exists()).count() as u32),
+        _ => return None,
+    };
+    Some(Backup { content, new_folders, reverted: false })
+}
+
+/// The whole file once `call` changes `before`; `None` when an edit's text
+/// does not occur exactly once (the tool refuses those).
+fn applied(call: &ToolCall, before: &str) -> Option<String> {
+    let a = args(call);
+    match call.name.as_str() {
+        "write_file" => Some(arg(&a, "content")?.to_owned()),
+        "edit_file" => {
+            let (old, new) = (arg(&a, "old_string")?, arg(&a, "new_string")?);
+            (!old.is_empty() && before.matches(old).count() == 1).then(|| before.replacen(old, new, 1))
+        }
+        _ => None,
+    }
+}
+
+/// Reverts a finished `write_file` or `edit_file` call: puts its file back
+/// as `backup` kept it, or deletes the file the call created. Refuses when
+/// the file no longer holds what the call left, so nothing done since is lost.
+///
+/// # Errors
+/// A message for the user: the file changed since, or it could not be restored.
+pub fn revert(root: &Path, call: &ToolCall, backup: &Backup) -> Result<(), String> {
+    let path = resolve(root, arg(&args(call), "path").ok_or("The change names no file.")?)?;
+    let name = relative(root, &path);
+    let left = applied(call, backup.content.as_deref().unwrap_or_default());
+    if left.is_none() || fs::read_to_string(&path).ok() != left {
+        return Err(format!("{name} has changed since; revert the later changes to it first."));
+    }
+    match &backup.content {
+        Some(content) => fs::write(&path, content),
+        None => fs::remove_file(&path).map(|()| {
+            // Then the folders the call made for it, until one holds something
+            // else. Never the root or above, whatever the session file says.
+            let made = path.ancestors().skip(1).take(backup.new_folders as usize);
+            let _ = made.take_while(|dir| *dir != root && dir.starts_with(root)).try_for_each(fs::remove_dir);
+        }),
+    }
+    .map_err(|e| format!("{name} could not be restored: {e}"))
 }
 
 /// What a `write_file` or `edit_file` call changes, from its arguments
@@ -931,6 +971,48 @@ mod tests {
         let outside = call("write_file", &json!({ "path": "../escape.txt", "content": "x" }));
         assert_eq!(file_change(&root, &outside), None, "never reads outside the project");
         assert!(changes_file("edit_file") && !changes_file("read_file"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn changes_revert_unless_the_file_changed_since() {
+        let root = project();
+        let read = |path: &str| fs::read_to_string(root.join(path)).ok();
+        let change = |name: &str, arguments: &Value| {
+            let c = call(name, arguments);
+            let kept = backup(&root, &c).expect("kept");
+            exec(&root, name, arguments).unwrap();
+            (c, kept)
+        };
+        let (edit, kept) = change("edit_file", &json!({ "path": "README.md", "old_string": "Demo", "new_string": "Show" }));
+        revert(&root, &edit, &kept).unwrap();
+        assert_eq!(read("README.md").as_deref(), Some("# Demo\n"));
+        assert!(revert(&root, &edit, &kept).unwrap_err().contains("README.md has changed"), "reverting twice is refused");
+
+        // A file the call created is deleted again, with the folders it made
+        // for it, except one that holds something else by now.
+        let (create, kept) = change("write_file", &json!({ "path": "new/deeper/a.txt", "content": "hi" }));
+        assert_eq!((kept.content.as_deref(), kept.new_folders), (None, 2));
+        fs::write(root.join("new/keep.txt"), "").unwrap();
+        revert(&root, &create, &kept).unwrap();
+        assert!(!root.join("new/deeper").exists() && root.join("new/keep.txt").exists());
+
+        // Changed by hand since: refused, and the file is left alone.
+        let (write, kept) = change("write_file", &json!({ "path": "src/main.rs", "content": "x" }));
+        fs::write(root.join("src/main.rs"), "y").unwrap();
+        assert!(revert(&root, &write, &kept).is_err());
+        assert_eq!(read("src/main.rs").as_deref(), Some("y"));
+
+        assert!(backup(&root, &call("write_file", &json!({ "path": "../out.txt", "content": "" }))).is_none());
+
+        // A session file claiming more folders never touches the project folder.
+        let bare = root.join("bare");
+        fs::create_dir(&bare).unwrap();
+        let lone = call("write_file", &json!({ "path": "lone.txt", "content": "" }));
+        let kept = Backup { new_folders: 9, ..backup(&bare, &lone).unwrap() };
+        run(Some(&bare), 0, &Client::new(), &lone, &AtomicBool::new(false)).unwrap();
+        revert(&bare, &lone, &kept).unwrap();
+        assert!(bare.is_dir(), "the emptied project folder stays");
         fs::remove_dir_all(&root).unwrap();
     }
 
